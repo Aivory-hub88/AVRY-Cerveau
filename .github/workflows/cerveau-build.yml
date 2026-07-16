@@ -1,0 +1,68 @@
+name: cerveau-build
+
+# Aivory Cerveau patch 0001: the one workflow this fork needs.
+# Builds the `zeroclaw` binary for x86_64-unknown-linux-gnu with the same
+# recipe as upstream's v0.8.3 release job (see CERVEAU_PATCHES.md).
+
+on:
+  push:
+    branches: [cerveau-main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-x86_64-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.1
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: cerveau-x86_64-unknown-linux-gnu
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # xtask wrapper: renders the gateway OpenAPI spec, generates
+      # web/src/lib/api-generated.ts, then npm ci + vite build.
+      # The gateway embeds web/dist/ into the binary.
+      - name: Build web dashboard
+        run: cargo web build
+
+      # Feature set resolved from upstream's canonical registry — the same
+      # single source of truth install.sh and packaging use ("dist" = the
+      # lean standard distribution set).
+      - name: Build release binary
+        run: |
+          FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection dist --target x86_64-unknown-linux-gnu)"
+          echo "Resolved features: $FEATURES"
+          cargo build --release --locked --no-default-features \
+            --features "$FEATURES" \
+            --target x86_64-unknown-linux-gnu
+
+      - name: Package
+        run: |
+          tar -czf zeroclaw-x86_64-unknown-linux-gnu.tar.gz \
+            -C target/x86_64-unknown-linux-gnu/release zeroclaw
+          sha256sum zeroclaw-x86_64-unknown-linux-gnu.tar.gz \
+            > zeroclaw-x86_64-unknown-linux-gnu.tar.gz.sha256
+          ls -la zeroclaw-x86_64-unknown-linux-gnu.tar.gz*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zeroclaw-x86_64-unknown-linux-gnu
+          path: |
+            zeroclaw-x86_64-unknown-linux-gnu.tar.gz
+            zeroclaw-x86_64-unknown-linux-gnu.tar.gz.sha256
+          retention-days: 30
