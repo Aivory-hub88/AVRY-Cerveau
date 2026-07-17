@@ -32,6 +32,7 @@ pub mod api_webauthn;
 ))]
 pub mod api_webhook;
 pub mod auth_rate_limit;
+pub mod tenant;
 pub mod canvas;
 pub mod hardware_context;
 pub mod node_tool;
@@ -2551,6 +2552,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
     message: &str,
     session_id: Option<&str>,
     agent_override: Option<&str>,
+    tenant: Option<std::sync::Arc<zeroclaw_runtime::agent::tenant::TenantContext>>,
 ) -> anyhow::Result<GatewayChatOutcome> {
     if let Some(err) = needs_quickstart_for(&state.model) {
         return Err(err);
@@ -2563,6 +2565,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
     #[cfg(test)]
     {
         record_gateway_chat_dispatch_for_test(message, session_id, agent_override);
+        let _ = tenant;
         let response = state
             .model_provider
             .chat_with_system(None, message, &state.model, state.temperature)
@@ -2596,16 +2599,21 @@ pub(crate) async fn run_gateway_chat_with_tools(
                 zeroclaw_runtime::agent::cost::TurnUsage::default(),
             ))
         });
-        let response = Box::pin(zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
-            turn_usage.clone(),
-            zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
-                cost_tracking_context,
-                zeroclaw_runtime::agent::process_message(
-                    config,
-                    &agent_alias,
-                    message,
-                    session_id,
-                    zeroclaw_api::ingress::TurnOrigin::Interactive,
+        // Cerveau: scope the tenant overlay (if any) around the turn using
+        // the same task-local pattern as the cost-tracking contexts.
+        let response = Box::pin(zeroclaw_runtime::agent::tenant::TENANT_CONTEXT.scope(
+            tenant,
+            zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
+                turn_usage.clone(),
+                zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    cost_tracking_context,
+                    zeroclaw_runtime::agent::process_message(
+                        config,
+                        &agent_alias,
+                        message,
+                        session_id,
+                        zeroclaw_api::ingress::TurnOrigin::Interactive,
+                    ),
                 ),
             ),
         ))
@@ -3030,6 +3038,53 @@ async fn handle_webhook(
         }
     }
 
+    // ── Cerveau: tenant selection (optional) ────────────────────────
+    // Tenant-scoped requests carry X-Tenant-Id + X-Agent-Type and are only
+    // honored on deployments with a webhook secret configured (the secret
+    // itself was already verified above when configured). Resolution
+    // failures reject the request — a tenant turn must never silently fall
+    // back to an unscoped (cross-tenant-visible) turn. Placed before
+    // idempotency so a rejected tenant request doesn't consume the
+    // caller's idempotency key.
+    let tenant_ctx = match tenant::TenantSelector::from_headers(&headers) {
+        Ok(None) => None,
+        Ok(Some(sel)) => {
+            if state.webhook_secret_hash.is_none() {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "webhook: tenant headers rejected — no webhook secret configured"
+                );
+                let err = serde_json::json!({
+                    "error": "Tenant-scoped requests require X-Webhook-Secret auth on this deployment"
+                });
+                return (StatusCode::UNAUTHORIZED, Json(err));
+            }
+            match tenant::TenantResolver::global().resolve(&sel).await {
+                Ok(persona) => Some(tenant::build_tenant_context(&sel, persona.as_deref())),
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{e:#}")})),
+                        "webhook: tenant persona resolution failed"
+                    );
+                    let err = serde_json::json!({
+                        "error": "Tenant resolution unavailable; retry later"
+                    });
+                    return (StatusCode::SERVICE_UNAVAILABLE, Json(err));
+                }
+            }
+        }
+        Err(reason) => {
+            let err = serde_json::json!({ "error": reason });
+            return (StatusCode::BAD_REQUEST, Json(err));
+        }
+    };
+
+    // ── Idempotency (optional, v0.8.5 helper with namespaced key) ──
     if !has_matching_sop && let Some(response) = check_webhook_idempotency(&state, &headers, None) {
         return response;
     }
@@ -3037,7 +3092,14 @@ async fn handle_webhook(
     let message = &webhook_body.message;
     let session_id = webhook_session_id(&headers);
 
-    if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(message) {
+    // Cerveau: install-wide autosave is skipped for tenant turns — the
+    // turn's own tenant-jailed memory handles conversation storage, and
+    // writing tenant messages into the unscoped install memory would leak
+    // them across tenants.
+    if tenant_ctx.is_none()
+        && state.auto_save
+        && !zeroclaw_memory::should_skip_autosave_content(message)
+    {
         let key = webhook_memory_key();
         let _ = state
             .mem
@@ -3074,7 +3136,14 @@ async fn handle_webhook(
     // gives one webhook prompt two unrelated turn IDs.
     let started_at = Instant::now();
 
-    match run_gateway_chat_with_tools(&state, message, session_id.as_deref(), agent_override).await
+    match run_gateway_chat_with_tools(
+        &state,
+        message,
+        session_id.as_deref(),
+        agent_override,
+        tenant_ctx,
+    )
+    .await
     {
         Ok(GatewayChatOutcome { response, .. }) => {
             let duration = started_at.elapsed();
