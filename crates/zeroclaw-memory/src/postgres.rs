@@ -443,21 +443,35 @@ impl Memory for PostgresMemory {
                 (None, None) => String::new(),
             };
 
+            // Cerveau: recall is a ranked top-k search, so keyword matching
+            // uses OR semantics (match ANY query term, rank by ts_rank_cd)
+            // instead of plainto_tsquery's implicit AND — with AND, one
+            // query word absent from the row ("preferensi" vs a row that
+            // says "lebih suka") hides an obviously relevant memory. The
+            // OR tsquery is composed once from the query's own lexemes.
             let stmt = format!(
                 "
                 SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id,
                        (
-                         CASE WHEN to_tsvector('simple', m.key) @@ plainto_tsquery('simple', $1)
-                           THEN ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0
+                         CASE WHEN q.tsq IS NOT NULL AND to_tsvector('simple', m.key) @@ q.tsq
+                           THEN ts_rank_cd(to_tsvector('simple', m.key), q.tsq) * 2.0
                            ELSE 0.0 END +
-                         CASE WHEN to_tsvector('simple', m.content) @@ plainto_tsquery('simple', $1)
-                           THEN ts_rank_cd(to_tsvector('simple', m.content), plainto_tsquery('simple', $1))
+                         CASE WHEN q.tsq IS NOT NULL AND to_tsvector('simple', m.content) @@ q.tsq
+                           THEN ts_rank_cd(to_tsvector('simple', m.content), q.tsq)
                            ELSE 0.0 END
                        ) AS score
                 FROM {qualified_table} m
                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                CROSS JOIN (
+                  SELECT CASE WHEN length(trim($1)) = 0 THEN NULL
+                    ELSE to_tsquery('simple',
+                      (SELECT string_agg(lex, ' | ')
+                         FROM unnest(tsvector_to_array(to_tsvector('simple', $1))) AS lex))
+                  END AS tsq
+                ) q
                 WHERE ($2::TEXT IS NULL OR m.session_id = $2)
-                  AND ($1 = '' OR to_tsvector('simple', m.key || ' ' || m.content) @@ plainto_tsquery('simple', $1))
+                  AND ($1 = '' OR (q.tsq IS NOT NULL
+                       AND to_tsvector('simple', m.key || ' ' || m.content) @@ q.tsq))
                   {time_filter}
                 ORDER BY score DESC, m.updated_at DESC
                 LIMIT $3
@@ -830,21 +844,30 @@ impl Memory for PostgresMemory {
                 (None, None) => String::new(),
             };
 
+            // Same OR-semantics rationale as `recall` above.
             let stmt = format!(
                 "
                 SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id,
                        (
-                         CASE WHEN to_tsvector('simple', m.key) @@ plainto_tsquery('simple', $1)
-                           THEN ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0
+                         CASE WHEN q.tsq IS NOT NULL AND to_tsvector('simple', m.key) @@ q.tsq
+                           THEN ts_rank_cd(to_tsvector('simple', m.key), q.tsq) * 2.0
                            ELSE 0.0 END +
-                         CASE WHEN to_tsvector('simple', m.content) @@ plainto_tsquery('simple', $1)
-                           THEN ts_rank_cd(to_tsvector('simple', m.content), plainto_tsquery('simple', $1))
+                         CASE WHEN q.tsq IS NOT NULL AND to_tsvector('simple', m.content) @@ q.tsq
+                           THEN ts_rank_cd(to_tsvector('simple', m.content), q.tsq)
                            ELSE 0.0 END
                        ) AS score
                 FROM {qualified_table} m
                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                CROSS JOIN (
+                  SELECT CASE WHEN length(trim($1)) = 0 THEN NULL
+                    ELSE to_tsquery('simple',
+                      (SELECT string_agg(lex, ' | ')
+                         FROM unnest(tsvector_to_array(to_tsvector('simple', $1))) AS lex))
+                  END AS tsq
+                ) q
                 WHERE ($2::TEXT IS NULL OR m.session_id = $2)
-                  AND ($1 = '' OR to_tsvector('simple', m.key || ' ' || m.content) @@ plainto_tsquery('simple', $1))
+                  AND ($1 = '' OR (q.tsq IS NOT NULL
+                       AND to_tsvector('simple', m.key || ' ' || m.content) @@ q.tsq))
                   AND m.agent_id = ANY($4)
                   {time_filter}
                 ORDER BY score DESC, m.updated_at DESC
