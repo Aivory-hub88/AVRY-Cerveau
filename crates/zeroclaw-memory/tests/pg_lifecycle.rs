@@ -30,11 +30,18 @@ fn pg_url() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn exec(sql: &str) {
+/// Run admin SQL on a dedicated blocking thread — the sync `postgres` client
+/// internally drives its own runtime, so it must NOT be called directly on a
+/// tokio worker ("Cannot start a runtime from within a runtime").
+async fn exec(sql: &str) {
     let url = pg_url().unwrap();
     let sql = sql.to_string();
-    let mut c = postgres::Client::connect(&url, postgres::NoTls).expect("admin connect");
-    c.batch_execute(&sql).expect("admin exec");
+    tokio::task::spawn_blocking(move || {
+        let mut c = postgres::Client::connect(&url, postgres::NoTls).expect("admin connect");
+        c.batch_execute(&sql).expect("admin exec");
+    })
+    .await
+    .expect("admin task join");
 }
 
 async fn seed(mem: &PostgresMemory, agent: &str, category: MemoryCategory, n: usize, prefix: &str) {
@@ -60,10 +67,11 @@ async fn count_for(mem: &PostgresMemory, agent: &str) -> usize {
         .len()
 }
 
-fn truncate() {
+async fn truncate() {
     exec(&format!(
         "TRUNCATE {SCHEMA}.memories; TRUNCATE {SCHEMA}.cerveau_tenant_quota;"
-    ));
+    ))
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -76,7 +84,8 @@ async fn postgres_lifecycle_end_to_end() {
     // Fresh schema so the v3 migration runs cleanly (see module docs).
     exec(&format!(
         "DROP SCHEMA IF EXISTS {SCHEMA} CASCADE; CREATE SCHEMA {SCHEMA};"
-    ));
+    ))
+    .await;
 
     let mem = PostgresMemory::new("test", &url, SCHEMA, "memories", Some(5), Some(false), None)
         .expect("connect + migrate");
@@ -98,7 +107,7 @@ async fn postgres_lifecycle_end_to_end() {
     assert_eq!(count_for(&mem, "tenant_b").await, 3, "B under cap untouched");
 
     // ── Scenario 2: per-tenant quota override beats the default ───────
-    truncate();
+    truncate().await;
     seed(&mem, "vip", MemoryCategory::Core, 20, "c").await;
     let vip_id = mem.ensure_agent_uuid("vip").await.expect("uuid");
     mem.set_tenant_quota(&vip_id, "core", 12).await.expect("quota");
@@ -110,12 +119,13 @@ async fn postgres_lifecycle_end_to_end() {
     );
 
     // ── Scenario 3: core is durable, conversation is age-pruned ───────
-    truncate();
+    truncate().await;
     seed(&mem, "t", MemoryCategory::Core, 3, "core").await;
     seed(&mem, "t", MemoryCategory::Conversation, 3, "conv").await;
     exec(&format!(
         "UPDATE {SCHEMA}.memories SET created_at = now() - interval '400 days';"
-    ));
+    ))
+    .await;
     let with_retention = PgLifecycleConfig {
         conversation_retention_days: Some(30),
         daily_retention_days: Some(180),
@@ -127,5 +137,5 @@ async fn postgres_lifecycle_end_to_end() {
     assert_eq!(report.retention_pruned, 3, "3 aged conversation rows pruned");
     assert_eq!(count_for(&mem, "t").await, 3, "3 core rows survive (durable)");
 
-    exec(&format!("DROP SCHEMA IF EXISTS {SCHEMA} CASCADE;"));
+    exec(&format!("DROP SCHEMA IF EXISTS {SCHEMA} CASCADE;")).await;
 }
