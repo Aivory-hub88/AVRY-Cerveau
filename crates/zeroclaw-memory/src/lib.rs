@@ -953,6 +953,67 @@ pub async fn create_memory_for_agent(
     Ok(Arc::new(scoped))
 }
 
+/// Cerveau: create a memory instance bound to one *tenant* rather than a
+/// configured agent alias.
+///
+/// Tenants are dynamically-provisioned identities (rows in the platform
+/// database), not `[agents.<alias>]` config entries — there may be tens of
+/// thousands of them, so they must never require config entries, workspace
+/// dirs, or reloads. A tenant rides the same storage the *host* agent uses
+/// (the SQL/Qdrant branch of [`create_memory_for_agent`]), scoped through
+/// [`AgentScopedMemory`] with the tenant identifier in the agent-id
+/// dimension and an **empty** cross-agent allowlist: a tenant can only ever
+/// see its own rows. There is deliberately no tenant equivalent of
+/// `read_memory_from`.
+///
+/// `tenant_id` must already be validated/normalized by the caller (the
+/// gateway rejects anything outside `[A-Za-z0-9._-]`); it is namespaced
+/// here with a `t_` prefix so a tenant id can never collide with a
+/// configured agent alias in the agents table.
+///
+/// Markdown/None host backends are rejected: tenants require the shared
+/// SQL/Qdrant path (per-tenant markdown dirs would reintroduce the
+/// filesystem-per-identity scaling wall).
+pub async fn create_memory_for_tenant(
+    config: &zeroclaw_config::schema::Config,
+    host_agent_alias: &str,
+    tenant_id: &str,
+    api_key: Option<&str>,
+) -> anyhow::Result<Arc<dyn Memory>> {
+    use zeroclaw_config::multi_agent::MemoryBackendKind as ConfigBackend;
+    let host_cfg = config
+        .agents
+        .get(host_agent_alias)
+        .with_context(|| format!("agents.{host_agent_alias} is not configured"))?;
+    if matches!(
+        host_cfg.memory.backend,
+        ConfigBackend::Markdown | ConfigBackend::None
+    ) {
+        anyhow::bail!(
+            "tenant-scoped memory requires the host agent `{host_agent_alias}` to use a \
+             shared SQL/Qdrant backend, not markdown/none"
+        );
+    }
+
+    let inner = create_memory_with_storage_and_routes(
+        &config.memory,
+        &config.embedding_routes,
+        config.resolve_active_storage(),
+        &config.data_dir,
+        api_key,
+        Some(&config.providers.models),
+    )?;
+    let inner_arc: Arc<dyn Memory> = Arc::from(inner);
+
+    let namespaced = format!("t_{tenant_id}");
+    let bound_id = inner_arc.ensure_agent_uuid(&namespaced).await?;
+
+    // Empty allowlist: the wrapper adds the bound id itself; nothing else
+    // is ever visible. Tenant isolation is structural, not configured.
+    let scoped = AgentScopedMemory::new(inner_arc, bound_id, Vec::new());
+    Ok(Arc::new(scoped))
+}
+
 /// Factory: create an optional response cache from config.
 pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Option<ResponseCache> {
     if !config.response_cache_enabled {

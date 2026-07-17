@@ -70,6 +70,8 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 # Misc
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 parking_lot = "0.12"
+lru = "0.16"
+postgres = { version = "0.19", features = ["with-chrono-0_4"] }
 toml = "1.0"
 toml_edit = "0.25"
 rustls-pemfile = "2"

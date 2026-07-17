@@ -18,6 +18,7 @@ pub mod personality_templates;
 pub mod pricing_catalog;
 pub mod prompt;
 pub mod system_prompt;
+pub mod tenant;
 pub mod thinking;
 pub mod tool_execution;
 pub mod tool_receipts;

@@ -1663,7 +1663,10 @@ impl DelegateTool {
                     originator_route: None,
                     delivered: false,
                     idem_key: None,
-                    principal_id: None,
+                    // Cerveau: tenant turns stamp their identity into the
+                    // EPIC-D principal seam so task ownership is tenant-scoped.
+                    principal_id: crate::agent::tenant::current_tenant()
+                        .map(|t| t.tenant_id.clone()),
                     started_at: started_at.clone(),
                     finished_at: None,
                 })
