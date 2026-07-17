@@ -3003,7 +3003,10 @@ pub async fn process_message(
             provider_name,
             provider_alias.as_str(),
         );
-        let model_provider: Box<dyn ModelProvider> =
+        // Arc (not Box) so the tenant-turn background consolidation below can
+        // share the provider without rebuilding it. Arc<dyn _> still derefs
+        // for the `.as_ref()` call sites.
+        let model_provider: Arc<dyn ModelProvider> = Arc::from(
             zeroclaw_providers::create_routed_model_provider_with_options(
                 &config,
                 &format!("{provider_name}.{provider_alias}"),
@@ -3015,7 +3018,8 @@ pub async fn process_message(
                 &config.model_routes,
                 &model_name,
                 &provider_runtime_options,
-            )?;
+            )?,
+        );
 
         let hardware_rag: Option<crate::rag::HardwareRag> = config
             .peripherals
@@ -3299,7 +3303,7 @@ pub async fn process_message(
             .as_ref()
             .map(|c| c as &dyn zeroclaw_api::channel::Channel);
 
-        zeroclaw_api::NATIVE_THINKING_OVERRIDE
+        let turn_outcome = zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(
                 thinking_params.native_thinking,
                 agent_turn_with_sop_reassembly(
@@ -3345,7 +3349,48 @@ pub async fn process_message(
                     Some(SopStepReassembly { config: &config }),
                 ),
             )
-            .await
+            .await;
+
+        // Cerveau (P-consolidation): upstream ships `consolidate_turn` with no
+        // call sites, so conversations never distill into long-term memory on
+        // their own. For tenant turns, spawn the distill in the background so
+        // it adds no latency to the reply; the memory handle is already
+        // tenant-scoped, so what it writes stays tenant-jailed. Vanilla
+        // (non-tenant) turns are unchanged.
+        if let Ok(ref assistant_reply) = turn_outcome
+            && config.memory.auto_save
+            && crate::agent::tenant::current_tenant().is_some()
+        {
+            let mem_bg = Arc::clone(&mem);
+            let provider_bg = Arc::clone(&model_provider);
+            let mem_cfg_bg = config.memory.clone();
+            let model_bg = model_name.clone();
+            let user_bg = effective_message.clone();
+            let reply_bg = assistant_reply.clone();
+            zeroclaw_spawn::spawn!(async move {
+                if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
+                    provider_bg.as_ref(),
+                    &model_bg,
+                    effective_temperature,
+                    mem_bg.as_ref(),
+                    &mem_cfg_bg,
+                    &user_bg,
+                    &reply_bg,
+                )
+                .await
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                        "cerveau: background turn consolidation failed"
+                    );
+                }
+            });
+        }
+
+        turn_outcome
     };
     __zc_body
         .instrument(__zc_scope_span)

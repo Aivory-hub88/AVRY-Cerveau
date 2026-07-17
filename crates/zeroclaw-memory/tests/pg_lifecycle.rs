@@ -142,5 +142,40 @@ async fn postgres_lifecycle_end_to_end() {
     assert_eq!(report.retention_pruned, 3, "3 aged conversation rows pruned");
     assert_eq!(count_for(&mem, "t").await, 3, "3 core rows survive (durable)");
 
+    // ── Scenario 4: recall uses OR semantics (ranked top-k), so a query
+    //    with one term absent from the row still finds it ──────────────
+    truncate().await;
+    let uuid = mem.ensure_agent_uuid("t_recall.cs").await.expect("uuid");
+    mem.store_with_agent(
+        "vip_pref",
+        "Pelanggan VIP kami lebih suka pengiriman hari Sabtu.",
+        MemoryCategory::Core,
+        None,
+        None,
+        None,
+        Some(&uuid),
+    )
+    .await
+    .expect("store");
+    // "preferensi" does not appear in the row — AND semantics would miss it.
+    let hits = mem
+        .recall_for_agents(
+            &[&uuid],
+            "preferensi pengiriman pelanggan VIP",
+            10,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("recall");
+    assert_eq!(hits.len(), 1, "partial-term query must still match (OR semantics)");
+    // Punctuation-only query: no match, no SQL error.
+    let none = mem
+        .recall_for_agents(&[&uuid], "!!! ...", 10, None, None, None)
+        .await
+        .expect("punct recall must not error");
+    assert!(none.is_empty(), "punctuation-only query matches nothing");
+
     exec(&format!("DROP SCHEMA IF EXISTS {SCHEMA} CASCADE;")).await;
 }
