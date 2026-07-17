@@ -16,6 +16,24 @@ jobs:
   build-x86_64-linux:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    services:
+      # Postgres for the tenant-memory lifecycle integration tests (ADR-004).
+      # pgvector image so vector columns are available if a test needs them.
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: cerveau
+          POSTGRES_PASSWORD: cerveau
+          POSTGRES_DB: cerveau_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cerveau"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CERVEAU_TEST_PG_URL: "host=127.0.0.1 port=5432 user=cerveau password=cerveau dbname=cerveau_test"
     steps:
       - uses: actions/checkout@v4
 
@@ -42,6 +60,13 @@ jobs:
           cargo test --locked -p zeroclaw-memory --test tenant_isolation
           cargo test --locked -p zeroclaw-runtime tenant
           cargo test --locked -p zeroclaw-gateway tenant::
+
+      # Memory lifecycle against a real Postgres (ADR-004): retention prune,
+      # per-tenant budget, per-tier quota override. Uses CERVEAU_TEST_PG_URL.
+      - name: Memory lifecycle (Postgres) tests
+        run: |
+          cargo test --locked -p zeroclaw-memory --features memory-postgres --test pg_lifecycle
+          cargo test --locked -p zeroclaw-runtime control_plane::tool_idem
 
       # xtask wrapper: renders the gateway OpenAPI spec, generates
       # web/src/lib/api-generated.ts, then npm ci + vite build.

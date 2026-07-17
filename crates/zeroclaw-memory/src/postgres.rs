@@ -1055,3 +1055,176 @@ mod tests {
         );
     }
 }
+
+// ── Cerveau: tenant-scoped memory lifecycle (ADR-004) ───────────────────
+//
+// The upstream lifecycle (`hygiene::run_if_due` + `budget::compact_*`) is
+// SQLite/filesystem-only and never touches this backend. Because every
+// tenant's rows share one `memories` table keyed by `agent_id`, a single
+// set-based statement enforces retention and per-tenant budget across ALL
+// tenants at once — one query for 10k tenants, no per-tenant iteration.
+
+/// Lifecycle tuning. Retention is age-based per category (`core` is durable
+/// and never age-pruned); budget caps the retained rows per tenant per
+/// category, overridable per tenant via the `*_tenant_quota` table.
+#[derive(Debug, Clone)]
+pub struct PgLifecycleConfig {
+    /// Age cap for `conversation` rows; `None` disables conversation retention.
+    pub conversation_retention_days: Option<i64>,
+    /// Age cap for `daily` rows; `None` disables daily retention.
+    pub daily_retention_days: Option<i64>,
+    /// Default per-tenant row cap for `core` (durable) memories.
+    pub core_max_rows_per_tenant: i64,
+    /// Default per-tenant row cap for `daily` memories.
+    pub daily_max_rows_per_tenant: i64,
+    /// Default per-tenant row cap for `conversation` memories.
+    pub conversation_max_rows_per_tenant: i64,
+}
+
+impl Default for PgLifecycleConfig {
+    fn default() -> Self {
+        Self {
+            conversation_retention_days: Some(30),
+            daily_retention_days: Some(180),
+            core_max_rows_per_tenant: 2_000,
+            daily_max_rows_per_tenant: 1_000,
+            conversation_max_rows_per_tenant: 500,
+        }
+    }
+}
+
+/// Rows removed by one lifecycle pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PgLifecycleReport {
+    pub retention_pruned: u64,
+    pub budget_evicted: u64,
+}
+
+impl PostgresMemory {
+    /// Schema-qualified name of the per-tenant quota-override table, derived
+    /// from the (already schema-qualified) agents table so it lands in the
+    /// same schema as `memories`.
+    fn qualified_tenant_quota(&self) -> String {
+        let schema = self
+            .qualified_agents
+            .rsplit_once('.')
+            .map(|(s, _)| s)
+            .unwrap_or("public");
+        format!("{schema}.cerveau_tenant_quota")
+    }
+
+    /// Create the per-tenant quota-override table if absent. Idempotent.
+    ///
+    /// Rows are populated by the identity layer from a tenant's tier
+    /// (foundation < pro < enterprise); an absent row falls back to the
+    /// per-category default in [`PgLifecycleConfig`].
+    pub async fn init_lifecycle_schema(&self) -> Result<()> {
+        let client = self.client.get().clone();
+        let quota = self.qualified_tenant_quota();
+        run_on_os_thread(move || -> Result<()> {
+            let mut client = client.lock();
+            client.batch_execute(&format!(
+                "CREATE TABLE IF NOT EXISTS {quota} (
+                     agent_id TEXT NOT NULL,
+                     category TEXT NOT NULL,
+                     max_rows BIGINT NOT NULL,
+                     PRIMARY KEY (agent_id, category)
+                 );"
+            ))?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Upsert a per-tenant, per-category row cap (the tier override).
+    pub async fn set_tenant_quota(
+        &self,
+        agent_id: &str,
+        category: &str,
+        max_rows: i64,
+    ) -> Result<()> {
+        let client = self.client.get().clone();
+        let quota = self.qualified_tenant_quota();
+        let agent_id = agent_id.to_string();
+        let category = category.to_string();
+        run_on_os_thread(move || -> Result<()> {
+            let mut client = client.lock();
+            client.execute(
+                &format!(
+                    "INSERT INTO {quota} (agent_id, category, max_rows) VALUES ($1, $2, $3)
+                     ON CONFLICT (agent_id, category) DO UPDATE SET max_rows = EXCLUDED.max_rows"
+                ),
+                &[&agent_id, &category, &max_rows],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Run one lifecycle pass: age-based retention prune, then per-tenant
+    /// budget eviction. Set-based; a single pass covers every tenant.
+    pub async fn run_lifecycle(&self, cfg: &PgLifecycleConfig) -> Result<PgLifecycleReport> {
+        let client = self.client.get().clone();
+        let table = self.qualified_table.clone();
+        let quota = self.qualified_tenant_quota();
+        let cfg = cfg.clone();
+        run_on_os_thread(move || -> Result<PgLifecycleReport> {
+            let mut client = client.lock();
+            let mut report = PgLifecycleReport::default();
+
+            // 1. Retention prune (conversation, daily). `core` is never
+            //    age-pruned — it is the durable tier, bounded only by budget.
+            let retention: [(&str, Option<i64>); 2] = [
+                ("conversation", cfg.conversation_retention_days),
+                ("daily", cfg.daily_retention_days),
+            ];
+            for (category, days) in retention {
+                if let Some(days) = days {
+                    let n = client.execute(
+                        &format!(
+                            "DELETE FROM {table}
+                              WHERE category = $1
+                                AND created_at < now() - make_interval(days => $2::int)"
+                        ),
+                        &[&category, &(days as i32)],
+                    )?;
+                    report.retention_pruned += n;
+                }
+            }
+
+            // 2. Per-tenant budget eviction. Keep the top-N rows per agent
+            //    per category (most important, then most recent); delete the
+            //    overflow. The per-tenant cap is the tier override when
+            //    present, else the category default.
+            let budgets: [(&str, i64); 3] = [
+                ("core", cfg.core_max_rows_per_tenant),
+                ("daily", cfg.daily_max_rows_per_tenant),
+                ("conversation", cfg.conversation_max_rows_per_tenant),
+            ];
+            for (category, default_cap) in budgets {
+                let n = client.execute(
+                    &format!(
+                        "DELETE FROM {table} WHERE id IN (
+                             SELECT r.id FROM (
+                                 SELECT m.id, m.agent_id,
+                                     row_number() OVER (
+                                         PARTITION BY m.agent_id
+                                         ORDER BY m.importance DESC NULLS LAST, m.created_at DESC
+                                     ) AS rn
+                                 FROM {table} m WHERE m.category = $1
+                             ) r
+                             LEFT JOIN {quota} q
+                                 ON q.agent_id = r.agent_id AND q.category = $1
+                             WHERE r.rn > COALESCE(q.max_rows, $2::bigint)
+                         )"
+                    ),
+                    &[&category, &default_cap],
+                )?;
+                report.budget_evicted += n;
+            }
+
+            Ok(report)
+        })
+        .await
+    }
+}
