@@ -26,11 +26,10 @@ git fetch upstream --tags
 |---|---|---|---|
 | 0001 | Replace upstream CI with `cerveau-build` | Upstream's ~25 workflows target their release/publish infra (secrets we don't have; scheduled jobs we don't want). One workflow builds the one artifact we deploy: `zeroclaw` for `x86_64-unknown-linux-gnu`, same recipe as upstream's v0.8.3 release (toolchain 1.96.1, `cargo web build` for the embedded dashboard, feature set resolved via `cargo run -p xtask --bin generate -- features --selection dist`) | `.github/workflows/` |
 
+| 0002 | P-identity: per-request tenant identity resolution | Tenant-scoped `/webhook` turns for dynamically-provisioned identities (no config alias/reload per tenant). `X-Tenant-Id`+`X-Agent-Type` headers (webhook-secret mandatory, fail-closed resolver), persona from `product.agent_profiles` via bounded TTL LRU, rendered as inert fenced operator data appended after host security rules; memory bound to the tenant via `create_memory_for_tenant` (empty allowlist = structurally jailed); install-wide autosave skipped on tenant turns; `principal_id` stamped on delegate/subagent task records. Vanilla paths bit-for-bit unchanged when headers absent | `zeroclaw-memory/src/lib.rs`, `zeroclaw-runtime/src/agent/{tenant.rs,mod.rs,loop_.rs}`, `zeroclaw-runtime/src/tools/{delegate.rs,spawn_subagent.rs}`, `zeroclaw-gateway/src/{tenant.rs,lib.rs,a2a.rs}`, gateway `Cargo.toml` |
+
 ### Planned (per the execution plan; not yet applied)
 
-- **P-identity** — DB-backed multi-tenant identity resolution (persona/tone/language/voice/tool-scope
-  per authenticated tenant from Postgres), alongside the existing config-alias model. Stamps
-  `TaskRecord.principal_id` (upstream's own EPIC-D seam).
 - **P-isolation** — row-level tenant scoping in `zeroclaw-memory` / `control_plane` Postgres backends,
   mirroring upstream's default-jailed per-agent semantics at tenant granularity.
 - **F-1** — boot recovery enqueues a continuation for owned tasks with a persisted

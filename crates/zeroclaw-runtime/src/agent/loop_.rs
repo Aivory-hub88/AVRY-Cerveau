@@ -2847,14 +2847,32 @@ pub async fn process_message(
             }
         };
         let approval_manager = ApprovalManager::for_non_interactive(&risk_profile);
-        let mem: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent(
-            &config,
-            agent_alias,
-            agent_model_provider
-                .as_ref()
-                .and_then(|e| e.api_key.as_deref()),
-        )
-        .await?;
+        // Cerveau: a tenant-scoped turn binds memory to the tenant's own
+        // jailed scope instead of the host agent's; absent tenant context
+        // this is bit-for-bit the vanilla path.
+        let mem: Arc<dyn Memory> = match crate::agent::tenant::current_tenant() {
+            Some(tenant) => {
+                zeroclaw_memory::create_memory_for_tenant(
+                    &config,
+                    agent_alias,
+                    &tenant.tenant_id,
+                    agent_model_provider
+                        .as_ref()
+                        .and_then(|e| e.api_key.as_deref()),
+                )
+                .await?
+            }
+            None => {
+                zeroclaw_memory::create_memory_for_agent(
+                    &config,
+                    agent_alias,
+                    agent_model_provider
+                        .as_ref()
+                        .and_then(|e| e.api_key.as_deref()),
+                )
+                .await?
+            }
+        };
 
         let (composio_key, composio_entity_id) = if config.composio.enabled {
             (
@@ -3154,6 +3172,18 @@ pub async fn process_message(
         if !deferred_section.is_empty() {
             system_prompt.push('\n');
             system_prompt.push_str(&deferred_section);
+        }
+
+        // Cerveau: append the tenant's persona as pre-framed inert operator
+        // data. The block is rendered and fenced by the gateway (untrusted
+        // input; carries no instruction authority) — appended last so the
+        // host agent's security rules above it always take precedence.
+        if let Some(tenant) = crate::agent::tenant::current_tenant()
+            && let Some(persona) = tenant.persona.as_deref()
+            && !persona.is_empty()
+        {
+            system_prompt.push('\n');
+            system_prompt.push_str(persona);
         }
 
         // ── Parse thinking directive from user message ─────────────

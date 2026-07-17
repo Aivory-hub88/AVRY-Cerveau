@@ -541,7 +541,8 @@ async fn handle_alias_task(
     }
 
     let session_id = format!("a2a_{alias}_{}", Uuid::new_v4());
-    match run_gateway_chat_with_tools(&state, &prompt, Some(&session_id), Some(&alias)).await {
+    match run_gateway_chat_with_tools(&state, &prompt, Some(&session_id), Some(&alias), None).await
+    {
         Ok(outcome) => {
             let task = OutTask {
                 id: Uuid::new_v4().to_string(),

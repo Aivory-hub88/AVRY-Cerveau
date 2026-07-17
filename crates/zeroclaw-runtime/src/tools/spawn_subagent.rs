@@ -209,7 +209,10 @@ impl Tool for SpawnSubagentTool {
                     originator_route: None,
                     delivered: false,
                     idem_key: None,
-                    principal_id: None,
+                    // Cerveau: tenant turns stamp their identity into the
+                    // EPIC-D principal seam so task ownership is tenant-scoped.
+                    principal_id: crate::agent::tenant::current_tenant()
+                        .map(|t| t.tenant_id.clone()),
                     started_at: chrono::Utc::now().to_rfc3339(),
                     finished_at: None,
                 })
