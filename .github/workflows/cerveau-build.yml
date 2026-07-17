@@ -34,6 +34,15 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
+      # Cerveau gate: multi-tenant identity + adversarial isolation tests.
+      # A red isolation test means a cross-tenant leak — never ship that
+      # artifact.
+      - name: Tenant identity & isolation tests
+        run: |
+          cargo test --locked -p zeroclaw-memory --test tenant_isolation
+          cargo test --locked -p zeroclaw-runtime tenant
+          cargo test --locked -p zeroclaw-gateway tenant::
+
       # xtask wrapper: renders the gateway OpenAPI spec, generates
       # web/src/lib/api-generated.ts, then npm ci + vite build.
       # The gateway embeds web/dist/ into the binary.
