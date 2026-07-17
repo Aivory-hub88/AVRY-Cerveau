@@ -44,16 +44,20 @@ async fn exec(sql: &str) {
     .expect("admin task join");
 }
 
+/// `agent_id` in the memories table is the agents-table UUID, enforced by an
+/// FK — resolve the alias to its UUID and pass it in the correct (7th)
+/// `agent_id` argument slot. (Slots 5/6 are `_namespace`/`_importance`.)
 async fn seed(mem: &PostgresMemory, agent: &str, category: MemoryCategory, n: usize, prefix: &str) {
+    let uuid = mem.ensure_agent_uuid(agent).await.expect("uuid");
     for i in 0..n {
         mem.store_with_agent(
             &format!("{prefix}_{agent}_{i}"),
             &format!("memory {prefix} {i} for {agent}"),
             category.clone(),
             None,
-            Some(agent),
             None,
             None,
+            Some(&uuid),
         )
         .await
         .expect("store");
@@ -61,7 +65,8 @@ async fn seed(mem: &PostgresMemory, agent: &str, category: MemoryCategory, n: us
 }
 
 async fn count_for(mem: &PostgresMemory, agent: &str) -> usize {
-    mem.recall_for_agents(&[agent], "*", 10_000, None, None, None)
+    let uuid = mem.ensure_agent_uuid(agent).await.expect("uuid");
+    mem.recall_for_agents(&[&uuid], "*", 10_000, None, None, None)
         .await
         .expect("recall")
         .len()
