@@ -1171,6 +1171,7 @@ impl PostgresMemory {
     pub async fn init_lifecycle_schema(&self) -> Result<()> {
         let client = self.client.get().clone();
         let quota = self.qualified_tenant_quota();
+        let table = self.qualified_table.clone();
         run_on_os_thread(move || -> Result<()> {
             let mut client = client.lock();
             client.batch_execute(&format!(
@@ -1179,7 +1180,11 @@ impl PostgresMemory {
                      category TEXT NOT NULL,
                      max_rows BIGINT NOT NULL,
                      PRIMARY KEY (agent_id, category)
-                 );"
+                 );
+                 -- `importance` is only added by the pgvector migration; the
+                 -- budget ranking needs it regardless of vector state, so
+                 -- guarantee it here (idempotent).
+                 ALTER TABLE {table} ADD COLUMN IF NOT EXISTS importance REAL;"
             ))?;
             Ok(())
         })
