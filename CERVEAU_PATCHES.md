@@ -32,6 +32,8 @@ git fetch upstream --tags
 
 | 0004 | F-2 (primitive): durable tool-idempotency ledger | Closes the mid-turn-crash replay window (a replayed turn re-running a side-effectful tool). SQLite ledger in `control_plane.db` with a claim/complete/release protocol: `Claimed` → execute+complete, `AlreadyDone(output)` → reuse never re-execute, `InFlight` → crash case. Length-prefixed SHA-256 key over principal+task+turn+tool+args. 6 tests. Hot-loop wiring + F-1 auto-resume deferred (see ADR-003) | `zeroclaw-runtime/src/control_plane/{tool_idem.rs,mod.rs}` |
 
+| 0005 | Postgres memory lifecycle (tenant-scoped retention + budget) | Upstream lifecycle (hygiene/budget) is SQLite/filesystem-only; the Postgres backend had no bounded-growth path (ADR-004). Adds `PostgresMemory::{init_lifecycle_schema,set_tenant_quota,run_lifecycle}` — one set-based pass enforces age retention (core exempt) + per-tenant budget for ALL tenants at once via `row_number() PARTITION BY agent_id`, with a per-tier `cerveau_tenant_quota` override table LEFT JOINed in. Embedding dims locked at 768 (ADR-004). CI now runs a Postgres service container; 3 integration tests (per-tenant independence, quota override, core-durable retention) | `zeroclaw-memory/src/postgres.rs`, `zeroclaw-memory/tests/pg_lifecycle.rs`, `.github/workflows/cerveau-build.yml` |
+
 ### Planned (per the execution plan; not yet applied)
 
 - **P-isolation (slice 2)** — the isolation suite against a real Postgres service container in CI;
