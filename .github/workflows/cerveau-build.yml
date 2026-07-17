@@ -80,6 +80,11 @@ jobs:
       - name: Build release binary
         run: |
           FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection dist --target x86_64-unknown-linux-gnu)"
+          # Cerveau: the dist selection does NOT include the Postgres memory
+          # backend — without it the binary ships a stub that errors at
+          # runtime ("compiled without memory-postgres"). Tenant memory lives
+          # in Postgres (ADR-002 D5 / ADR-004), so append it explicitly.
+          FEATURES="$FEATURES,memory-postgres"
           echo "Resolved features: $FEATURES"
           cargo build --release --locked --no-default-features \
             --features "$FEATURES" \
