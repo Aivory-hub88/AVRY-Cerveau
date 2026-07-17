@@ -30,14 +30,16 @@ git fetch upstream --tags
 
 | 0003 | P-isolation (slice 1): adversarial cross-tenant tests as a CI gate | Five attack-shaped tests over the exact production mechanism (shared SQL backend + per-tenant `AgentScopedMemory` with empty allowlist): keyword/wildcard/empty recalls, shared-session-id bridging, caller-allowlist widening, exact-key lookup, and host-default-scope visibility — all must return nothing. Wired into `cerveau-build` before the release build: a red isolation test never ships an artifact. (Slice 2 later: same suite against a real Postgres service container) | `zeroclaw-memory/tests/tenant_isolation.rs`, `.github/workflows/cerveau-build.yml` |
 
+| 0004 | F-2 (primitive): durable tool-idempotency ledger | Closes the mid-turn-crash replay window (a replayed turn re-running a side-effectful tool). SQLite ledger in `control_plane.db` with a claim/complete/release protocol: `Claimed` → execute+complete, `AlreadyDone(output)` → reuse never re-execute, `InFlight` → crash case. Length-prefixed SHA-256 key over principal+task+turn+tool+args. 6 tests. Hot-loop wiring + F-1 auto-resume deferred (see ADR-003) | `zeroclaw-runtime/src/control_plane/{tool_idem.rs,mod.rs}` |
+
 ### Planned (per the execution plan; not yet applied)
 
 - **P-isolation (slice 2)** — the isolation suite against a real Postgres service container in CI;
   tenant scoping asserted on `control_plane` task rows once F-1/F-2 land.
-- **F-1** — boot recovery enqueues a continuation for owned tasks with a persisted
-  `TaskContinuationContext` instead of defaulting them to `Lost`.
-- **F-2** — idempotency keys on side-effectful tool executions
-  (dedup key = task id + turn + tool + args hash). Upstream candidate.
+- **F-1** — boot-time auto-resume of crashed in-flight tasks. Deferred: needs a goal-execution
+  driver seam that does not yet exist (see ADR-003). Own patch after F-2 wiring.
+- **F-2 wiring** — thread the landed ledger (0004) into `execute_one_tool`, gated on a deliberate
+  side-effect taxonomy (ADR-003). The ledger primitive itself is done.
 
 ## Rebase procedure
 
