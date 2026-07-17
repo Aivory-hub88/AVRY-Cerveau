@@ -8,6 +8,7 @@ pub mod goal_task;
 pub mod reaper;
 pub mod task_registry;
 pub mod task_store_sqlite;
+pub mod tool_idem;
 
 pub use authority::is_authoritative;
 pub use boot::ControlPlaneHandle;
