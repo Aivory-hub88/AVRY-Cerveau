@@ -3077,6 +3077,8 @@ pub fn migrate_postgres_memory_to_v3(
     client: &mut postgres::Client,
     schema_ident: &str,
     qualified_table: &str,
+    schema: &str,
+    table: &str,
 ) -> MigResult<()> {
     let qualified_agents = format!("{schema_ident}.agents");
 
@@ -3118,8 +3120,11 @@ pub fn migrate_postgres_memory_to_v3(
         DO $$
         BEGIN
             IF NOT EXISTS (
-                SELECT 1 FROM pg_constraint
-                WHERE conname = 'memories_agent_id_notnull_chk'
+                SELECT 1 FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE c.conname = 'memories_agent_id_notnull_chk'
+                  AND n.nspname = '{schema}' AND t.relname = '{table}'
             ) THEN
                 ALTER TABLE {qualified_table}
                     ADD CONSTRAINT memories_agent_id_notnull_chk
@@ -3131,8 +3136,11 @@ pub fn migrate_postgres_memory_to_v3(
         DO $$
         BEGIN
             IF NOT EXISTS (
-                SELECT 1 FROM pg_constraint
-                WHERE conname = 'memories_agent_id_fk'
+                SELECT 1 FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE c.conname = 'memories_agent_id_fk'
+                  AND n.nspname = '{schema}' AND t.relname = '{table}'
             ) THEN
                 ALTER TABLE {qualified_table}
                     ADD CONSTRAINT memories_agent_id_fk
@@ -3146,8 +3154,11 @@ pub fn migrate_postgres_memory_to_v3(
         DO $$
         BEGIN
             IF NOT EXISTS (
-                SELECT 1 FROM pg_constraint
-                WHERE conname = 'memories_agent_key_uniq'
+                SELECT 1 FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE c.conname = 'memories_agent_key_uniq'
+                  AND n.nspname = '{schema}' AND t.relname = '{table}'
             ) THEN
                 ALTER TABLE {qualified_table}
                     ADD CONSTRAINT memories_agent_key_uniq UNIQUE (agent_id, key);
