@@ -38,6 +38,14 @@ pub struct TenantContext {
     /// namespace prefix) as the memory agent-id dimension and as the
     /// `principal_id` stamped on task records.
     pub tenant_id: String,
+    /// The raw platform user id (`X-Tenant-Id`, pre-flattening), distinct
+    /// from `tenant_id` which also folds in the agent type. Per ADR-002 D2,
+    /// third-party OAuth connections (Composio) are per-*user*, shared
+    /// across every agent the user deploys — so entity-scoped tool access
+    /// (Phase 4.1, `McpServerConfig::tenant_entity_query_param`) must key
+    /// off this field, not `tenant_id`. Authenticated by the gateway same
+    /// as `tenant_id`; never derived from agent output or message content.
+    pub platform_user_id: String,
     /// Pre-rendered inert persona block to append to the system prompt,
     /// already fenced/framed as untrusted operator data by the gateway.
     /// `None` when the tenant has no persona configured (defaults apply).
@@ -71,6 +79,7 @@ mod tests {
     async fn scoped_context_is_visible_inside_and_gone_outside() {
         let ctx = Arc::new(TenantContext {
             tenant_id: "u1:cs".to_string(),
+            platform_user_id: "u1".to_string(),
             persona: Some("<operator_config>…</operator_config>".to_string()),
         });
         TENANT_CONTEXT

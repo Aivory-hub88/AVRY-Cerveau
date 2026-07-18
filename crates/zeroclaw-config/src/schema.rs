@@ -4329,6 +4329,45 @@ impl Config {
         }
     }
 
+    /// Cerveau (Phase 4.1 — Composio-as-MCP, ADR-002 D2 extension): like
+    /// [`Self::mcp_servers_for_agent`], but resolves servers whose
+    /// `tenant_entity_query_param` is set (e.g. Composio's `user_id`)
+    /// against the *authenticated* tenant's platform user id.
+    ///
+    /// - `tenant_platform_user_id = None` — a vanilla (non-tenant) turn, or
+    ///   a tenant turn the caller chose not to entity-scope: every
+    ///   tenant-gated server is dropped, never connected with no entity and
+    ///   never falling back to a default/shared account.
+    /// - `Some(id)` — `id` must be sourced from the caller's authenticated
+    ///   tenant context (`TenantContext::platform_user_id` in
+    ///   `zeroclaw-runtime`), never from agent output, tool results, or
+    ///   message content; this function has no way to enforce that
+    ///   itself, so it is the caller's obligation.
+    ///
+    /// A tenant-gated server whose `url` fails to parse is dropped rather
+    /// than connected unscoped (fail closed).
+    #[must_use]
+    pub fn mcp_servers_for_agent_and_tenant(
+        &self,
+        agent_alias: &str,
+        tenant_platform_user_id: Option<&str>,
+    ) -> Vec<McpServerConfig> {
+        self.mcp_servers_for_agent(agent_alias)
+            .into_iter()
+            .filter_map(|mut server| {
+                let Some(param) = server.tenant_entity_query_param.clone() else {
+                    return Some(server);
+                };
+                let user_id = tenant_platform_user_id?;
+                let url = server.url.as_ref()?;
+                let mut parsed = url::Url::parse(url).ok()?;
+                parsed.query_pairs_mut().append_pair(&param, user_id);
+                server.url = Some(parsed.into());
+                Some(server)
+            })
+            .collect()
+    }
+
     /// Resolve a set of `[mcp_bundles.<alias>]` references to the concrete
     /// `[mcp.servers]` entries they grant.
     ///
@@ -4980,6 +5019,18 @@ pub struct McpServerConfig {
     /// warning. Read once per run (not refreshed; no subscriptions).
     #[serde(default)]
     pub pinned_resources: Vec<String>,
+    /// Cerveau (Phase 4.1, P-identity extension): name of a URL query
+    /// parameter that carries the caller's entity id on this server (e.g.
+    /// Composio's `user_id`, scoping which of the platform user's
+    /// connected accounts a tool call acts through). When set, this server
+    /// is tenant-gated: it is connected only inside a tenant-scoped turn,
+    /// with the value sourced *exclusively* from the authenticated
+    /// `TenantContext::platform_user_id` — never from agent/LLM output or
+    /// message content. Vanilla (non-tenant) turns never connect a server
+    /// with this set, so a single-operator install is unaffected. Leave
+    /// unset for servers that are not per-tenant (e.g. `n8n-mcp`).
+    #[serde(default)]
+    pub tenant_entity_query_param: Option<String>,
 }
 
 /// External MCP client configuration (`[mcp]` section).
@@ -23804,7 +23855,103 @@ untrusted_outbound_redact = false
         );
     }
 
-    /// Regression test for the operator-UX warning added alongside:
+    /// Config with a tenant-gated `composio` server (alongside a plain
+    /// `n8n` server) granted to agent `aaatools`.
+    fn config_with_tenant_gated_composio_server() -> Config {
+        let mut config = Config::default();
+        config.mcp.servers.push(McpServerConfig {
+            name: "composio".to_string(),
+            url: Some("https://mcp.composio.dev/v1".to_string()),
+            tenant_entity_query_param: Some("user_id".to_string()),
+            ..McpServerConfig::default()
+        });
+        config.mcp.servers.push(mcp_server("n8n"));
+        config.mcp_bundles.insert(
+            "tools".to_string(),
+            McpBundleConfig {
+                servers: vec!["composio".to_string(), "n8n".to_string()],
+                exclude: vec![],
+            },
+        );
+        config.agents.insert(
+            "aaatools".to_string(),
+            AliasedAgentConfig {
+                mcp_bundles: vec!["tools".to_string()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+    }
+
+    #[test]
+    async fn tenant_gated_mcp_server_dropped_without_a_tenant() {
+        // Vanilla / no-tenant turn: never connect a tenant-gated server
+        // with no entity to scope it to, never fall back to a shared one.
+        let config = config_with_tenant_gated_composio_server();
+        let granted: Vec<String> = config
+            .mcp_servers_for_agent_and_tenant("aaatools", None)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            granted,
+            vec!["n8n"],
+            "the tenant-gated composio server is dropped; the ungated n8n server is unaffected"
+        );
+    }
+
+    #[test]
+    async fn tenant_gated_mcp_server_gets_entity_scoped_url() {
+        let config = config_with_tenant_gated_composio_server();
+        let servers = config.mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"));
+        let composio = servers
+            .iter()
+            .find(|s| s.name == "composio")
+            .expect("composio server retained when a tenant is present");
+        assert_eq!(
+            composio.url.as_deref(),
+            Some("https://mcp.composio.dev/v1?user_id=u_42"),
+            "the platform user id is appended as the configured query param"
+        );
+        let n8n = servers.iter().find(|s| s.name == "n8n").expect("n8n server retained");
+        assert_eq!(
+            n8n.url, None,
+            "an ungated server's url is untouched by tenant scoping"
+        );
+    }
+
+    #[test]
+    async fn tenant_gated_mcp_server_with_existing_query_string_appends() {
+        let mut config = config_with_tenant_gated_composio_server();
+        config.mcp.servers[0].url = Some("https://mcp.composio.dev/v1?region=us".to_string());
+
+        let servers = config.mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"));
+        let composio = servers.iter().find(|s| s.name == "composio").unwrap();
+        assert_eq!(
+            composio.url.as_deref(),
+            Some("https://mcp.composio.dev/v1?region=us&user_id=u_42"),
+            "an existing query string is preserved, not clobbered"
+        );
+    }
+
+    #[test]
+    async fn tenant_gated_mcp_server_with_unparseable_url_is_dropped_not_unscoped() {
+        let mut config = config_with_tenant_gated_composio_server();
+        config.mcp.servers[0].url = Some("not a url".to_string());
+
+        let granted: Vec<String> = config
+            .mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"))
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            granted,
+            vec!["n8n"],
+            "fail closed: an unparseable tenant-gated url is dropped, never connected unscoped"
+        );
+    }
+
+    /// Regression test for the operator-UX warning added alongside #7733:
     /// when MCP is enabled and `[[mcp.servers]]` is non-empty but no
     /// `[mcp_bundles.*]` exists, validate() must still succeed (warnings
     /// are non-fatal) AND every agent must resolve to zero servers
