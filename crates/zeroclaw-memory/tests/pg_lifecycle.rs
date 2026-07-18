@@ -6,12 +6,13 @@
 //! no-op so the suite stays green without Postgres.
 //!
 //! All scenarios run inside ONE test on ONE freshly-recreated schema,
-//! sequentially. That is deliberate: upstream's v3 migration checks
+//! sequentially. Originally deliberate: upstream's v3 migration checked
 //! `pg_constraint.conname` WITHOUT scoping to the table's schema, so two
-//! same-named `memories` tables in different schemas being migrated at once
-//! interfere. Production has a single `cerveau` schema, so this never bites
-//! there — but parallel per-schema tests would. One schema, serial scenarios,
-//! truncate between them.
+//! same-named `memories` tables in different schemas being migrated
+//! interfered. That is now fixed (schema-scoped constraint checks; see
+//! `pg_v3_migration_schema_scope.rs`), but this suite stays single-schema —
+//! there is no need to add cross-schema noise to a lifecycle test. One
+//! schema, serial scenarios, truncate between them.
 //!
 //! Proven: retention prune (core durable, conversation aged out); per-tenant
 //! budget enforced INDEPENDENTLY per tenant in a single set-based pass; a

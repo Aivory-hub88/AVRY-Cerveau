@@ -88,6 +88,8 @@ impl PostgresMemory {
             connect_timeout_secs,
             schema_ident.clone(),
             qualified_table.clone(),
+            schema.to_string(),
+            table.to_string(),
             pgvector,
         )?;
 
@@ -113,6 +115,8 @@ impl PostgresMemory {
         connect_timeout_secs: Option<u64>,
         schema_ident: String,
         qualified_table: String,
+        schema: String,
+        table: String,
         pgvector: Option<usize>,
     ) -> Result<(Client, bool)> {
         let init_handle = std::thread::Builder::new()
@@ -136,6 +140,8 @@ impl PostgresMemory {
                     &mut client,
                     &schema_ident,
                     &qualified_table,
+                    &schema,
+                    &table,
                 )?;
                 // The synchronous postgres client uses block_on internally,
                 // so pgvector setup must also stay on this plain OS thread —
