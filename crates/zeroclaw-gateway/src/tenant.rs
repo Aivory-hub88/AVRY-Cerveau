@@ -306,6 +306,7 @@ pub fn build_tenant_context(
 ) -> Arc<TenantContext> {
     Arc::new(TenantContext {
         tenant_id: sel.tenant_id(),
+        platform_user_id: sel.user_id.clone(),
         persona: persona.and_then(render_persona_block),
     })
 }
@@ -374,5 +375,21 @@ mod tests {
     #[test]
     fn empty_persona_renders_nothing() {
         assert!(render_persona_block(&TenantPersona::default()).is_none());
+    }
+
+    /// Phase 4.1: `platform_user_id` must carry the raw `user_id`, distinct
+    /// from `tenant_id` (which also folds in `agent_type`) — Composio
+    /// connections are per-user, shared across the user's agents (ADR-002
+    /// D2), so entity scoping must key off the former, not the latter.
+    #[test]
+    fn tenant_context_platform_user_id_is_the_raw_user_id_not_the_composite_tenant_id() {
+        let sel = TenantSelector {
+            user_id: "user_d09".to_string(),
+            agent_type: "cs".to_string(),
+        };
+        let ctx = build_tenant_context(&sel, None);
+        assert_eq!(ctx.platform_user_id, "user_d09");
+        assert_eq!(ctx.tenant_id, "user_d09.cs");
+        assert_ne!(ctx.platform_user_id, ctx.tenant_id);
     }
 }
