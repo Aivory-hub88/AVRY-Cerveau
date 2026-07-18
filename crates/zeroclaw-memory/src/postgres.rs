@@ -103,6 +103,8 @@ impl PostgresMemory {
             connect_timeout_secs,
             schema_ident.clone(),
             qualified_table.clone(),
+            schema.to_string(),
+            table.to_string(),
         )?;
 
         let pgvector_enabled = pgvector_enabled.unwrap_or(false);
@@ -143,6 +145,8 @@ impl PostgresMemory {
         connect_timeout_secs: Option<u64>,
         schema_ident: String,
         qualified_table: String,
+        schema: String,
+        table: String,
     ) -> Result<Client> {
         let init_handle = std::thread::Builder::new()
             .name("postgres-memory-init".to_string())
@@ -165,6 +169,8 @@ impl PostgresMemory {
                     &mut client,
                     &schema_ident,
                     &qualified_table,
+                    &schema,
+                    &table,
                 )?;
                 Ok(client)
             })
