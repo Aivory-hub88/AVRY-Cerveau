@@ -10461,6 +10461,21 @@ pub struct MemoryConfig {
     // postgres.*) live on `[storage.<backend>.<alias>]`. The `backend` field
     // carries a dotted alias reference and the runtime looks up the typed
     // config via `Config::resolve_active_storage`.
+
+    // ── Cerveau: background turn consolidation (P-consolidation) ──
+    /// Distill each tenant turn into long-term memory in the background
+    /// (`consolidate_turn`, an LLM sub-call per turn). Off disables the
+    /// distill entirely; memory then only holds what the agent explicitly
+    /// writes via the memory tool.
+    #[serde(default = "default_true")]
+    pub consolidation_enabled: bool,
+    /// Fraction of eligible tenant turns to actually consolidate, 0.0-1.0.
+    /// 1.0 (default) consolidates every turn, matching the behavior this
+    /// knob was added to gate. Lower it to cut the per-turn LLM distill
+    /// cost at scale, trading recall freshness for spend; values are
+    /// clamped to [0.0, 1.0].
+    #[serde(default = "default_consolidation_sample_rate")]
+    pub consolidation_sample_rate: f64,
 }
 
 /// Memory policy configuration (`[memory.policy]` section).
@@ -10482,6 +10497,9 @@ pub struct MemoryPolicyConfig {
     pub read_only_namespaces: Vec<String>,
 }
 
+fn default_consolidation_sample_rate() -> f64 {
+    1.0
+}
 fn default_retrieval_stages() -> Vec<String> {
     vec!["cache".into(), "fts".into(), "vector".into()]
 }
@@ -10644,6 +10662,8 @@ impl Default for MemoryConfig {
             audit_enabled: false,
             audit_retention_days: default_audit_retention_days(),
             policy: MemoryPolicyConfig::default(),
+            consolidation_enabled: true,
+            consolidation_sample_rate: default_consolidation_sample_rate(),
         }
     }
 }
