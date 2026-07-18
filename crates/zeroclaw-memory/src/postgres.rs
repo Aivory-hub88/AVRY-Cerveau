@@ -98,48 +98,49 @@ impl PostgresMemory {
         let qualified_table = format!("{schema_ident}.{table_ident}");
         let qualified_agents = format!("{schema_ident}.agents");
 
-        let client = Self::initialize_client(
+        let pgvector_enabled = pgvector_enabled.unwrap_or(false);
+        let pgvector_dimensions = pgvector_dimensions.unwrap_or(1536);
+
+        let (client, pgvector_ext_ok) = Self::initialize_client(
             db_url.to_string(),
             connect_timeout_secs,
             schema_ident.clone(),
             qualified_table.clone(),
             schema.to_string(),
             table.to_string(),
+            pgvector_enabled,
+            pgvector_dimensions,
         )?;
 
-        let pgvector_enabled = pgvector_enabled.unwrap_or(false);
-        let pgvector_dimensions = pgvector_dimensions.unwrap_or(1536);
-
-        if pgvector_enabled {
-            let client_ref = Arc::new(Mutex::new(client));
-            let ext_ok = {
-                let mut c = client_ref.lock();
-                Self::try_enable_pgvector(&mut c, &qualified_table, pgvector_dimensions).is_ok()
-            };
-            if !ext_ok {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    "pgvector extension not available; falling back to keyword-only recall"
-                );
-            }
-            Ok(Self {
-                alias: alias.to_string(),
-                client: DropOnThread::new(client_ref),
-                qualified_table,
-                qualified_agents,
-            })
-        } else {
-            Ok(Self {
-                alias: alias.to_string(),
-                client: DropOnThread::new(Arc::new(Mutex::new(client))),
-                qualified_table,
-                qualified_agents,
-            })
+        if pgvector_enabled && !pgvector_ext_ok {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "pgvector extension not available; falling back to keyword-only recall"
+            );
         }
+
+        Ok(Self {
+            alias: alias.to_string(),
+            client: DropOnThread::new(Arc::new(Mutex::new(client))),
+            qualified_table,
+            qualified_agents,
+        })
     }
 
+    /// Connects, migrates, and (if requested) enables pgvector — all on one
+    /// dedicated OS thread.
+    ///
+    /// `try_enable_pgvector` drives the sync `postgres::Client`'s own
+    /// internal Tokio runtime via `block_on`. Previously it ran back on
+    /// whatever thread called `new()`; when that thread was itself a worker
+    /// of the daemon's async runtime, entering the client's runtime from
+    /// inside another one panicked ("Cannot start a runtime from within a
+    /// runtime"), crash-looping the daemon. Folding it into the same
+    /// spawned init thread as the schema/migration calls (which already had
+    /// to isolate themselves this way) keeps every blocking Postgres call
+    /// off the async runtime's threads.
     fn initialize_client(
         db_url: String,
         connect_timeout_secs: Option<u64>,
@@ -147,10 +148,12 @@ impl PostgresMemory {
         qualified_table: String,
         schema: String,
         table: String,
-    ) -> Result<Client> {
+        pgvector_enabled: bool,
+        pgvector_dimensions: usize,
+    ) -> Result<(Client, bool)> {
         let init_handle = std::thread::Builder::new()
             .name("postgres-memory-init".to_string())
-            .spawn(move || -> Result<Client> {
+            .spawn(move || -> Result<(Client, bool)> {
                 let mut config: postgres::Config = db_url
                     .parse()
                     .context("invalid PostgreSQL connection URL")?;
@@ -172,7 +175,12 @@ impl PostgresMemory {
                     &schema,
                     &table,
                 )?;
-                Ok(client)
+
+                let pgvector_ext_ok = pgvector_enabled
+                    && Self::try_enable_pgvector(&mut client, &qualified_table, pgvector_dimensions)
+                        .is_ok();
+
+                Ok((client, pgvector_ext_ok))
             })
             .context("failed to spawn PostgreSQL initializer thread")?;
 
