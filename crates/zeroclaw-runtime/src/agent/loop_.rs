@@ -683,6 +683,14 @@ fn autosave_memory_key(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4())
 }
 
+/// Cerveau (P-consolidation cost knob): decide whether this turn's roll
+/// falls inside `sample_rate` (0.0-1.0, out-of-range values clamp). `roll`
+/// is a caller-supplied `[0.0, 1.0)` draw so the decision is pure and
+/// testable; production callers pass `rand::random()`.
+fn should_consolidate(sample_rate: f64, roll: f64) -> bool {
+    roll < sample_rate.clamp(0.0, 1.0)
+}
+
 /// Build hardware datasheet context from RAG when peripherals are enabled.
 /// Includes pin-alias lookup (e.g. "red_led" → 13) when query matches, plus retrieved chunks.
 fn build_hardware_context(
@@ -3357,8 +3365,19 @@ pub async fn process_message(
         // it adds no latency to the reply; the memory handle is already
         // tenant-scoped, so what it writes stays tenant-jailed. Vanilla
         // (non-tenant) turns are unchanged.
+        //
+        // `consolidation_enabled` + `consolidation_sample_rate` are the cost
+        // knob queued in ADR-004 §4b item 3: each consolidation is an LLM
+        // sub-call, so at scale an operator may want it off entirely or
+        // sampled down rather than run on every single tenant turn. The roll
+        // is taken once here (not inside the spawned task) so a disabled/
+        // zero-rate config never even reaches the RNG.
+        let consolidation_sampled_in =
+            should_consolidate(config.memory.consolidation_sample_rate, rand::random());
         if let Ok(ref assistant_reply) = turn_outcome
             && config.memory.auto_save
+            && config.memory.consolidation_enabled
+            && consolidation_sampled_in
             && crate::agent::tenant::current_tenant().is_some()
         {
             let mem_bg = Arc::clone(&mem);
@@ -3403,7 +3422,8 @@ mod tests {
     use super::{
         apply_text_tool_prompt_policy, estimate_history_tokens, load_interactive_session_history,
         make_query_summary, maybe_inject_channel_delivery_defaults,
-        save_interactive_session_history, seed_channel_handles, truncate_tool_result,
+        save_interactive_session_history, seed_channel_handles, should_consolidate,
+        truncate_tool_result,
     };
 
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
@@ -16560,5 +16580,34 @@ Pin 13: LED
             CappedLine::Line(line) => assert_eq!(line, "next-line"),
             other => panic!("expected Line, got {other:?}"),
         }
+    }
+
+    // ── Cerveau: P-consolidation cost-knob sampling ─────────────────────
+
+    #[test]
+    fn should_consolidate_rate_one_always_samples_in() {
+        assert!(should_consolidate(1.0, 0.0));
+        assert!(should_consolidate(1.0, 0.999_999));
+    }
+
+    #[test]
+    fn should_consolidate_rate_zero_never_samples_in() {
+        assert!(!should_consolidate(0.0, 0.0));
+        assert!(!should_consolidate(0.0, 0.000_001));
+    }
+
+    #[test]
+    fn should_consolidate_mid_rate_splits_on_roll() {
+        assert!(should_consolidate(0.5, 0.49));
+        assert!(!should_consolidate(0.5, 0.5));
+        assert!(!should_consolidate(0.5, 0.51));
+    }
+
+    #[test]
+    fn should_consolidate_out_of_range_rate_clamps() {
+        // A misconfigured rate above 1.0 behaves like 1.0, not "never".
+        assert!(should_consolidate(2.0, 0.999_999));
+        // A negative rate behaves like 0.0, not "always".
+        assert!(!should_consolidate(-1.0, 0.0));
     }
 }
