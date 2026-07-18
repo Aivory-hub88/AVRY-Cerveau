@@ -298,7 +298,15 @@ impl ScopedToolRegistry {
         let mut mcp_tool_names: HashSet<String> = HashSet::new();
 
         let agent_mcp_servers = if connect_mcp && config.mcp.enabled {
-            config.mcp_servers_for_agent(agent_alias)
+            // Cerveau (Phase 4.1): entity-scope tenant-gated servers (e.g.
+            // Composio) to the authenticated tenant's platform user id;
+            // `current_tenant()` is None outside a tenant-scoped turn, so
+            // vanilla installs resolve identically to `mcp_servers_for_agent`.
+            let tenant = crate::agent::tenant::current_tenant();
+            config.mcp_servers_for_agent_and_tenant(
+                agent_alias,
+                tenant.as_deref().map(|t| t.platform_user_id.as_str()),
+            )
         } else {
             Vec::new()
         };
