@@ -50,3 +50,14 @@ cerveau-skills/<agent-type>/<skill-name>/
   instance** — drafted and parse-verified only; wiring a real Composio
   toolkit connection is a separate follow-up (see the skill's reference doc
   for the checklist).
+- `office-assistant/meeting-outcomes/` — extracts decisions/action-items
+  (owner + due date)/risks from meeting notes for the `office_assistant`
+  agent (Enterprise-gated on the platform side via `record_meeting_summary`
+  in `ENTERPRISE_TOOLS`), always persisted locally first, then synced to
+  whichever of Notion/Slack/Google Sheets the tenant has connected — all
+  three toolkits are already in `COMPOSIO_CURATED`, no new toolkit needed.
+  See `references/composio-tools.md` for verified tool schemas, including a
+  flagged bug: `COMPOSIO_CURATED.slack` in `telegram-agent.js` currently
+  points to Composio's deprecated `SLACK_CHAT_POST_MESSAGE`, not the
+  current `SLACK_SEND_MESSAGE`. **Not yet installed to any running
+  instance.**
