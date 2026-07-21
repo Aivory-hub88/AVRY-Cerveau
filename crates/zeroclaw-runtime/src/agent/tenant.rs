@@ -46,6 +46,25 @@ pub struct TenantContext {
     /// off this field, not `tenant_id`. Authenticated by the gateway same
     /// as `tenant_id`; never derived from agent output or message content.
     pub platform_user_id: String,
+    /// The tenant's Aivory agent type (`autonomous`, `customer_service`,
+    /// `leads_qualifier`, `finance_invoice_ops`, `office_assistant`) — the
+    /// raw `X-Agent-Type` header value, authenticated by the gateway same
+    /// as `tenant_id`/`platform_user_id`.
+    ///
+    /// This is deliberately *not* used to select which host
+    /// `[agents.<alias>]` a turn runs on (that's `?agent=`, resolved
+    /// independently — see `zeroclaw-gateway`'s
+    /// `resolve_gateway_chat_agent_alias`, and the current bridge's own
+    /// `telegram-agent.js` for the reference pattern: one running process,
+    /// `agent_type` is a per-request data value that dynamically selects
+    /// prompt/tools, never a provisioning axis). Here it drives which
+    /// *additional* skill bundles this turn loads on top of whatever the
+    /// host alias already grants — see
+    /// `Config::skill_bundle_aliases_for_tenant` (Phase 4.1 follow-on,
+    /// patch 0011) — the same data-driven pattern already used for
+    /// persona (this struct) and Composio entity scoping
+    /// (`platform_user_id`, patch 0010).
+    pub agent_type: String,
     /// Pre-rendered inert persona block to append to the system prompt,
     /// already fenced/framed as untrusted operator data by the gateway.
     /// `None` when the tenant has no persona configured (defaults apply).
@@ -80,6 +99,7 @@ mod tests {
         let ctx = Arc::new(TenantContext {
             tenant_id: "u1:cs".to_string(),
             platform_user_id: "u1".to_string(),
+            agent_type: "customer_service".to_string(),
             persona: Some("<operator_config>…</operator_config>".to_string()),
         });
         TENANT_CONTEXT

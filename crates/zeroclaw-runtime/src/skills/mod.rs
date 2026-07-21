@@ -625,51 +625,127 @@ pub fn load_skills_for_agent_audited(
         .map(|s| (s.name.clone(), origin_hint_of(s)))
         .collect();
     for bundle_alias in &agent.skill_bundles {
-        let bundle = match config.skill_bundles.get(bundle_alias) {
-            Some(b) => b,
-            None => {
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "bundle": bundle_alias, "bundle_alias": bundle_alias})), "skipping skill bundle: [skill_bundles.] is not configured");
-                continue;
-            }
-        };
-        let dir = match zeroclaw_config::skill_bundles::resolve_directory(
+        apply_skill_bundle(
+            bundle_alias,
             config,
             &install_root,
+            allow_scripts,
+            agent_alias,
+            &mut skills,
+            &mut dropped,
+            &mut seen,
+            &mut shadows,
+        );
+    }
+    (skills, dropped, shadows)
+}
+
+/// Cerveau (Phase 4.1 follow-on, patch 0011): like
+/// [`load_skills_for_agent_audited`], but additionally grants the skill
+/// bundles configured for the tenant's Aivory agent type
+/// (`[agent_type_skill_bundles.<agent_type>]`), on top of whatever the host
+/// `[agents.<alias>]` already grants. `tenant_agent_type = None` (a vanilla,
+/// non-tenant turn) behaves identically to `load_skills_for_agent_audited` —
+/// no tenant bundles are considered, matching this fork's "absent tenant
+/// context = vanilla behavior, bit-for-bit" rule (see `agent::tenant`).
+///
+/// The same first-write-wins / shadow-tracking rules apply across host and
+/// tenant bundles combined: a host-alias skill (or an earlier tenant
+/// bundle) with the same name wins over a later tenant bundle skill.
+pub fn load_skills_for_agent_and_tenant_audited(
+    workspace_dir: &Path,
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+    tenant_agent_type: Option<&str>,
+) -> (Vec<Skill>, Vec<DroppedSkill>, Vec<ShadowedSkill>) {
+    let (mut skills, mut dropped, mut shadows) =
+        load_skills_for_agent_audited(workspace_dir, config, agent_alias);
+    let tenant_bundle_aliases = config.skill_bundle_aliases_for_tenant(tenant_agent_type);
+    if tenant_bundle_aliases.is_empty() {
+        return (skills, dropped, shadows);
+    }
+    let install_root = config.install_root_dir();
+    let allow_scripts = config.skills.allow_scripts;
+    let mut seen: std::collections::HashMap<String, &'static str> = skills
+        .iter()
+        .map(|s| (s.name.clone(), origin_hint_of(s)))
+        .collect();
+    for bundle_alias in &tenant_bundle_aliases {
+        apply_skill_bundle(
             bundle_alias,
-        ) {
+            config,
+            &install_root,
+            allow_scripts,
+            agent_alias,
+            &mut skills,
+            &mut dropped,
+            &mut seen,
+            &mut shadows,
+        );
+    }
+    (skills, dropped, shadows)
+}
+
+/// Loads one `[skill_bundles.<bundle_alias>]` directory's skills into
+/// `skills`/`dropped`/`shadows`, applying the bundle's include/exclude
+/// filter and first-write-wins naming. Shared by the host-alias bundle loop
+/// ([`load_skills_for_agent_audited`]) and the tenant-agent-type bundle
+/// loop ([`load_skills_for_agent_and_tenant_audited`]) so both apply
+/// identical resolution/shadowing rules.
+#[allow(clippy::too_many_arguments)]
+fn apply_skill_bundle(
+    bundle_alias: &str,
+    config: &zeroclaw_config::schema::Config,
+    install_root: &Path,
+    allow_scripts: bool,
+    agent_alias: &str,
+    skills: &mut Vec<Skill>,
+    dropped: &mut Vec<DroppedSkill>,
+    seen: &mut std::collections::HashMap<String, &'static str>,
+    shadows: &mut Vec<ShadowedSkill>,
+) {
+    let bundle = match config.skill_bundles.get(bundle_alias) {
+        Some(b) => b,
+        None => {
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "bundle": bundle_alias, "bundle_alias": bundle_alias})), "skipping skill bundle: [skill_bundles.] is not configured");
+            return;
+        }
+    };
+    let dir =
+        match zeroclaw_config::skill_bundles::resolve_directory(config, install_root, bundle_alias)
+        {
             Ok(d) => d,
             Err(e) => {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "bundle": bundle_alias, "e": e.to_string()})), "skipping skill bundle: ");
-                continue;
+                return;
             }
         };
-        let (bundle_skills, bundle_dropped) = load_skills_from_directory(&dir, allow_scripts);
-        dropped.extend(bundle_dropped.into_iter().map(|mut d| {
-            d.origin_hint = "bundle".into();
-            d
-        }));
-        for skill in bundle_skills {
-            if !bundle.admits_skill(&skill.name) {
-                continue;
-            }
-            // First-write wins so workspace skills override bundle skills
-            // with the same name (legacy agents who edited a workspace
-            // copy keep their override after a bundle is assigned).
-            if seen.contains_key(&skill.name) {
-                // This bundle skill lost the name to an earlier source.
-                // Record the loser keyed to the winner's name so the
-                // dashboard can badge the winning skill.
-                shadows.push(ShadowedSkill {
-                    name: skill.name.clone(),
-                    origin_hint: "bundle".into(),
-                });
-            } else {
-                seen.insert(skill.name.clone(), "bundle");
-                skills.push(skill);
-            }
+    let (bundle_skills, bundle_dropped) = load_skills_from_directory(&dir, allow_scripts);
+    dropped.extend(bundle_dropped.into_iter().map(|mut d| {
+        d.origin_hint = "bundle".into();
+        d
+    }));
+    for skill in bundle_skills {
+        if !bundle.admits_skill(&skill.name) {
+            continue;
+        }
+        // First-write wins so workspace skills (or an earlier bundle)
+        // override a later bundle's skill with the same name (legacy
+        // agents who edited a workspace copy keep their override after a
+        // bundle is assigned).
+        if seen.contains_key(&skill.name) {
+            // This bundle skill lost the name to an earlier source.
+            // Record the loser keyed to the winner's name so the
+            // dashboard can badge the winning skill. (#7963)
+            shadows.push(ShadowedSkill {
+                name: skill.name.clone(),
+                origin_hint: "bundle".into(),
+            });
+        } else {
+            seen.insert(skill.name.clone(), "bundle");
+            skills.push(skill);
         }
     }
-    (skills, dropped, shadows)
 }
 
 pub fn load_skills_for_agent_from_config(
@@ -691,6 +767,25 @@ pub fn load_skills_for_agent_from_config_audited(
         config,
         agent_alias,
     )
+}
+
+/// Cerveau (Phase 4.1 follow-on, patch 0011): tenant-aware counterpart to
+/// [`load_skills_for_agent_from_config`] — additionally grants the skill
+/// bundles configured for `tenant_agent_type` (see
+/// [`load_skills_for_agent_and_tenant_audited`]). Pass `None` for vanilla,
+/// non-tenant turns; behaves identically to the non-tenant function then.
+pub fn load_skills_for_agent_and_tenant_from_config(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+    tenant_agent_type: Option<&str>,
+) -> Vec<Skill> {
+    load_skills_for_agent_and_tenant_audited(
+        &config.agent_workspace_dir(agent_alias),
+        config,
+        agent_alias,
+        tenant_agent_type,
+    )
+    .0
 }
 
 /// Load skills using explicit open-skills settings.
@@ -4286,6 +4381,87 @@ version = "0.1.0"
         .unwrap();
     }
 
+    /// Cerveau (Phase 4.1 follow-on, patch 0011):
+    /// `load_skills_for_agent_and_tenant_audited` must grant the tenant's
+    /// `[agent_type_skill_bundles.<agent_type>]` skills on top of whatever
+    /// the host alias's own workspace already has, and `None` (vanilla,
+    /// non-tenant turn) must resolve identically to the non-tenant
+    /// function.
+    #[test]
+    fn load_skills_for_agent_and_tenant_grants_tenant_bundle_on_top_of_host() {
+        let install_root = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let agent_workspace = TempDir::new().unwrap();
+        let tenant_bundle_dir = TempDir::new().unwrap();
+        let agent_alias = "host-alias";
+
+        write_test_skill(agent_workspace.path(), "host-skill");
+        write_test_skill(tenant_bundle_dir.path(), "finance-skill");
+
+        let mut config = make_config_with_agent_workspace(
+            install_root.path(),
+            data_dir.path(),
+            agent_alias,
+            agent_workspace.path().to_path_buf(),
+        );
+        config.skill_bundles.insert(
+            "finance-invoice-ops".to_string(),
+            zeroclaw_config::schema::SkillBundleConfig {
+                // `write_test_skill` nests under `<workspace>/skills/<name>/` (it
+                // mirrors an agent workspace layout); a bundle `directory` must
+                // point directly at the folder containing skill subdirectories.
+                directory: Some(
+                    tenant_bundle_dir
+                        .path()
+                        .join("skills")
+                        .display()
+                        .to_string(),
+                ),
+                ..Default::default()
+            },
+        );
+        config.agent_type_skill_bundles.insert(
+            "finance_invoice_ops".to_string(),
+            zeroclaw_config::schema::TenantSkillBundleConfig {
+                bundles: vec!["finance-invoice-ops".to_string()],
+            },
+        );
+
+        cache::invalidate();
+        let names_for = |tenant_agent_type: Option<&str>| -> Vec<String> {
+            load_skills_for_agent_and_tenant_from_config(&config, agent_alias, tenant_agent_type)
+                .into_iter()
+                .map(|s| s.name)
+                .collect()
+        };
+
+        let vanilla = names_for(None);
+        assert!(
+            vanilla.contains(&"host-skill".to_string()),
+            "got: {vanilla:?}"
+        );
+        assert!(
+            !vanilla.contains(&"finance-skill".to_string()),
+            "a vanilla/non-tenant turn must not see finance_invoice_ops's tenant bundle; got: {vanilla:?}"
+        );
+
+        let finance_tenant = names_for(Some("finance_invoice_ops"));
+        assert!(finance_tenant.contains(&"host-skill".to_string()));
+        assert!(
+            finance_tenant.contains(&"finance-skill".to_string()),
+            "a finance_invoice_ops tenant turn must additionally see its agent-type bundle; got: {finance_tenant:?}"
+        );
+
+        let other_tenant = names_for(Some("customer_service"));
+        assert!(
+            !other_tenant.contains(&"finance-skill".to_string()),
+            "a different agent_type must not see finance_invoice_ops's bundle; got: {other_tenant:?}"
+        );
+    }
+
+    /// #7963: `load_skills_for_agent_from_config_audited` returns the loaded
+    /// skills *and* the audit-dropped candidates, so the dashboard can surface
+    /// the latter. One clean + one parse-broken workspace skill → 1 + 1.
     #[test]
     fn load_skills_for_agent_from_config_audited_returns_dropped() {
         let install_root = TempDir::new().unwrap();
