@@ -307,6 +307,7 @@ pub fn build_tenant_context(
     Arc::new(TenantContext {
         tenant_id: sel.tenant_id(),
         platform_user_id: sel.user_id.clone(),
+        agent_type: sel.agent_type.clone(),
         persona: persona.and_then(render_persona_block),
     })
 }
@@ -391,5 +392,15 @@ mod tests {
         assert_eq!(ctx.platform_user_id, "user_d09");
         assert_eq!(ctx.tenant_id, "user_d09.cs");
         assert_ne!(ctx.platform_user_id, ctx.tenant_id);
+    }
+
+    #[test]
+    fn tenant_context_carries_the_raw_agent_type() {
+        let sel = TenantSelector {
+            user_id: "user_d09".to_string(),
+            agent_type: "finance_invoice_ops".to_string(),
+        };
+        let ctx = build_tenant_context(&sel, None);
+        assert_eq!(ctx.agent_type, "finance_invoice_ops");
     }
 }

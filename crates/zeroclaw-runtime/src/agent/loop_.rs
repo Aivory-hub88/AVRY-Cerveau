@@ -1404,7 +1404,17 @@ pub async fn run(
             sop_audit,
             None,
         );
-        let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
+        // Cerveau (Phase 4.1 follow-on, patch 0011): grant the tenant's
+        // agent-type skill bundles too, same data-driven pattern as
+        // persona/entity scoping. `current_tenant()` is None outside a
+        // tenant-scoped turn, so vanilla installs are unaffected.
+        let tenant_agent_type_for_skills =
+            crate::agent::tenant::current_tenant().map(|t| t.agent_type.clone());
+        let skills = crate::skills::load_skills_for_agent_and_tenant_from_config(
+            &config,
+            agent_alias,
+            tenant_agent_type_for_skills.as_deref(),
+        );
         // Route the per-agent tool registry through the one gated seam
         // (peripherals -> built-in filter -> MCP scope+gate -> skills), identical
         // to the behavior this path hand-rolled. `caller_allowed` carries the
@@ -3048,7 +3058,17 @@ pub async fn process_message(
             sop_audit,
             None,
         );
-        let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
+        // Cerveau (Phase 4.1 follow-on, patch 0011): grant the tenant's
+        // agent-type skill bundles too, same data-driven pattern as
+        // persona/entity scoping. `current_tenant()` is None outside a
+        // tenant-scoped turn, so vanilla installs are unaffected.
+        let tenant_agent_type_for_skills =
+            crate::agent::tenant::current_tenant().map(|t| t.agent_type.clone());
+        let skills = crate::skills::load_skills_for_agent_and_tenant_from_config(
+            &config,
+            agent_alias,
+            tenant_agent_type_for_skills.as_deref(),
+        );
         // Route the per-agent tool registry through the one gated seam - the same
         // seam run() uses. This UNIFIES process_message's built-in filter with every
         // other construction path: `assemble` applies the plain policy filter

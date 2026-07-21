@@ -472,6 +472,20 @@ pub struct Config {
     #[nested]
     pub skill_bundles: HashMap<String, SkillBundleConfig>,
 
+    /// Cerveau (Phase 4.1 follow-on, patch 0011): skill bundles granted to a
+    /// tenant by their Aivory agent type
+    /// (`[agent_type_skill_bundles.<agent_type>]`, e.g.
+    /// `[agent_type_skill_bundles.finance_invoice_ops]`), in *addition* to
+    /// whatever the host `[agents.<alias>].skill_bundles` already grants.
+    /// Data-driven and resolved per-turn from the tenant's `agent_type` —
+    /// the same pattern already used for persona injection and Composio
+    /// entity scoping (`agent::tenant::TenantContext`) — deliberately not a
+    /// second host-alias-per-agent-type provisioning scheme. See
+    /// `Config::skill_bundle_aliases_for_tenant`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub agent_type_skill_bundles: HashMap<String, TenantSkillBundleConfig>,
+
     /// Named knowledge bundles (`[knowledge_bundles.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -4302,6 +4316,30 @@ impl Config {
                 Some(server)
             })
             .collect()
+    }
+
+    /// Cerveau (Phase 4.1 follow-on, patch 0011): `[skill_bundles.<alias>]`
+    /// names granted to a tenant by their Aivory agent type
+    /// (`[agent_type_skill_bundles.<agent_type>]`), on top of whatever the
+    /// host `[agents.<alias>]` serving the turn already grants via its own
+    /// `skill_bundles`. Consumed by
+    /// `zeroclaw_runtime::skills::load_skills_for_agent_and_tenant_audited`.
+    ///
+    /// Fail closed, matching `mcp_servers_for_agent_and_tenant` and
+    /// `mcp_servers_for_bundles`'s "omission is not a grant" rule:
+    /// `tenant_agent_type = None` (a vanilla, non-tenant turn) or an
+    /// `agent_type` with no matching `[agent_type_skill_bundles.<type>]`
+    /// entry both resolve to an empty grant, never a fallback or default
+    /// bundle.
+    #[must_use]
+    pub fn skill_bundle_aliases_for_tenant(&self, tenant_agent_type: Option<&str>) -> Vec<String> {
+        let Some(agent_type) = tenant_agent_type else {
+            return Vec::new();
+        };
+        self.agent_type_skill_bundles
+            .get(agent_type)
+            .map(|c| c.bundles.clone())
+            .unwrap_or_default()
     }
 
     /// Resolve a set of `[mcp_bundles.<alias>]` references to the concrete
@@ -11534,6 +11572,20 @@ impl SkillBundleConfig {
     }
 }
 
+/// Cerveau (Phase 4.1 follow-on, patch 0011): skill bundles granted to
+/// tenants of one Aivory agent type
+/// (`[agent_type_skill_bundles.<agent_type>]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "agent_type_skill_bundle"]
+#[serde(default)]
+pub struct TenantSkillBundleConfig {
+    /// `[skill_bundles.<alias>]` names granted to every tenant of this
+    /// agent type, on top of whatever the host `[agents.<alias>]` serving
+    /// the turn already grants via its own `skill_bundles`.
+    pub bundles: Vec<String>,
+}
+
 /// Named knowledge bundle (`[knowledge_bundles.<alias>]`).
 ///
 /// A reusable set of knowledge sources (documents, URLs, or RAG corpus paths)
@@ -17075,6 +17127,7 @@ impl Default for Config {
             risk_profiles: HashMap::new(),
             runtime_profiles: HashMap::new(),
             skill_bundles: HashMap::new(),
+            agent_type_skill_bundles: HashMap::new(),
             knowledge_bundles: HashMap::new(),
             mcp_bundles: HashMap::new(),
             peer_groups: HashMap::new(),
@@ -22440,6 +22493,53 @@ untrusted_outbound_redact = false
         );
     }
 
+    #[test]
+    async fn skill_bundle_aliases_for_tenant_none_grants_nothing() {
+        let mut config = Config::default();
+        config.agent_type_skill_bundles.insert(
+            "finance_invoice_ops".to_string(),
+            TenantSkillBundleConfig {
+                bundles: vec!["finance-invoice-ops".to_string()],
+            },
+        );
+        assert!(
+            config.skill_bundle_aliases_for_tenant(None).is_empty(),
+            "a vanilla, non-tenant turn is granted no tenant skill bundles"
+        );
+    }
+
+    #[test]
+    async fn skill_bundle_aliases_for_tenant_unknown_agent_type_grants_nothing() {
+        let mut config = Config::default();
+        config.agent_type_skill_bundles.insert(
+            "finance_invoice_ops".to_string(),
+            TenantSkillBundleConfig {
+                bundles: vec!["finance-invoice-ops".to_string()],
+            },
+        );
+        assert!(
+            config
+                .skill_bundle_aliases_for_tenant(Some("customer_service"))
+                .is_empty(),
+            "an agent_type with no configured entry grants nothing — never falls back to another type's bundles"
+        );
+    }
+
+    #[test]
+    async fn skill_bundle_aliases_for_tenant_matching_type_resolves_its_bundles() {
+        let mut config = Config::default();
+        config.agent_type_skill_bundles.insert(
+            "finance_invoice_ops".to_string(),
+            TenantSkillBundleConfig {
+                bundles: vec!["finance-invoice-ops".to_string(), "shared-ops".to_string()],
+            },
+        );
+        assert_eq!(
+            config.skill_bundle_aliases_for_tenant(Some("finance_invoice_ops")),
+            vec!["finance-invoice-ops".to_string(), "shared-ops".to_string()]
+        );
+    }
+
     /// Regression test for the operator-UX warning added alongside #7733:
     /// when MCP is enabled and `[[mcp.servers]]` is non-empty but no
     /// `[mcp_bundles.*]` exists, validate() must still succeed (warnings
@@ -23885,6 +23985,7 @@ auto_save = true
             agents: HashMap::new(),
             runtime_profiles: HashMap::new(),
             skill_bundles: HashMap::new(),
+            agent_type_skill_bundles: HashMap::new(),
             knowledge_bundles: HashMap::new(),
             mcp_bundles: HashMap::new(),
             peer_groups: HashMap::new(),
@@ -24597,6 +24698,7 @@ default_temperature = 0.7
             risk_profiles: HashMap::new(),
             runtime_profiles: HashMap::new(),
             skill_bundles: HashMap::new(),
+            agent_type_skill_bundles: HashMap::new(),
             knowledge_bundles: HashMap::new(),
             mcp_bundles: HashMap::new(),
             peer_groups: HashMap::new(),

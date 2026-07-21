@@ -25,39 +25,42 @@ cerveau-skills/<agent-type>/<skill-name>/
 
 ## Installing a skill from here into a running Cerveau instance
 
-1. Copy `<agent-type>/<skill-name>/` into the target skill bundle's
-   `directory` (see `[skill_bundles.<alias>]` in `config.toml` —
-   `directory` is relative to the workspace root).
-2. Ensure the host agent that serves that `agent-type`'s tenants has
-   `skill_bundles = ["<alias>"]` in its `[agents.<alias>]` entry (or the
-   bundle's `include`/`exclude` admits the skill by name).
-3. Skills are loaded per **host agent alias**, not per-tenant — every tenant
-   riding that agent_type shares the same installed skill set. This is
-   correct (skills are capability, not tenant data) but means a bad skill
-   affects every tenant of that agent_type at once; review before
-   installing to a production host agent, ideally through
-   `zeroclaw-runtime/src/skills/review.rs`'s audit pipeline.
+These skills are **tenant-agent-type-scoped**, not host-agent-alias-scoped —
+patch 0011 added the resolution primitive for exactly this, after tracing
+how the *current* (pre-Cerveau) bridge already solves the same problem:
+`telegram-agent.js`'s `agent_type` is a per-request data value that
+dynamically selects prompt/tools in one running process — never a
+provisioning axis (no per-agent-type host/container/config). Cerveau now
+mirrors that, on top of the same tenant-context pattern already used for
+persona injection and Composio entity scoping:
 
-**Blocker found 2026-07-20, not yet resolved:** the `:3100` Cerveau
-instance's `[agents.<alias>]` entries are still the 6 generic vanilla-zeroclaw
-brain roles (`analyst_brain`, `builder_brain`, `comms_brain`,
-`diagnostic_brain`, `security_brain`, `workflow_brain`) — copied from prod
-zeroclaw's own config, not from Aivory's 5 deployable-agent types. The
-webhook's host-agent selection (`?agent=<alias>` query param /
-`resolve_gateway_chat_agent_alias` in `zeroclaw-gateway/src/lib.rs`) is
-**entirely independent** of the `X-Agent-Type` tenant header (that header
-only drives persona lookup + memory/principal scoping, per
-`zeroclaw-gateway/src/tenant.rs`). No ADR or the planning doc specifies how
-`X-Agent-Type` values (`finance_invoice_ops`, `office_assistant`,
-`customer_service`, `leads_qualifier`, `autonomous`) should map to a host
-`[agents.<alias>]` — new dedicated aliases, or a `?agent=` param the
-(not-yet-built) Phase 6 bridge integration would pass explicitly. **This is
-a real open architectural question, decided nowhere yet** — none of the
-four skills below can be installed to a live, traffic-serving agent until
-it's resolved. Don't invent an answer unilaterally in a live config; it's a
-product/engineering decision (whoever owns Phase 6) with real behavioral
-consequences (wrong mapping = a tenant's turn silently runs on the wrong
-persona/tools).
+1. Put the skill's files under a `[skill_bundles.<alias>]` entry as usual
+   (`directory` relative to the workspace root, or absolute).
+2. Grant it to a **tenant agent type**, not a host alias, via
+   `[agent_type_skill_bundles.<agent_type>]`:
+   ```toml
+   [skill_bundles.finance-invoice-ops]
+   directory = "cerveau-skills/finance-invoice-ops/invoice-processing"
+
+   [agent_type_skill_bundles.finance_invoice_ops]
+   bundles = ["finance-invoice-ops"]
+   ```
+   Every tenant turn whose `X-Agent-Type: finance_invoice_ops` header
+   authenticates gets this bundle **on top of** whatever the serving host
+   `[agents.<alias>]` already grants via its own `skill_bundles` — resolved
+   fresh per turn via `Config::skill_bundle_aliases_for_tenant`, no new host
+   alias needed. A vanilla (non-tenant) turn, or a tenant of a *different*
+   `agent_type`, never sees it (fail-closed, same "omission is not a grant"
+   rule as `mcp_servers_for_bundles`).
+3. Skills granted this way are still **shared across every tenant of that
+   agent_type** (capability, not tenant data) — a bad skill affects all of
+   them at once; review before installing to a production instance, ideally
+   through `zeroclaw-runtime/src/skills/review.rs`'s audit pipeline.
+4. This only grants the skill; it doesn't yet make the `?agent=` host alias
+   the current bridge would need to pass line up with the underlying
+   `[agents.<alias>]` config, or wire a real Composio toolkit connection —
+   see each skill's own reference doc for what's still needed before a
+   tenant turn can actually use it end to end.
 
 ## Current contents
 
@@ -93,7 +96,9 @@ persona/tools).
   are not) if connected — no fan-out to multiple CRMs, unlike the
   office-assistant skill's multi-target sync.
 
-**None of the four skills above are installed to any running instance** —
-all are parse-verified drafts blocked on the host-agent-alias question
-above (or, for finance/office-assistant, additionally on picking + wiring a
-real Composio toolkit connection).
+**None of the four skills above are installed to any running instance yet**
+— all are parse-verified drafts. Installing them is now unblocked (patch
+0011), but still needs: deciding which `[agents.<alias>]` host(s) actually
+serve Aivory tenant traffic once Phase 6 wires a real bridge integration,
+and — for finance-invoice-ops/office-assistant specifically — picking +
+wiring a real Composio toolkit connection (see each skill's reference doc).
