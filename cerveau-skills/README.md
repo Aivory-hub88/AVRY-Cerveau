@@ -38,6 +38,27 @@ cerveau-skills/<agent-type>/<skill-name>/
    installing to a production host agent, ideally through
    `zeroclaw-runtime/src/skills/review.rs`'s audit pipeline.
 
+**Blocker found 2026-07-20, not yet resolved:** the `:3100` Cerveau
+instance's `[agents.<alias>]` entries are still the 6 generic vanilla-zeroclaw
+brain roles (`analyst_brain`, `builder_brain`, `comms_brain`,
+`diagnostic_brain`, `security_brain`, `workflow_brain`) — copied from prod
+zeroclaw's own config, not from Aivory's 5 deployable-agent types. The
+webhook's host-agent selection (`?agent=<alias>` query param /
+`resolve_gateway_chat_agent_alias` in `zeroclaw-gateway/src/lib.rs`) is
+**entirely independent** of the `X-Agent-Type` tenant header (that header
+only drives persona lookup + memory/principal scoping, per
+`zeroclaw-gateway/src/tenant.rs`). No ADR or the planning doc specifies how
+`X-Agent-Type` values (`finance_invoice_ops`, `office_assistant`,
+`customer_service`, `leads_qualifier`, `autonomous`) should map to a host
+`[agents.<alias>]` — new dedicated aliases, or a `?agent=` param the
+(not-yet-built) Phase 6 bridge integration would pass explicitly. **This is
+a real open architectural question, decided nowhere yet** — none of the
+four skills below can be installed to a live, traffic-serving agent until
+it's resolved. Don't invent an answer unilaterally in a live config; it's a
+product/engineering decision (whoever owns Phase 6) with real behavioral
+consequences (wrong mapping = a tenant's turn silently runs on the wrong
+persona/tools).
+
 ## Current contents
 
 - `finance-invoice-ops/invoice-processing/` — jurisdiction-agnostic invoice
@@ -46,18 +67,33 @@ cerveau-skills/<agent-type>/<skill-name>/
   (QuickBooks/Xero/Stripe/Zoho Books/FreshBooks/Sage/NetSuite — see the
   skill's `references/composio-toolkits.md`) the tenant has connected via
   Composio, entity-scoped through Cerveau patch 0010
-  (`mcp_servers_for_agent_and_tenant`). **Not yet installed to any running
-  instance** — drafted and parse-verified only; wiring a real Composio
-  toolkit connection is a separate follow-up (see the skill's reference doc
-  for the checklist).
+  (`mcp_servers_for_agent_and_tenant`).
 - `office-assistant/meeting-outcomes/` — extracts decisions/action-items
   (owner + due date)/risks from meeting notes for the `office_assistant`
   agent (Enterprise-gated on the platform side via `record_meeting_summary`
   in `ENTERPRISE_TOOLS`), always persisted locally first, then synced to
   whichever of Notion/Slack/Google Sheets the tenant has connected — all
   three toolkits are already in `COMPOSIO_CURATED`, no new toolkit needed.
-  See `references/composio-tools.md` for verified tool schemas, including a
-  flagged bug: `COMPOSIO_CURATED.slack` in `telegram-agent.js` currently
-  points to Composio's deprecated `SLACK_CHAT_POST_MESSAGE`, not the
-  current `SLACK_SEND_MESSAGE`. **Not yet installed to any running
-  instance.**
+  The `COMPOSIO_CURATED.slack` deprecated-tool bug this skill's research
+  turned up is **fixed** (`telegram-agent.js`, live on both git and the
+  running vps-bridge process as of 2026-07-20).
+- `customer-service/ticket-triage/` — triage → resolve → log → escalate for
+  the `customer_service` agent. No usable open-source skill existed for
+  this (the one candidate found in earlier research was an unlicensed
+  demo), so this is authored from scratch. Logs locally via `create_ticket`
+  always; syncs to Zendesk/Freshdesk (classic tickets) or Intercom
+  (conversation-based, no ticket object) if connected — none of the three
+  are in `COMPOSIO_CURATED` yet.
+- `leads-qualifier/bant-qualification/` — inbound BANT (Budget, Authority,
+  Need, Timeline) qualification for the `leads_qualifier` agent, one
+  question at a time. Also authored from scratch (the closest open-source
+  candidate does outbound prospecting, a different job). Saves locally via
+  `save_lead` always; syncs to exactly one CRM (HubSpot/Salesforce/
+  Pipedrive — HubSpot's contact action is already curated, the other two
+  are not) if connected — no fan-out to multiple CRMs, unlike the
+  office-assistant skill's multi-target sync.
+
+**None of the four skills above are installed to any running instance** —
+all are parse-verified drafts blocked on the host-agent-alias question
+above (or, for finance/office-assistant, additionally on picking + wiring a
+real Composio toolkit connection).
