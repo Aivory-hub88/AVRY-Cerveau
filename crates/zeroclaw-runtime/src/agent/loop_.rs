@@ -2864,7 +2864,39 @@ pub async fn process_message(
                 );
             }
         };
-        let approval_manager = ApprovalManager::for_non_interactive(&risk_profile);
+        let approval_manager = {
+            let mgr = ApprovalManager::for_non_interactive(&risk_profile);
+            // Cerveau (enterprise-hardening round 1): opt the channel-driven
+            // (webhook/etc.) path into tiered approval + F-2 idempotency.
+            // A ledger/store open failure (disk full, permissions) must not
+            // break the turn — fail toward the pre-existing binary
+            // auto_approve behavior, not toward denying every tool call.
+            match (
+                crate::control_plane::tool_idem::ToolIdemLedger::shared(&config.data_dir),
+                crate::control_plane::pending_approvals::PendingApprovalsStore::shared(
+                    &config.data_dir,
+                ),
+            ) {
+                (Ok(ledger), Ok(pending_store)) => mgr.with_risk_taxonomy(
+                    config.tool_risk_tiers.clone(),
+                    Some(ledger),
+                    Some(pending_store),
+                ),
+                (ledger_result, store_result) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_attrs(::serde_json::json!({
+                                "ledger_error": ledger_result.err().map(|e| e.to_string()),
+                                "store_error": store_result.err().map(|e| e.to_string()),
+                            })),
+                        "Cerveau: could not open F-2/pending-approval control-plane storage; \
+                         proceeding without tiered approval for this turn"
+                    );
+                    mgr
+                }
+            }
+        };
         // Cerveau: a tenant-scoped turn binds memory to the tenant's own
         // jailed scope instead of the host agent's; absent tenant context
         // this is bit-for-bit the vanilla path.

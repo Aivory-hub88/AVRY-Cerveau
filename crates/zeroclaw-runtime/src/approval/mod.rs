@@ -2,6 +2,8 @@
 //! Provides a pre-execution hook that prompts the user before tool calls,
 //! with session-scoped "Always" allowlists and audit logging.
 
+use crate::control_plane::pending_approvals::PendingApprovalsStore;
+use crate::control_plane::tool_idem::ToolIdemLedger;
 use crate::security::AutonomyLevel;
 use chrono::Utc;
 use parking_lot::Mutex;
@@ -10,7 +12,8 @@ use std::collections::HashSet;
 #[cfg(unix)]
 use std::io::BufReader;
 use std::io::{self, BufRead, Write};
-use zeroclaw_config::schema::RiskProfileConfig;
+use std::sync::Arc;
+use zeroclaw_config::schema::{RiskProfileConfig, ToolRiskTier, ToolRiskTiersConfig};
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -77,6 +80,14 @@ pub enum ApprovalRequirement {
     Prompt,
     Approved,
     NotRequired,
+    /// Cerveau (enterprise-hardening round 1): an `Irreversible`-tier tool
+    /// on a non-interactive manager. Never resolves to `Approved` via
+    /// `auto_approve` — the caller must create a durable pending-approval
+    /// record instead of executing (see `gate_tool_approval`). Distinct
+    /// from `Prompt`, which on a non-interactive manager still falls
+    /// through to auto-deny; `Pending` is a hard floor that `auto_approve`
+    /// cannot override, matching the actual gap this tier exists to close.
+    Pending,
 }
 
 // ── ApprovalManager ──────────────────────────────────────────────
@@ -98,6 +109,20 @@ pub struct ApprovalManager {
     session_allowlist: Mutex<HashSet<String>>,
     /// Audit trail of approval decisions.
     audit_log: Mutex<Vec<ApprovalLogEntry>>,
+    /// Cerveau (enterprise-hardening round 1): global per-tool risk
+    /// classification, set via [`Self::with_risk_taxonomy`]. `None` (every
+    /// constructor's default) preserves this manager's pre-existing
+    /// behavior exactly — tiering is opt-in per construction site, not a
+    /// forced change to every caller.
+    risk_tiers: Option<ToolRiskTiersConfig>,
+    /// The F-2 idempotency ledger, set alongside `risk_tiers` via
+    /// [`Self::with_risk_taxonomy`]. `None` disables idempotency checks
+    /// (matches `risk_tiers: None` — both arrive together).
+    idem_ledger: Option<Arc<ToolIdemLedger>>,
+    /// The durable pending-approval store for `Irreversible`-tier tools on
+    /// a non-interactive manager, set alongside `risk_tiers` via
+    /// [`Self::with_risk_taxonomy`].
+    pending_store: Option<Arc<PendingApprovalsStore>>,
 }
 
 impl ApprovalManager {
@@ -111,6 +136,9 @@ impl ApprovalManager {
             non_interactive_shell_requires_approval: false,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
+            risk_tiers: None,
+            idem_ledger: None,
+            pending_store: None,
         }
     }
 
@@ -123,6 +151,9 @@ impl ApprovalManager {
             non_interactive_shell_requires_approval: false,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
+            risk_tiers: None,
+            idem_ledger: None,
+            pending_store: None,
         }
     }
 
@@ -135,6 +166,9 @@ impl ApprovalManager {
             non_interactive_shell_requires_approval: true,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
+            risk_tiers: None,
+            idem_ledger: None,
+            pending_store: None,
         }
     }
 
@@ -166,6 +200,53 @@ impl ApprovalManager {
         self.non_interactive
     }
 
+    /// Cerveau (enterprise-hardening round 1): opt this manager into tiered
+    /// approval, F-2 idempotency checks, and durable pending-approval
+    /// records for `Irreversible` tools. Chainable; call right after
+    /// construction. Not called ⇒ every tool resolves via the pre-existing
+    /// binary `auto_approve`/`always_ask` logic exactly as before this
+    /// round — see [`Self::risk_tier`], [`Self::idem_ledger`], and
+    /// [`Self::pending_store`].
+    #[must_use]
+    pub fn with_risk_taxonomy(
+        mut self,
+        tiers: ToolRiskTiersConfig,
+        ledger: Option<Arc<ToolIdemLedger>>,
+        pending_store: Option<Arc<PendingApprovalsStore>>,
+    ) -> Self {
+        self.risk_tiers = Some(tiers);
+        self.idem_ledger = ledger;
+        self.pending_store = pending_store;
+        self
+    }
+
+    /// Classify a tool's risk tier per this manager's taxonomy. Callers
+    /// that never opted in via [`Self::with_risk_taxonomy`] get
+    /// `Reversible` for everything — the pre-existing binary behavior,
+    /// where every tool is subject to plain `auto_approve`/`always_ask`
+    /// with no `Safe` fast-path and no `Irreversible` hard floor.
+    #[must_use]
+    pub fn risk_tier(&self, tool_name: &str) -> ToolRiskTier {
+        match &self.risk_tiers {
+            Some(tiers) => zeroclaw_config::schema::resolve_tool_risk_tier(tiers, tool_name),
+            None => ToolRiskTier::Reversible,
+        }
+    }
+
+    /// The F-2 idempotency ledger, if this manager opted in via
+    /// [`Self::with_risk_taxonomy`] with `Some(ledger)`.
+    #[must_use]
+    pub fn idem_ledger(&self) -> Option<&Arc<ToolIdemLedger>> {
+        self.idem_ledger.as_ref()
+    }
+
+    /// The durable pending-approval store, if this manager opted in via
+    /// [`Self::with_risk_taxonomy`] with `Some(store)`.
+    #[must_use]
+    pub fn pending_store(&self) -> Option<&Arc<PendingApprovalsStore>> {
+        self.pending_store.as_ref()
+    }
+
     /// Check whether a tool call requires interactive approval.
     /// Returns `true` if the call needs a prompt, `false` if it can proceed.
     pub fn needs_approval(&self, tool_name: &str) -> bool {
@@ -173,6 +254,27 @@ impl ApprovalManager {
     }
 
     pub fn approval_requirement(&self, tool_name: &str) -> ApprovalRequirement {
+        // Cerveau (enterprise-hardening round 1): a Safe-tier tool never
+        // needs approval — checked first so opting a manager into tiering
+        // can only ever relax the fast (read-only) path, never change what
+        // was already NotRequired/Approved for mutating tools below.
+        if self.risk_tier(tool_name) == ToolRiskTier::Safe {
+            return ApprovalRequirement::NotRequired;
+        }
+
+        // An Irreversible-tier tool on a non-interactive manager is a hard
+        // floor: no `auto_approve` entry, session allowlist, or even
+        // `AutonomyLevel::Full` can silently approve it. This is the actual
+        // gap this round exists to close — a webhook call must never
+        // finalize a real invoice or attach a real payment unsupervised
+        // just because someone listed it in `auto_approve` (as this exact
+        // fork did, deliberately, as a testing-only stopgap earlier this
+        // session) or set the profile to full autonomy. Interactive (CLI)
+        // managers are unaffected — they already prompt a present operator.
+        if self.non_interactive && self.risk_tier(tool_name) == ToolRiskTier::Irreversible {
+            return ApprovalRequirement::Pending;
+        }
+
         // Full autonomy never prompts.
         if self.autonomy_level == AutonomyLevel::Full {
             return ApprovalRequirement::Approved;
@@ -442,6 +544,85 @@ mod tests {
             level: AutonomyLevel::Full,
             ..RiskProfileConfig::default()
         }
+    }
+
+    fn irreversible_tiers() -> zeroclaw_config::schema::ToolRiskTiersConfig {
+        zeroclaw_config::schema::ToolRiskTiersConfig {
+            irreversible: vec!["finalize_invoice".to_string()],
+            reversible: vec![],
+        }
+    }
+
+    // ── Cerveau: tiered approval ─────────────────────────────
+
+    #[test]
+    fn manager_without_taxonomy_classifies_everything_reversible() {
+        // Backward compatibility: a manager that never opts in via
+        // with_risk_taxonomy must behave exactly as before this round —
+        // no Safe fast-path, no Irreversible hard floor.
+        let mgr = ApprovalManager::for_non_interactive(&supervised_config());
+        assert_eq!(mgr.risk_tier("tool_search"), ToolRiskTier::Reversible);
+        assert_eq!(mgr.risk_tier("finalize_invoice"), ToolRiskTier::Reversible);
+    }
+
+    #[test]
+    fn safe_tier_never_requires_approval_even_without_auto_approve() {
+        let mgr = ApprovalManager::for_non_interactive(&supervised_config())
+            .with_risk_taxonomy(
+                zeroclaw_config::schema::ToolRiskTiersConfig::default(),
+                None,
+                None,
+            );
+        // tool_search is Safe by the built-in default and is NOT in this
+        // profile's auto_approve list — must still resolve NotRequired.
+        assert_eq!(
+            mgr.approval_requirement("tool_search"),
+            ApprovalRequirement::NotRequired
+        );
+    }
+
+    #[test]
+    fn irreversible_tier_is_pending_on_non_interactive_regardless_of_auto_approve() {
+        let mut profile = supervised_config();
+        // Explicitly (mis)configured into auto_approve — must NOT win.
+        profile.auto_approve.push("finalize_invoice".to_string());
+        let mgr = ApprovalManager::for_non_interactive(&profile)
+            .with_risk_taxonomy(irreversible_tiers(), None, None);
+        assert_eq!(
+            mgr.approval_requirement("finalize_invoice"),
+            ApprovalRequirement::Pending,
+            "an Irreversible tool must never resolve Approved via auto_approve, \
+             regardless of how the risk profile is configured"
+        );
+    }
+
+    #[test]
+    fn irreversible_tier_beats_full_autonomy_on_non_interactive() {
+        let mgr = ApprovalManager::for_non_interactive(&full_config())
+            .with_risk_taxonomy(irreversible_tiers(), None, None);
+        assert_eq!(
+            mgr.approval_requirement("finalize_invoice"),
+            ApprovalRequirement::Pending,
+            "Irreversible is a hard floor even under AutonomyLevel::Full"
+        );
+        // A Reversible tool on the same Full-autonomy manager is untouched.
+        assert_eq!(
+            mgr.approval_requirement("some_other_tool"),
+            ApprovalRequirement::Approved
+        );
+    }
+
+    #[test]
+    fn irreversible_tier_still_prompts_normally_on_interactive_manager() {
+        // CLI (interactive) managers are explicitly unaffected — a present
+        // operator already gets prompted; Pending is only for the
+        // non-interactive gap this round closes.
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config())
+            .with_risk_taxonomy(irreversible_tiers(), None, None);
+        assert_eq!(
+            mgr.approval_requirement("finalize_invoice"),
+            ApprovalRequirement::Prompt
+        );
     }
 
     // ── CLI prompt input ────────────────────────────────────

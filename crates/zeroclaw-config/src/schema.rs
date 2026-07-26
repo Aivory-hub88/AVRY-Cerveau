@@ -463,6 +463,20 @@ pub struct Config {
     #[nested]
     pub risk_profiles: HashMap<String, RiskProfileConfig>,
 
+    /// Cerveau (enterprise-hardening round 1): global per-tool risk
+    /// classification (`[tool_risk_tiers]`), shared by the F-2 idempotency
+    /// ledger (`Config::tool_risk_tier` gates whether a tool call goes
+    /// through `control_plane::tool_idem`) and by tiered approval
+    /// (`Irreversible` tools never silently auto-approve on a
+    /// non-interactive risk profile, regardless of that profile's own
+    /// `auto_approve` list). A tool's inherent risk is a property of the
+    /// tool, not the calling agent, hence this is global rather than
+    /// per-risk-profile. See `Config::tool_risk_tier`.
+    #[serde(default)]
+    #[nested]
+    #[group = "Agent"]
+    pub tool_risk_tiers: ToolRiskTiersConfig,
+
     /// Named runtime/LLM execution profiles (`[runtime_profiles.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -4403,17 +4417,7 @@ impl Config {
         }
         granted
             .into_iter()
-            .filter_map(|mut server| {
-                let Some(param) = server.tenant_entity_query_param.clone() else {
-                    return Some(server);
-                };
-                let user_id = tenant_platform_user_id?;
-                let url = server.url.as_ref()?;
-                let mut parsed = url::Url::parse(url).ok()?;
-                parsed.query_pairs_mut().append_pair(&param, user_id);
-                server.url = Some(parsed.into());
-                Some(server)
-            })
+            .filter_map(|server| apply_tenant_entity_scoping(server, tenant_platform_user_id))
             .collect()
     }
 
@@ -4437,6 +4441,23 @@ impl Config {
             .get(agent_type)
             .map(|c| c.bundles.clone())
             .unwrap_or_default()
+    }
+
+    /// Cerveau (enterprise-hardening round 1): classify a tool's inherent
+    /// risk for two consumers — gating the F-2 idempotency ledger, and
+    /// tiered approval (`Irreversible` tools never silently auto-approve
+    /// non-interactively, regardless of `auto_approve`).
+    ///
+    /// Resolution order: exact name in `[tool_risk_tiers].irreversible`,
+    /// then `.reversible`, then a conservative built-in default list, then
+    /// (for anything still unmatched) `Reversible` — fail toward requiring
+    /// *more* oversight, not less. This specifically means an unclassified
+    /// MCP-origin tool (any name containing `__`, the `<server>__<tool>`
+    /// convention) is never `Safe` by default; a newly-wired toolkit is
+    /// supervised until someone explicitly reclassifies it.
+    #[must_use]
+    pub fn tool_risk_tier(&self, tool_name: &str) -> ToolRiskTier {
+        resolve_tool_risk_tier(&self.tool_risk_tiers, tool_name)
     }
 
     /// Cerveau (Phase 4.1 follow-on, patch 0011): `[skill_bundles.<alias>]`
@@ -12044,6 +12065,115 @@ impl Default for RiskProfileConfig {
     }
 }
 
+// ── Tool risk taxonomy (enterprise-hardening round 1) ───────────────
+
+/// A tool's inherent risk classification, shared by two consumers:
+/// [`Config::tool_risk_tier`] gates whether a call goes through the F-2
+/// idempotency ledger (`control_plane::tool_idem`), and tiered approval
+/// (`crate::approval` in `zeroclaw-runtime`) uses it to decide whether a
+/// non-interactive risk profile's `auto_approve` list is even consulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ToolRiskTier {
+    /// Read-only, no side effects. Never gated, never idempotency-checked.
+    Safe,
+    /// Mutating but reversible / low-consequence (e.g. draft creation,
+    /// local file writes). Auto-approvable per risk profile as before this
+    /// round; idempotency-checked (a crash-replay must not double-write).
+    Reversible,
+    /// Mutating with real, hard-to-reverse consequences (money movement,
+    /// finalizing/sending something externally visible). Never silently
+    /// auto-approved on a non-interactive risk profile, regardless of that
+    /// profile's own `auto_approve` list — always resolves through the
+    /// durable pending-approval path instead. Idempotency-checked.
+    Irreversible,
+}
+
+/// Global per-tool risk classification (`[tool_risk_tiers]`). A tool's
+/// inherent risk is a property of the tool itself, not the calling agent,
+/// so this is one global list rather than per-`[risk_profiles.<alias>]`.
+///
+/// Resolution order (see [`Config::tool_risk_tier`]): exact name match in
+/// `irreversible`, then `reversible`, then a conservative built-in default
+/// — unlisted MCP-origin tools (names containing `__`) default to
+/// `Reversible`, never `Safe`, so a newly-wired toolkit is never silently
+/// unsupervised before someone classifies it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "tool_risk_tier"]
+#[serde(default)]
+pub struct ToolRiskTiersConfig {
+    /// Tool names classified `Irreversible` — never auto-approved
+    /// non-interactively, regardless of `auto_approve`.
+    pub irreversible: Vec<String>,
+    /// Tool names classified `Reversible` — subject to today's
+    /// `auto_approve`/`always_ask` logic, unchanged.
+    pub reversible: Vec<String>,
+}
+
+/// Names classified `Safe` by default when not overridden in config:
+/// read-only, no side effects, never gated or idempotency-checked.
+const DEFAULT_SAFE_TOOLS: &[&str] = &[
+    "tool_search",
+    "memory_recall",
+    "file_read",
+    "content_search",
+    "glob_search",
+    "web_search_tool",
+    "web_fetch",
+    "calculator",
+    "http_request",
+];
+
+/// Apply a tenant's entity id to one `[[mcp.servers]]` entry, if it's
+/// tenant-gated (`tenant_entity_query_param` set). Extracted from
+/// [`Config::mcp_servers_for_agent_and_tenant`] so the enterprise-hardening
+/// round's approval-resolve handler (`zeroclaw-gateway`, executing one
+/// specific already-approved tool call out-of-band) can apply the exact
+/// same scoping without re-deriving the whole agent/tenant grant.
+///
+/// - Not tenant-gated → passed through unchanged.
+/// - Tenant-gated but `tenant_platform_user_id` is `None`, or the url is
+///   missing/unparseable → dropped (`None`) — fail closed, never connect a
+///   tenant-gated server unscoped.
+#[must_use]
+pub fn apply_tenant_entity_scoping(
+    mut server: McpServerConfig,
+    tenant_platform_user_id: Option<&str>,
+) -> Option<McpServerConfig> {
+    let Some(param) = server.tenant_entity_query_param.clone() else {
+        return Some(server);
+    };
+    let user_id = tenant_platform_user_id?;
+    let url = server.url.as_ref()?;
+    let mut parsed = url::Url::parse(url).ok()?;
+    parsed.query_pairs_mut().append_pair(&param, user_id);
+    server.url = Some(parsed.into());
+    Some(server)
+}
+
+/// Free-function core of [`Config::tool_risk_tier`], extracted so
+/// `zeroclaw-runtime`'s `ApprovalManager` (which holds its own cloned
+/// `ToolRiskTiersConfig` snapshot, not a full `Config`) can classify a tool
+/// the exact same way without duplicating the resolution order.
+#[must_use]
+pub fn resolve_tool_risk_tier(tiers: &ToolRiskTiersConfig, tool_name: &str) -> ToolRiskTier {
+    if tiers.irreversible.iter().any(|t| t == tool_name) {
+        return ToolRiskTier::Irreversible;
+    }
+    if tiers.reversible.iter().any(|t| t == tool_name) {
+        return ToolRiskTier::Reversible;
+    }
+    if DEFAULT_SAFE_TOOLS.contains(&tool_name) {
+        return ToolRiskTier::Safe;
+    }
+    // Every other unmatched name (built-in mutating tools like `shell`,
+    // `file_write`; unclassified MCP-origin tools) lands here — the
+    // conservative default is "supervised," not "unsupervised."
+    ToolRiskTier::Reversible
+}
+
 /// Named runtime/LLM execution profile (`[runtime_profiles.<alias>]`).
 ///
 /// Reusable operational tuning: agentic mode, iteration caps, context
@@ -17979,6 +18109,7 @@ impl Default for Config {
             knowledge_bundles: HashMap::new(),
             mcp_bundles: HashMap::new(),
             agent_type_mcp_bundles: HashMap::new(),
+            tool_risk_tiers: ToolRiskTiersConfig::default(),
             peer_groups: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
@@ -24170,6 +24301,63 @@ untrusted_outbound_redact = false
         );
     }
 
+    #[test]
+    async fn tool_risk_tier_builtin_defaults() {
+        let config = Config::default();
+        assert_eq!(config.tool_risk_tier("tool_search"), ToolRiskTier::Safe);
+        assert_eq!(config.tool_risk_tier("file_read"), ToolRiskTier::Safe);
+        assert_eq!(config.tool_risk_tier("shell"), ToolRiskTier::Reversible);
+        assert_eq!(config.tool_risk_tier("file_write"), ToolRiskTier::Reversible);
+    }
+
+    #[test]
+    async fn tool_risk_tier_unclassified_mcp_tool_defaults_reversible_never_safe() {
+        let config = Config::default();
+        assert_eq!(
+            config.tool_risk_tier("some-new-toolkit__DO_SOMETHING"),
+            ToolRiskTier::Reversible,
+            "an unclassified MCP-origin tool must never default to Safe — \
+             fail toward more oversight, not less"
+        );
+    }
+
+    #[test]
+    async fn tool_risk_tier_explicit_config_wins_over_default() {
+        let mut config = Config::default();
+        // tool_search is Safe by default; explicitly reclassify it.
+        config.tool_risk_tiers.irreversible = vec!["tool_search".to_string()];
+        assert_eq!(
+            config.tool_risk_tier("tool_search"),
+            ToolRiskTier::Irreversible,
+            "explicit [tool_risk_tiers] config must override the built-in default"
+        );
+    }
+
+    #[test]
+    async fn tool_risk_tier_irreversible_wins_over_reversible_if_listed_in_both() {
+        let mut config = Config::default();
+        config.tool_risk_tiers.irreversible = vec!["ambiguous_tool".to_string()];
+        config.tool_risk_tiers.reversible = vec!["ambiguous_tool".to_string()];
+        assert_eq!(
+            config.tool_risk_tier("ambiguous_tool"),
+            ToolRiskTier::Irreversible,
+            "a name misconfigured into both lists must resolve to the stricter tier"
+        );
+    }
+
+    #[test]
+    async fn tool_risk_tiers_config_round_trips_through_toml() {
+        let mut config = Config::default();
+        config.tool_risk_tiers = ToolRiskTiersConfig {
+            irreversible: vec!["composio-stripe-invoicing__STRIPE_FINALIZE_INVOICE".to_string()],
+            reversible: vec!["officecli__officecli".to_string()],
+        };
+        let toml_str = toml::to_string(&config.tool_risk_tiers).expect("serialize");
+        let parsed: ToolRiskTiersConfig = toml::from_str(&toml_str).expect("parse");
+        assert_eq!(parsed.irreversible, config.tool_risk_tiers.irreversible);
+        assert_eq!(parsed.reversible, config.tool_risk_tiers.reversible);
+    }
+
     /// Config with a host alias `"aaatools"` (bare, no mcp_bundles of its
     /// own) plus a Stripe-shaped tenant-gated server granted only via
     /// `[agent_type_mcp_bundles.finance_invoice_ops]` — the patch 0012
@@ -26117,6 +26305,7 @@ auto_save = true
             knowledge_bundles: HashMap::new(),
             mcp_bundles: HashMap::new(),
             agent_type_mcp_bundles: HashMap::new(),
+            tool_risk_tiers: ToolRiskTiersConfig::default(),
             peer_groups: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
@@ -26991,6 +27180,7 @@ default_temperature = 0.7
             knowledge_bundles: HashMap::new(),
             mcp_bundles: HashMap::new(),
             agent_type_mcp_bundles: HashMap::new(),
+            tool_risk_tiers: ToolRiskTiersConfig::default(),
             peer_groups: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
