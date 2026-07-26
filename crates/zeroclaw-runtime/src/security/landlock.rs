@@ -209,6 +209,22 @@ impl LandlockSandbox {
             }
         }
 
+        // Allow /etc (read-only) — standard system config, same trust tier
+        // as /usr and /bin. Discovered live: Node's own OpenSSL init reads
+        // /etc/ssl/openssl.cnf at startup regardless of what the spawned
+        // tool actually does; other runtimes commonly need /etc/resolv.conf,
+        // /etc/nsswitch.conf, /etc/localtime, ca-certificates, etc. None of
+        // this is tenant- or workspace-specific, so it's not a workspace-
+        // isolation concern — omitting it only breaks legitimate use.
+        let etc_fd =
+            PathFd::new(Path::new("/etc")).map_err(|e| std::io::Error::other(e.to_string()))?;
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(
+                etc_fd,
+                AccessFs::ReadFile | AccessFs::ReadDir,
+            ))
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
         // Allow the exec target's own (operator-installed, non-tenant)
         // install root, if the caller resolved one — same trust tier as
         // the /usr and /bin entries in the table above.
