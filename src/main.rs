@@ -4589,6 +4589,26 @@ async fn async_main(command: clap::Command) -> Result<()> {
         _ => {}
     }
 
+    // Two independent, immutable-for-the-process logging axes:
+    //
+    //   --log-level  recording floor → runtime trace + capture layer.
+    //                Precedence: flag > RUST_LOG env > per-command
+    //                default. matrix_sdk crates stay pinned to warn
+    //                regardless (extremely noisy at info+). To restore
+    //                SDK output for Matrix debugging, set RUST_LOG
+    //                explicitly with no --log-level flag, e.g.
+    //                  RUST_LOG=info,matrix_sdk=info,matrix_sdk_base=info
+    //
+    //   --verbose    display gate → stderr fmt layer only. Off by
+    //                default: logs go to the trace file, the terminal
+    //                shows only command output (println!/stdout, which
+    //                never routes through tracing). On: the fmt layer
+    //                surfaces events down to the recording floor.
+    //
+    // Per-command floor defaults: ephemeral daemon → debug (tool spans
+    // visible); ACP / agent REPL → warn (kept for parity; verbose-off
+    // already mutes the terminal so conversation/stdio output is never
+    // interleaved). Everything else → info.
     let default_floor = match &cli.command {
         Commands::Daemon {
             ephemeral: true, ..
@@ -4615,6 +4635,19 @@ async fn async_main(command: clap::Command) -> Result<()> {
         cli.verbose,
     );
 
+    // Cerveau (enterprise-hardening: OfficeCLI/MCP-stdio per-tenant
+    // workspace isolation): register the real Landlock-backed sandbox hook
+    // that `zeroclaw-tools`' `StdioTransport::new` calls for any MCP server
+    // with a resolved `tenant_workspace_dir`. Must happen before any MCP
+    // server connects; after logging init so its own warnings are visible.
+    #[cfg(feature = "agent-runtime")]
+    zeroclaw_runtime::security::install_mcp_sandbox_hook();
+
+    // `zeroclaw onboard` is deprecated. The legacy section-by-section
+    // wizard is gone; new installs run `zeroclaw quickstart`. Any old
+    // flags (`--api-key`, `--model-provider`, `--quick`, `--<section>-only`,
+    // positional section subcommands) error so scripted callers fail
+    // loudly rather than silently doing the wrong thing.
     #[cfg(feature = "agent-runtime")]
     if let Commands::Onboard {
         section,

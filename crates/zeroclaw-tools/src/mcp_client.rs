@@ -1603,6 +1603,7 @@ mod tests {
             headers: std::collections::HashMap::default(),
             tls_ca_cert_path: None,
             max_response_bytes: None,
+            ..Default::default()
         };
         let result = McpServer::connect(config).await;
         assert!(result.is_err());
@@ -1625,6 +1626,7 @@ mod tests {
             headers: std::collections::HashMap::default(),
             tls_ca_cert_path: None,
             max_response_bytes: None,
+            ..Default::default()
         }];
         let registry = McpRegistry::connect_all(&configs)
             .await
@@ -2592,6 +2594,7 @@ done
             headers: std::collections::HashMap::default(),
             tls_ca_cert_path: None,
             max_response_bytes: None,
+            ..Default::default()
         };
 
         let registry = McpRegistry::connect_all(&[config])

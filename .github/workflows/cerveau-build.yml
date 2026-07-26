@@ -85,6 +85,16 @@ jobs:
           # runtime ("compiled without memory-postgres"). Tenant memory lives
           # in Postgres (ADR-002 D5 / ADR-004), so append it explicitly.
           FEATURES="$FEATURES,memory-postgres"
+          # Cerveau (enterprise-hardening: OfficeCLI/MCP-stdio per-tenant
+          # workspace isolation): the dist selection also omits every
+          # sandbox-* feature, so LandlockSandbox was never compiled into
+          # any production binary — the shell tool's own sandboxing has
+          # silently been NoopSandbox in prod this whole time, independent
+          # of anything tenant-isolation-related. No external binary needed
+          # (unlike firejail/bubblewrap/docker, none of which are installed
+          # on tencent-vps) — Landlock is a pure in-kernel LSM reachable via
+          # syscalls the `landlock` crate wraps.
+          FEATURES="$FEATURES,sandbox-landlock"
           echo "Resolved features: $FEATURES"
           cargo build --release --locked --no-default-features \
             --features "$FEATURES" \
