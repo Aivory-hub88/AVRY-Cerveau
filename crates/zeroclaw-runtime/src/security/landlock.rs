@@ -115,38 +115,46 @@ impl LandlockSandbox {
             ))
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        // Allow /usr and /bin for executing commands
-        let usr_fd =
-            PathFd::new(Path::new("/usr")).map_err(|e| std::io::Error::other(e.to_string()))?;
-        ruleset = ruleset
-            .add_rule(PathBeneath::new(
-                usr_fd,
-                AccessFs::ReadFile | AccessFs::ReadDir,
-            ))
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        // Read-only system paths every spawned runtime needs before it can
+        // run any of the tool's own logic. None are tenant- or
+        // workspace-specific, so granting them costs nothing in *tenant*
+        // isolation (the property this sandbox exists to enforce) — what
+        // they buy is the sandbox not breaking legitimate use. Each entry
+        // below was found by an actual live EACCES, not added speculatively:
+        //
+        // - /usr, /bin — the interpreter/loader and system binaries.
+        // - /etc       — Node's OpenSSL init unconditionally reads
+        //                /etc/ssl/openssl.cnf; also resolv.conf, nsswitch,
+        //                ca-certificates, localtime.
+        // - /proc      — CoreCLR (OfficeCLI ships a self-contained .NET
+        //                binary) reads /proc/meminfo, /proc/self/maps,
+        //                /proc/self/cgroup, /proc/stat to size its GC heap;
+        //                it aborts with E_OUTOFMEMORY without them.
+        // - /sys       — same CoreCLR startup path reads
+        //                /sys/devices/system/cpu/**/cache/**/size and
+        //                .../node for CPU cache and NUMA topology.
+        //
+        // /proc and /sys carry no *additional* cross-tenant exposure here:
+        // every spawned server already runs as the same OS user as the
+        // daemon, so ordinary Unix permissions govern that boundary
+        // identically with or without these rules.
+        for path in ["/usr", "/bin", "/etc", "/proc", "/sys"] {
+            let fd = PathFd::new(Path::new(path))
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(fd, AccessFs::ReadFile | AccessFs::ReadDir))
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
 
-        let bin_fd =
-            PathFd::new(Path::new("/bin")).map_err(|e| std::io::Error::other(e.to_string()))?;
+        // /dev needs write too: /dev/null and /dev/shm (POSIX shared memory,
+        // which CoreCLR and other runtimes map) are write targets, not just
+        // reads, alongside read-only /dev/urandom.
+        let dev_fd =
+            PathFd::new(Path::new("/dev")).map_err(|e| std::io::Error::other(e.to_string()))?;
         ruleset = ruleset
             .add_rule(PathBeneath::new(
-                bin_fd,
-                AccessFs::ReadFile | AccessFs::ReadDir,
-            ))
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-        // Allow /etc (read-only) — standard system config, same trust tier
-        // as /usr and /bin. Discovered live: Node's own OpenSSL init reads
-        // /etc/ssl/openssl.cnf at startup regardless of what the spawned
-        // tool actually does; other runtimes commonly need /etc/resolv.conf,
-        // /etc/nsswitch.conf, /etc/localtime, ca-certificates, etc. None of
-        // this is tenant- or workspace-specific, so it's not a workspace-
-        // isolation concern — omitting it only breaks legitimate use.
-        let etc_fd =
-            PathFd::new(Path::new("/etc")).map_err(|e| std::io::Error::other(e.to_string()))?;
-        ruleset = ruleset
-            .add_rule(PathBeneath::new(
-                etc_fd,
-                AccessFs::ReadFile | AccessFs::ReadDir,
+                dev_fd,
+                AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::ReadDir,
             ))
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
