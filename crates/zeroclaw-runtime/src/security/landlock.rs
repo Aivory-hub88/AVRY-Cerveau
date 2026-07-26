@@ -62,7 +62,19 @@ impl LandlockSandbox {
     /// dedicated process meant to immediately `execve` into its real target
     /// (see the CLI's hidden `internal-landlock-exec` subcommand), never
     /// from the long-lived daemon itself.
-    pub fn apply_restrictions(&self) -> std::io::Result<()> {
+    ///
+    /// `extra_readable_root`, when given, is granted the same trust tier as
+    /// `/usr`/`/bin` below (read + readdir, no write): a directory the
+    /// *operator* installed and configured the exec target from — e.g. an
+    /// MCP tool's own npm install under `~/.zeroclaw-cerveau/mcp-tools/`,
+    /// which lives outside `/usr`/`/bin` and the tenant workspace but is
+    /// exactly as trusted as system binaries (not tenant-controlled). Without
+    /// this, `execve`d targets installed outside those default paths (and
+    /// anything they read at startup, e.g. a Node module-resolution walk
+    /// through `node_modules/`) fail closed with `EACCES` even for their
+    /// *legitimate* owning tenant — this isn't a workspace-isolation gap,
+    /// it's the tool's own code being unreadable.
+    pub fn apply_restrictions(&self, extra_readable_root: Option<&Path>) -> std::io::Result<()> {
         let mut ruleset = Ruleset::default()
             .handle_access(
                 AccessFs::Execute
@@ -195,6 +207,22 @@ impl LandlockSandbox {
                     Err(std::io::Error::other(e.to_string()))?;
                 }
             }
+        }
+
+        // Allow the exec target's own (operator-installed, non-tenant)
+        // install root, if the caller resolved one — same trust tier as
+        // the /usr and /bin entries in the table above.
+        if let Some(extra_root) = extra_readable_root
+            && extra_root.exists()
+        {
+            let extra_fd =
+                PathFd::new(extra_root).map_err(|e| std::io::Error::other(e.to_string()))?;
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(
+                    extra_fd,
+                    AccessFs::ReadFile | AccessFs::ReadDir,
+                ))
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
 
         // This method is only ever called from the short-lived,

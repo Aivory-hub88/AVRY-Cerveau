@@ -3411,6 +3411,27 @@ fn main() -> Result<()> {
     }
 
     async_main(command)
+/// Find the exec target's own (operator-installed, non-tenant) install
+/// root, so a Landlock-sandboxed stdio MCP server can still read its own
+/// code and dependencies. For an npm-installed tool laid out as
+/// `<tool-root>/node_modules/.bin/<binary>` (this fork's own convention for
+/// `~/.zeroclaw-cerveau/mcp-tools/<tool>/`), walks up past every
+/// `node_modules` path component to reach `<tool-root>`, so Node's own
+/// module-resolution walk through the whole tree stays readable. For
+/// anything else (a plain standalone binary), falls back to just its
+/// containing directory.
+#[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+fn mcp_tool_install_root(program: &std::path::Path) -> std::path::PathBuf {
+    let mut dir = program
+        .parent()
+        .map_or_else(|| program.to_path_buf(), std::path::Path::to_path_buf);
+    while dir.components().any(|c| c.as_os_str() == "node_modules") {
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => break,
+        }
+    }
+    dir
 }
 
 #[tokio::main]
@@ -3497,8 +3518,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     workspace.clone(),
                 ))
                 .map_err(|e| anyhow::anyhow!("landlock unavailable: {e}"))?;
+            let extra_readable_root = mcp_tool_install_root(std::path::Path::new(program));
             sandbox
-                .apply_restrictions()
+                .apply_restrictions(Some(&extra_readable_root))
                 .map_err(|e| anyhow::anyhow!("failed to apply landlock restrictions: {e}"))?;
             // Replaces this process image; only returns on failure to exec.
             let err = std::process::Command::new(program).args(args).exec();
@@ -8283,6 +8305,28 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+    #[test]
+    fn mcp_tool_install_root_walks_up_past_node_modules() {
+        let program = std::path::Path::new(
+            "/home/ubuntu/.zeroclaw-cerveau/mcp-tools/officecli/node_modules/.bin/officecli",
+        );
+        assert_eq!(
+            mcp_tool_install_root(program),
+            std::path::Path::new("/home/ubuntu/.zeroclaw-cerveau/mcp-tools/officecli")
+        );
+    }
+
+    #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+    #[test]
+    fn mcp_tool_install_root_falls_back_to_parent_dir_without_node_modules() {
+        let program = std::path::Path::new("/opt/some-tool/bin/some-tool");
+        assert_eq!(
+            mcp_tool_install_root(program),
+            std::path::Path::new("/opt/some-tool/bin")
+        );
+    }
 
     #[test]
     fn probe_config_dir_extracts_global_flag_in_all_forms() {
