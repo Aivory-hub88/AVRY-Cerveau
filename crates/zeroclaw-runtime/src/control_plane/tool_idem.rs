@@ -28,6 +28,7 @@
 //! see ADR-003. This module is the standalone, tested primitive.
 
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
@@ -165,6 +166,30 @@ impl ToolIdemLedger {
             params![key],
         )?;
         Ok(())
+    }
+}
+
+/// Process-wide singleton, lazily opened on first use and reused for the
+/// life of the daemon — one `<data_dir>/control_plane.db` per process (the
+/// same single-writer-per-`data_dir` invariant `ControlPlaneHandle` relies
+/// on), never reopened per turn. `SqliteTaskStore`'s WAL connection would
+/// tolerate a second open, but there's no reason to pay the open+schema
+/// cost on every tool call when one instance already amortizes it.
+static SHARED: OnceLock<Arc<ToolIdemLedger>> = OnceLock::new();
+
+impl ToolIdemLedger {
+    /// The shared ledger instance for this process, opening it at
+    /// `<data_dir>/control_plane.db` on first call. Every caller after the
+    /// first must pass the *same* `data_dir` (true today: one daemon per
+    /// `data_dir`) — a later call with a different path silently keeps
+    /// serving the first-opened instance rather than erroring, matching
+    /// this being a lazy cache, not a per-call open.
+    pub fn shared(data_dir: &Path) -> Result<Arc<ToolIdemLedger>> {
+        if let Some(existing) = SHARED.get() {
+            return Ok(Arc::clone(existing));
+        }
+        let opened = Arc::new(Self::new(data_dir)?);
+        Ok(Arc::clone(SHARED.get_or_init(|| opened)))
     }
 }
 

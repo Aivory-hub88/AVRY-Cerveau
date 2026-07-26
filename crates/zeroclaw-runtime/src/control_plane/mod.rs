@@ -5,6 +5,7 @@ pub mod authority;
 pub mod boot;
 pub mod global;
 pub mod goal_task;
+pub mod pending_approvals;
 pub mod reaper;
 pub mod task_registry;
 pub mod task_store_sqlite;

@@ -19,6 +19,7 @@ pub mod api_plugins;
 pub mod api_quickstart;
 pub mod api_sections;
 pub mod api_skills;
+pub mod api_approvals;
 pub mod api_sop;
 pub mod api_sop_author;
 mod api_sop_webhook;
@@ -1609,6 +1610,11 @@ pub async fn run_gateway(
         .route("/admin/sop/pending", get(api_sop::handle_sop_pending))
         .route("/admin/sop/approve", post(api_sop::handle_sop_approve))
         .route("/admin/sop/deny", post(api_sop::handle_sop_deny))
+        .route("/admin/approvals", get(api_approvals::handle_list_approvals))
+        .route(
+            "/admin/approvals/{id}/resolve",
+            post(api_approvals::handle_resolve_approval),
+        )
         .route("/admin/paircode", get(handle_admin_paircode))
         .route("/admin/paircode/new", post(handle_admin_paircode_new))
         // ── Existing routes ──
@@ -3049,7 +3055,14 @@ async fn handle_webhook(
     let tenant_ctx = match tenant::TenantSelector::from_headers(&headers) {
         Ok(None) => None,
         Ok(Some(sel)) => {
-            if state.webhook_secret_hash.is_none() {
+            // Cerveau: v0.8.5 removed `AppState::webhook_secret_hash` in
+            // favor of a single-snapshot `WebhookAuthVerdict` threaded
+            // through dispatch — `secret_verified` is its exact
+            // replacement here ("a webhook secret is configured AND this
+            // request presented it"). Fail closed, no second config read.
+            // REVIEW: pair-only deployments (no webhook secret) now reject
+            // tenant headers; confirm fail-closed is intended there too.
+            if !auth_verdict.secret_verified {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
