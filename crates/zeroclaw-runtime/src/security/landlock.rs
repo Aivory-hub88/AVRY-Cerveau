@@ -169,8 +169,24 @@ impl LandlockSandbox {
                 AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir,
                 false,
             ),
-            // some variant of sh requires access to /dev/null
-            ("/dev/null", AccessFs::WriteFile | AccessFs::ReadFile, true),
+            // Discovered live: OfficeCLI's Node shim spawns a self-contained
+            // .NET binary, and CoreCLR aborts at startup with E_OUTOFMEMORY
+            // (HRESULT 0x8007000E) when it cannot read /proc/meminfo,
+            // /proc/self/maps, /proc/self/cgroup, /proc/stat (GC heap
+            // sizing) or /sys/devices/system/cpu/**/cache/**/size and
+            // .../node (CPU cache + NUMA topology). Both are kernel-mounted
+            // pseudo-filesystems present on every real Linux host capable of
+            // running Landlock (5.13+) in the first place, so required.
+            ("/proc", AccessFs::ReadFile | AccessFs::ReadDir, true),
+            ("/sys", AccessFs::ReadFile | AccessFs::ReadDir, true),
+            // /dev needs write too, not just read: /dev/null and /dev/shm
+            // (POSIX shared memory, which CoreCLR and other runtimes map)
+            // are write targets, alongside read-only /dev/urandom.
+            (
+                "/dev",
+                AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::ReadDir,
+                true,
+            ),
         ] {
             match PathFd::new(Path::new(allow_path)) {
                 Ok(path_fd) => {
