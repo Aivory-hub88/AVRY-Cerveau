@@ -613,6 +613,33 @@ fn log_auto_backend_selection(selected: SelectedSandboxBackend, runtime_kind: Ru
 /// `sandbox-landlock` feature not compiled in) — that fallback is
 /// intentional and sufficient; this function only adds a second, more
 /// specific warning naming the affected tenant workspace.
+/// Find the exec target's own (operator-installed, non-tenant) install
+/// root, so a Landlock-sandboxed stdio MCP server can still read its own
+/// code and dependencies. For an npm-installed tool laid out as
+/// `<tool-root>/node_modules/.bin/<binary>` (this fork's own convention
+/// for `~/.zeroclaw-cerveau/mcp-tools/<tool>/`), walks up past every
+/// `node_modules` path component to reach `<tool-root>`, so Node's own
+/// module-resolution walk through the whole tree stays readable. For
+/// anything else (a plain standalone binary), falls back to just its
+/// containing directory.
+///
+/// Cerveau (0016): originally consumed by the `internal-landlock-exec`
+/// re-exec path's `apply_restrictions(extra_readable_root)`; re-expressed
+/// here for upstream v0.8.5's `pre_exec` design, where the same need flows
+/// through `SandboxExtraRoots.read_only` (same read-only tier).
+fn mcp_tool_install_root(program: &Path) -> std::path::PathBuf {
+    let mut dir = program
+        .parent()
+        .map_or_else(|| program.to_path_buf(), std::path::Path::to_path_buf);
+    while dir.components().any(|c| c.as_os_str() == "node_modules") {
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => break,
+        }
+    }
+    dir
+}
+
 fn wrap_mcp_stdio_command(
     cmd: &mut std::process::Command,
     workspace: &Path,
@@ -622,12 +649,23 @@ fn wrap_mcp_stdio_command(
         enabled: Some(true),
         firejail_args: Vec::new(),
     };
-    let sandbox = create_sandbox(
-        &cfg,
-        RuntimeKind::Native,
-        Some(workspace),
-        &SandboxExtraRoots::default(),
-    );
+    // Cerveau (0016): the confined server must still read its own
+    // (operator-installed, non-tenant) code — e.g. officecli's npm tree
+    // under `~/.zeroclaw-cerveau/mcp-tools/`, outside the workspace and
+    // the static allowlist. Granted read-only via `SandboxExtraRoots`
+    // (same tier as `/usr`/`/bin`), and only when the derived root
+    // actually exists — a bare filename or relative program has no
+    // trustworthy root to grant.
+    let tool_root = mcp_tool_install_root(std::path::Path::new(cmd.get_program()));
+    let extra_roots = SandboxExtraRoots {
+        read_only: if tool_root.exists() {
+            vec![tool_root]
+        } else {
+            Vec::new()
+        },
+        ..Default::default()
+    };
+    let sandbox = create_sandbox(&cfg, RuntimeKind::Native, Some(workspace), &extra_roots);
     if sandbox.name() == "none" {
         ::zeroclaw_log::record!(
             WARN,
@@ -694,6 +732,29 @@ mod tests {
             detect_best_sandbox(RuntimeKind::Cloudflare, None, &SandboxExtraRoots::default());
         // Should always return at least NoopSandbox
         assert!(sandbox.is_available());
+    }
+
+    // Cerveau (0016, moved here from the binary when the re-exec design
+    // was dropped for upstream's `pre_exec`): pure path computation, no
+    // platform gate needed.
+    #[test]
+    fn mcp_tool_install_root_walks_up_past_node_modules() {
+        let program = std::path::Path::new(
+            "/home/ubuntu/.zeroclaw-cerveau/mcp-tools/officecli/node_modules/.bin/officecli",
+        );
+        assert_eq!(
+            mcp_tool_install_root(program),
+            std::path::Path::new("/home/ubuntu/.zeroclaw-cerveau/mcp-tools/officecli")
+        );
+    }
+
+    #[test]
+    fn mcp_tool_install_root_falls_back_to_parent_dir_without_node_modules() {
+        let program = std::path::Path::new("/opt/some-tool/bin/some-tool");
+        assert_eq!(
+            mcp_tool_install_root(program),
+            std::path::Path::new("/opt/some-tool/bin")
+        );
     }
 
     #[test]
