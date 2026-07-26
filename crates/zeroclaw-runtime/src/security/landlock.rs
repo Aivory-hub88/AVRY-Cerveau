@@ -101,7 +101,7 @@ fn write_only_access() -> BitFlags<AccessFs> {
 /// actually installed come from one list: a rule added here that the check
 /// never saw would silently reintroduce the tier bypass it exists to catch.
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
-fn generic_rules() -> [(&'static str, BitFlags<AccessFs>, bool); 23] {
+fn generic_rules() -> [(&'static str, BitFlags<AccessFs>, bool); 25] {
     [
         // /tmp: general temp directory for child processes (pipes, sockets, temp files).
         // Execute is intentionally omitted to prevent running untrusted binaries from /tmp.
@@ -148,8 +148,31 @@ fn generic_rules() -> [(&'static str, BitFlags<AccessFs>, bool); 23] {
             AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir,
             false,
         ),
-        // some variant of sh requires access to /dev/null
-        ("/dev/null", AccessFs::WriteFile | AccessFs::ReadFile, true),
+        // Kernel pseudo-filesystems (Cerveau: discovered live —
+        // OfficeCLI's Node shim spawns a self-contained .NET binary, and
+        // CoreCLR aborts at startup with E_OUTOFMEMORY when it cannot read
+        // /proc/meminfo, /proc/self/maps, /proc/self/cgroup, /proc/stat
+        // for GC heap sizing, or /sys CPU cache/topology nodes). None of
+        // this is tenant- or workspace-specific. Present on every real
+        // Linux host capable of running Landlock (5.13+), so required.
+        (
+            "/proc",
+            AccessFs::ReadFile | AccessFs::ReadDir,
+            true,
+        ),
+        (
+            "/sys",
+            AccessFs::ReadFile | AccessFs::ReadDir,
+            true,
+        ),
+        // /dev (superset of the old /dev/null rule): /dev/null and
+        // /dev/shm (POSIX shared memory, which CoreCLR and other runtimes
+        // map) are write targets, alongside read-only /dev/urandom.
+        (
+            "/dev",
+            AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::ReadDir,
+            true,
+        ),
         // DNS resolution: glibc's resolver (used by getaddrinfo, and thus by
         // Python/most language runtimes) reads these to resolve hostnames.
         // All are optional: not every distro/config uses all of them, and a
