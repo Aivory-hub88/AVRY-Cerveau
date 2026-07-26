@@ -448,6 +448,55 @@ fn log_auto_backend_selection(selected: SelectedSandboxBackend, runtime_kind: &s
     }
 }
 
+/// Wrap an MCP stdio server's command with the best available sandbox for
+/// its resolved tenant workspace directory. Matches
+/// `zeroclaw_tools::mcp_transport::SandboxWrapFn`'s signature exactly so it
+/// can be registered there via `install_mcp_sandbox_hook` below —
+/// `zeroclaw-tools` sits below `zeroclaw-runtime` in the crate graph and
+/// cannot call `create_sandbox` itself.
+///
+/// Always requests the `Landlock` backend explicitly (not `Auto`): MCP
+/// stdio servers are spawned per-tool-call on a long-lived multi-tenant
+/// daemon, where only Landlock's per-workspace, non-caller-affecting model
+/// is safe (see `LandlockSandbox::wrap_command`'s doc comment). `Auto`
+/// could otherwise select Firejail/Bubblewrap/Docker, which are fine for
+/// the one-shot `shell` tool but not designed for this call pattern here.
+/// `create_sandbox` already falls back to `NoopSandbox` with a `WARN` log
+/// when Landlock is unavailable on the host (e.g. non-Linux, or the
+/// `sandbox-landlock` feature not compiled in) — that fallback is
+/// intentional and sufficient; this function only adds a second, more
+/// specific warning naming the affected tenant workspace.
+fn wrap_mcp_stdio_command(
+    cmd: &mut std::process::Command,
+    workspace: &Path,
+) -> std::io::Result<()> {
+    let cfg = SandboxConfig {
+        backend: SandboxBackend::Landlock,
+        enabled: Some(true),
+        firejail_args: Vec::new(),
+    };
+    let sandbox = create_sandbox(&cfg, "native", Some(workspace));
+    if sandbox.name() == "none" {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"workspace": workspace.display().to_string()})),
+            "security::detect: MCP tenant workspace confinement requested but Landlock is \
+             unavailable on this host — server will run WITHOUT filesystem confinement"
+        );
+    }
+    sandbox.wrap_command(cmd)
+}
+
+/// Register [`wrap_mcp_stdio_command`] as `zeroclaw-tools`' process-wide MCP
+/// sandbox hook. Call once at process startup, before any MCP server
+/// connects (idempotent either way — `register_sandbox_wrapper` only keeps
+/// the first registration).
+pub fn install_mcp_sandbox_hook() {
+    zeroclaw_tools::mcp_transport::register_sandbox_wrapper(wrap_mcp_stdio_command);
+}
+
 /// Returns true if the Linux kernel has the memory cgroup controller enabled.
 ///
 /// Probes cgroup v2 (`/sys/fs/cgroup/memory.max`), then cgroup v1

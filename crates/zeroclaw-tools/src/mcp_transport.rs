@@ -104,6 +104,30 @@ pub trait McpTransportConn: Send + Sync {
 
 // ── Stdio Transport ──────────────────────────────────────────────────────
 
+/// Process-wide hook for applying OS-level sandboxing (e.g. Landlock) to a
+/// stdio MCP server's spawned command. `zeroclaw-tools` sits *below*
+/// `zeroclaw-runtime` in the crate graph (the reverse dependency would be
+/// circular), so it cannot call `zeroclaw_runtime::security::detect::
+/// create_sandbox` directly — the real binary registers an implementation
+/// here at startup instead (see `install_mcp_sandbox_hook` in
+/// `zeroclaw-runtime`). Takes the workspace directory to confine the
+/// command to, since that's the only case this hook is invoked for (see
+/// [`StdioTransport::new`]).
+pub type SandboxWrapFn =
+    fn(&mut std::process::Command, &std::path::Path) -> std::io::Result<()>;
+
+static SANDBOX_WRAP: std::sync::OnceLock<SandboxWrapFn> = std::sync::OnceLock::new();
+
+/// Register the process-wide MCP sandbox hook. Idempotent — only the first
+/// call takes effect, matching "one real implementation, registered once at
+/// startup." Never called ⇒ [`StdioTransport::new`] logs a warning and spawns
+/// unconfined for any server that requested a `tenant_workspace_dir`, the
+/// same "fail open with a loud warning" posture `create_sandbox` itself uses
+/// when a requested backend is unavailable on the host.
+pub fn register_sandbox_wrapper(f: SandboxWrapFn) {
+    let _ = SANDBOX_WRAP.set(f);
+}
+
 /// Stdio-based transport (spawn local process).
 pub struct StdioTransport {
     _child: Child,
@@ -113,9 +137,35 @@ pub struct StdioTransport {
 
 impl StdioTransport {
     pub fn new(config: &McpServerConfig) -> Result<Self> {
-        let mut child = Command::new(&config.command)
-            .args(&config.args)
-            .envs(&config.env)
+        let mut raw_cmd = std::process::Command::new(&config.command);
+        raw_cmd.args(&config.args).envs(&config.env);
+
+        if let Some(workspace) = &config.tenant_workspace_dir {
+            std::fs::create_dir_all(workspace).with_context(|| {
+                format!(
+                    "failed to create tenant workspace directory for MCP server `{}`: {}",
+                    config.name,
+                    workspace.display()
+                )
+            })?;
+            match SANDBOX_WRAP.get() {
+                Some(wrap) => wrap(&mut raw_cmd, workspace).with_context(|| {
+                    format!("failed to sandbox MCP server `{}`", config.name)
+                })?,
+                None => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"mcp_server": &config.name})),
+                        "mcp_transport: no sandbox wrapper registered — server has a \
+                         tenant_workspace_dir but will run WITHOUT filesystem confinement"
+                    );
+                }
+            }
+        }
+
+        let mut child = Command::from(raw_cmd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
@@ -1451,6 +1501,64 @@ mod tests {
         };
         let result = create_transport(&config);
         assert!(result.is_err());
+    }
+
+    // ── tenant workspace + sandbox hook wiring ─────────────────────────────
+
+    /// `register_sandbox_wrapper` is a process-wide `OnceLock` — only the
+    /// first call in this test binary wins. This module is the only place
+    /// in `zeroclaw-tools` that registers one, so there's no cross-test
+    /// race; every test below observes the same `spy_wrap`.
+    static SPY_WRAP_CALLS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+        std::sync::Mutex::new(Vec::new());
+
+    fn spy_wrap(_cmd: &mut std::process::Command, workspace: &std::path::Path) -> std::io::Result<()> {
+        SPY_WRAP_CALLS.lock().unwrap().push(workspace.to_path_buf());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stdio_transport_new_creates_and_confines_tenant_workspace_when_registered() {
+        register_sandbox_wrapper(spy_wrap);
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("tenant-a").join("office-assistant");
+        assert!(!workspace.exists());
+
+        let config = McpServerConfig {
+            name: "test-tenant-workspace".into(),
+            command: "true".into(),
+            tenant_workspace_dir: Some(workspace.clone()),
+            ..Default::default()
+        };
+        let result = StdioTransport::new(&config);
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        assert!(workspace.is_dir(), "tenant_workspace_dir must be created");
+        assert!(
+            SPY_WRAP_CALLS.lock().unwrap().contains(&workspace),
+            "registered sandbox wrapper must be invoked with the resolved workspace dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_transport_new_does_not_touch_filesystem_without_tenant_workspace_dir() {
+        register_sandbox_wrapper(spy_wrap);
+        let calls_before = SPY_WRAP_CALLS.lock().unwrap().len();
+
+        let config = McpServerConfig {
+            name: "test-no-tenant-workspace".into(),
+            command: "true".into(),
+            tenant_workspace_dir: None,
+            ..Default::default()
+        };
+        let result = StdioTransport::new(&config);
+        assert!(result.is_ok(), "{:?}", result.err());
+
+        assert_eq!(
+            SPY_WRAP_CALLS.lock().unwrap().len(),
+            calls_before,
+            "sandbox wrapper must not be invoked when the server has no tenant_workspace_dir"
+        );
     }
 
     #[test]

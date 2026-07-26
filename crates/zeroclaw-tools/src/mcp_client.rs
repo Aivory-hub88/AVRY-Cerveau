@@ -926,6 +926,7 @@ mod tests {
             transport: McpTransport::Stdio,
             url: None,
             headers: std::collections::HashMap::default(),
+            ..Default::default()
         };
         let result = McpServer::connect(config).await;
         assert!(result.is_err());
@@ -946,6 +947,7 @@ mod tests {
             transport: McpTransport::Stdio,
             url: None,
             headers: std::collections::HashMap::default(),
+            ..Default::default()
         }];
         let registry = McpRegistry::connect_all(&configs)
             .await
@@ -1321,6 +1323,7 @@ done
             transport: McpTransport::Stdio,
             url: None,
             headers: std::collections::HashMap::default(),
+            ..Default::default()
         };
 
         let registry = McpRegistry::connect_all(&[config])

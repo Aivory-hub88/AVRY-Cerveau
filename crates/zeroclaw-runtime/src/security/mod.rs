@@ -54,6 +54,7 @@ pub mod webauthn;
 pub use audit::{AuditEvent, AuditEventType, AuditLogger};
 #[allow(unused_imports)]
 pub use detect::create_sandbox;
+pub use detect::install_mcp_sandbox_hook;
 pub use detect::linux_memcg_available;
 pub use detect::{SandboxPosture, sandbox_posture};
 pub use domain_matcher::DomainMatcher;

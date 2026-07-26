@@ -1143,6 +1143,29 @@ Examples:
         #[command(subcommand)]
         locales_command: LocalesCommands,
     },
+
+    /// Cerveau internal: apply a Landlock filesystem sandbox to THIS process
+    /// (self, not a fork — safe, since this runs as an ordinary, fully
+    /// initialized process, never inside a `pre_exec` closure where only an
+    /// async-signal-safe subset of code would be sound), then `execve` into
+    /// the real target command, replacing this process image in place.
+    /// Landlock restrictions survive `execve` by kernel design, so the
+    /// exec'd program inherits them. Invoked only by
+    /// `LandlockSandbox::wrap_command` rewriting a spawned `Command` to call
+    /// back into this same binary — never meant to be run by a human
+    /// directly, hence hidden from `--help`.
+    #[command(hide = true)]
+    InternalLandlockExec {
+        /// Directory the exec'd command may read/write/list within (plus a
+        /// minimal fixed allowlist: /tmp, /usr, /bin — see
+        /// `zeroclaw_runtime::security::landlock::LandlockSandbox::apply_restrictions`).
+        #[arg(long)]
+        workspace: std::path::PathBuf,
+
+        /// The real command and its arguments, verbatim.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -3450,6 +3473,41 @@ async fn main() -> Result<()> {
         _ => {}
     }
 
+    // Cerveau internal: apply-then-exec re-exec target for
+    // `LandlockSandbox::wrap_command`. No config load, no logging init —
+    // this must be fast and dependency-free, matching the docs-pipeline
+    // commands above. On success this never returns (the process image is
+    // replaced); on failure it's a real command-not-runnable error, so it
+    // exits non-zero rather than silently falling through and running the
+    // target command unsandboxed.
+    if let Commands::InternalLandlockExec { workspace, command } = &cli.command {
+        let Some((program, args)) = command.split_first() else {
+            anyhow::bail!("internal-landlock-exec: no command given after `--`");
+        };
+        #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+        {
+            use std::os::unix::process::CommandExt;
+            let sandbox =
+                zeroclaw_runtime::security::landlock::LandlockSandbox::with_workspace(Some(
+                    workspace.clone(),
+                ))
+                .map_err(|e| anyhow::anyhow!("landlock unavailable: {e}"))?;
+            sandbox
+                .apply_restrictions()
+                .map_err(|e| anyhow::anyhow!("failed to apply landlock restrictions: {e}"))?;
+            // Replaces this process image; only returns on failure to exec.
+            let err = std::process::Command::new(program).args(args).exec();
+            anyhow::bail!("failed to exec `{program}` after applying landlock: {err}");
+        }
+        #[cfg(not(all(feature = "sandbox-landlock", target_os = "linux")))]
+        {
+            anyhow::bail!(
+                "internal-landlock-exec: this binary was built without Landlock support \
+                 (needs the `sandbox-landlock` feature on Linux)"
+            );
+        }
+    }
+
     // Two independent, immutable-for-the-process logging axes:
     //
     //   --log-level  recording floor → runtime trace + capture layer.
@@ -3495,6 +3553,14 @@ async fn main() -> Result<()> {
         &default_filter,
         cli.verbose,
     );
+
+    // Cerveau (enterprise-hardening: OfficeCLI/MCP-stdio per-tenant
+    // workspace isolation): register the real Landlock-backed sandbox hook
+    // that `zeroclaw-tools`' `StdioTransport::new` calls for any MCP server
+    // with a resolved `tenant_workspace_dir`. Must happen before any MCP
+    // server connects; after logging init so its own warnings are visible.
+    #[cfg(feature = "agent-runtime")]
+    zeroclaw_runtime::security::install_mcp_sandbox_hook();
 
     // `zeroclaw onboard` is deprecated. The legacy section-by-section
     // wizard is gone; new installs run `zeroclaw quickstart`. Any old
@@ -3730,7 +3796,10 @@ async fn main() -> Result<()> {
                 }
                 return Ok(());
             }
-            Commands::Completions { .. } | Commands::MarkdownHelp | Commands::MarkdownSchema => {
+            Commands::Completions { .. }
+            | Commands::MarkdownHelp
+            | Commands::MarkdownSchema
+            | Commands::InternalLandlockExec { .. } => {
                 unreachable!()
             }
             _ => {
@@ -3768,7 +3837,8 @@ async fn main() -> Result<()> {
         Commands::Onboard { .. }
         | Commands::Completions { .. }
         | Commands::MarkdownHelp
-        | Commands::MarkdownSchema => unreachable!(),
+        | Commands::MarkdownSchema
+        | Commands::InternalLandlockExec { .. } => unreachable!(),
 
         Commands::Quickstart {
             model_provider,

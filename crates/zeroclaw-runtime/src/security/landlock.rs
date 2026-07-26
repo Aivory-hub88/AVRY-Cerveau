@@ -7,6 +7,8 @@
 use landlock::{AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr};
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
 use std::path::Path;
+#[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+use std::process::Command;
 
 use crate::security::traits::Sandbox;
 
@@ -53,8 +55,13 @@ impl LandlockSandbox {
         Self::new()
     }
 
-    /// Apply Landlock restrictions to the current process
-    fn apply_restrictions(&self) -> std::io::Result<()> {
+    /// Apply Landlock restrictions to the current process. Irreversible and
+    /// permanent for the life of this process (Landlock is monotonic — only
+    /// ever adds restrictions) — call this only from a short-lived,
+    /// dedicated process meant to immediately `execve` into its real target
+    /// (see the CLI's hidden `internal-landlock-exec` subcommand), never
+    /// from the long-lived daemon itself.
+    pub fn apply_restrictions(&self) -> std::io::Result<()> {
         let mut ruleset = Ruleset::default()
             .handle_access(
                 AccessFs::ReadFile
@@ -141,11 +148,68 @@ impl LandlockSandbox {
 
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
 impl Sandbox for LandlockSandbox {
-    fn wrap_command(&self, _cmd: &mut std::process::Command) -> std::io::Result<()> {
-        // Apply Landlock restrictions before executing the command
-        // Note: This affects the current process, not the child process
-        // Child processes inherit the Landlock restrictions
-        self.apply_restrictions()
+    /// Rewrites `cmd` to invoke this same `zeroclaw` binary's hidden
+    /// `internal-landlock-exec` subcommand, which applies the Landlock
+    /// ruleset to *itself* (a fresh, ordinary process — safe, no
+    /// async-signal-safety concerns) and then `execve`s into the real
+    /// target. Mirrors `FirejailSandbox::wrap_command`'s shape (rewrite the
+    /// command to prepend a wrapper, rather than restricting the calling
+    /// process — the earlier version of this method did the latter, which
+    /// is wrong for a long-lived multi-tenant daemon: Landlock only ever
+    /// adds restrictions, so restricting the daemon itself would
+    /// permanently wall it off after the very first call).
+    ///
+    /// Requires `self.workspace_dir` — with no workspace to scope to, there
+    /// is nothing safe to restrict *to*, so this fails closed rather than
+    /// executing unsandboxed or restricting to an arbitrary default.
+    ///
+    /// Unlike `FirejailSandbox`, this explicitly re-applies `cmd`'s
+    /// original env vars onto the replacement command: `*cmd = new_cmd`
+    /// (below) would otherwise silently drop any `[[mcp.servers]].env`
+    /// entries a caller had already set — harmless for `shell.rs`'s call
+    /// site (it unconditionally rebuilds env right after wrapping) but not
+    /// for a caller with no such follow-up.
+    fn wrap_command(&self, cmd: &mut std::process::Command) -> std::io::Result<()> {
+        let Some(workspace) = &self.workspace_dir else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "LandlockSandbox::wrap_command requires a workspace_dir to scope to \
+                 (LandlockSandbox::new()/None has nothing safe to restrict to)",
+            ));
+        };
+        let current_exe = std::env::current_exe()?;
+        let program = cmd.get_program().to_owned();
+        let args: Vec<_> = cmd.get_args().map(std::ffi::OsStr::to_owned).collect();
+        // `get_envs()` yields `(key, None)` for a var this `cmd` explicitly
+        // *removed* (e.g. a prior `env_remove`), distinct from a var it
+        // simply never touched — carry that removal forward too, not just
+        // the additions, so the replacement command's env is a faithful
+        // copy of what the caller had actually built.
+        let envs: Vec<_> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_owned(), v.map(std::ffi::OsStr::to_owned)))
+            .collect();
+
+        let mut wrapped = Command::new(current_exe);
+        wrapped.arg("internal-landlock-exec");
+        wrapped.arg("--workspace");
+        wrapped.arg(workspace);
+        wrapped.arg("--");
+        wrapped.arg(program);
+        wrapped.args(args);
+        for (key, value) in envs {
+            match value {
+                Some(v) => {
+                    wrapped.env(key, v);
+                }
+                None => {
+                    wrapped.env_remove(key);
+                }
+            }
+        }
+
+        *cmd = wrapped;
+        Ok(())
     }
 
     fn is_available(&self) -> bool {
@@ -272,5 +336,84 @@ mod tests {
     fn landlock_stub_probe_returns_unsupported() {
         let result = LandlockSandbox::probe();
         assert!(result.is_err());
+    }
+
+    // ── Cerveau (enterprise-hardening round: OfficeCLI workspace isolation)
+    // wrap_command re-exec rewrite ───────────────────────────────────────
+    //
+    // These test the *rewrite* in-process (fast, no spawning) — they can't
+    // also prove OS-level enforcement here: `wrap_command` re-execs via
+    // `std::env::current_exe()`, which under `cargo test` resolves to this
+    // test binary itself (not the real `zeroclaw` CLI, which lives in a
+    // different crate — `CARGO_BIN_EXE_*` doesn't reach across crates
+    // either), so there is no faithful *and* self-contained way to spawn
+    // the real re-exec path from a unit test here. The actual OS-boundary
+    // proof — a real absolute-path escape attempt genuinely denied — is
+    // step 4 of this round's live VPS verification against the real
+    // compiled binary and real kernel, which is more trustworthy than a
+    // synthetic stand-in binary would be anyway.
+
+    #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+    #[test]
+    fn wrap_command_rewrites_to_self_reexec_with_workspace_and_original_command() {
+        let workspace = std::path::PathBuf::from("/tmp/example-tenant-workspace");
+        let sandbox = LandlockSandbox {
+            workspace_dir: Some(workspace.clone()),
+        };
+        let mut cmd = std::process::Command::new("cat");
+        cmd.arg("/etc/passwd");
+        sandbox.wrap_command(&mut cmd).expect("wrap_command should succeed with a workspace set");
+
+        let current_exe = std::env::current_exe().unwrap();
+        assert_eq!(cmd.get_program(), current_exe.as_os_str());
+
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            args,
+            vec![
+                "internal-landlock-exec".to_string(),
+                "--workspace".to_string(),
+                workspace.to_string_lossy().into_owned(),
+                "--".to_string(),
+                "cat".to_string(),
+                "/etc/passwd".to_string(),
+            ]
+        );
+    }
+
+    #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+    #[test]
+    fn wrap_command_preserves_original_env_vars() {
+        let sandbox = LandlockSandbox {
+            workspace_dir: Some(std::path::PathBuf::from("/tmp/ws")),
+        };
+        let mut cmd = std::process::Command::new("echo");
+        cmd.env("MY_VAR", "my_value");
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        let envs: std::collections::HashMap<_, _> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_owned(), v.map(std::ffi::OsStr::to_owned)))
+            .collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("MY_VAR")),
+            Some(&Some(std::ffi::OsString::from("my_value"))),
+            "an env var set on the original command must survive the rewrite, \
+             unlike FirejailSandbox's equivalent (which doesn't need to, since \
+             shell.rs always rebuilds env after wrapping regardless)"
+        );
+    }
+
+    #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+    #[test]
+    fn wrap_command_without_workspace_fails_closed() {
+        let sandbox = LandlockSandbox { workspace_dir: None };
+        let mut cmd = std::process::Command::new("echo");
+        let result = sandbox.wrap_command(&mut cmd);
+        assert!(
+            result.is_err(),
+            "with no workspace to scope to, wrap_command must refuse rather than \
+             execute unsandboxed or restrict to an arbitrary default"
+        );
     }
 }
