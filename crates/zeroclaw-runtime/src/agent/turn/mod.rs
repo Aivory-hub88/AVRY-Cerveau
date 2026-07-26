@@ -973,6 +973,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             mut ordered_results,
             executable_indices,
             executable_calls,
+            claimed_idem_keys,
         } = prepare_tool_calls(
             &ctx,
             &tool_calls,
@@ -1036,16 +1037,35 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         let mut executed_completed_indices: Vec<usize> = Vec::new();
         let mut executed_completed_calls = Vec::new();
         let mut executed_completed_outcomes = Vec::new();
-        for (slot, (call_idx, call)) in executed_slots.into_iter().zip(
+        let mut executed_completed_idem_keys: Vec<Option<String>> = Vec::new();
+        for (slot, ((call_idx, call), idem_key)) in executed_slots.into_iter().zip(
             executable_indices
                 .iter()
                 .copied()
-                .zip(executable_calls.iter()),
+                .zip(executable_calls.iter())
+                .zip(claimed_idem_keys.into_iter()),
         ) {
-            if let Some(outcome) = slot {
-                executed_completed_indices.push(call_idx);
-                executed_completed_calls.push(call.clone());
-                executed_completed_outcomes.push(outcome);
+            match slot {
+                Some(outcome) => {
+                    executed_completed_indices.push(call_idx);
+                    executed_completed_calls.push(call.clone());
+                    executed_completed_outcomes.push(outcome);
+                    executed_completed_idem_keys.push(idem_key);
+                }
+                None => {
+                    // Cerveau (F-2): a call cancelled mid-batch never ran and
+                    // never will for this turn — release its claim so it
+                    // doesn't leave a permanent InFlight tombstone blocking
+                    // a legitimate future retry. Best-effort: a release
+                    // failure here just leaves the tombstone, same as any
+                    // other crash-before-release case F-2 already tolerates.
+                    if let Some(key) = idem_key
+                        && let Some(mgr) = ctx.approval
+                        && let Some(ledger) = mgr.idem_ledger()
+                    {
+                        let _ = ledger.release(&key);
+                    }
+                }
             }
         }
 
@@ -1054,6 +1074,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             &executed_completed_indices,
             &executed_completed_calls,
             executed_completed_outcomes,
+            &executed_completed_idem_keys,
             &mut ordered_results,
             iteration,
         )

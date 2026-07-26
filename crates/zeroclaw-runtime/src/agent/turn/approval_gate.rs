@@ -33,6 +33,65 @@ pub(crate) async fn gate_tool_approval(
         .approval
         .map(|mgr| mgr.approval_requirement(tool_name))
         .unwrap_or(ApprovalRequirement::NotRequired);
+
+    // Cerveau (enterprise-hardening round 1): an Irreversible-tier tool on
+    // a non-interactive manager never executes and never falls through to
+    // auto-deny — it creates a durable pending-approval record instead, so
+    // a human can resolve it out-of-band later (see the `pending_approvals`
+    // module doc for why this doesn't try to resume the original turn).
+    if approval_requirement == ApprovalRequirement::Pending {
+        let principal = crate::agent::tenant::current_tenant()
+            .map(|t| t.platform_user_id.clone())
+            .unwrap_or_default();
+        let pending_id = match ctx.approval.and_then(|mgr| mgr.pending_store()) {
+            Some(store) => store
+                .insert(&principal, tool_name, &tool_args.to_string(), "irreversible")
+                .ok(),
+            None => None,
+        };
+        let message = match &pending_id {
+            Some(id) => format!(
+                "Requires human approval before it can run (risk tier: irreversible). \
+                 Tracked as pending_id={id}; not yet executed."
+            ),
+            None => "Requires human approval before it can run (risk tier: irreversible), \
+                     but no durable pending-approval store is configured for this agent — \
+                     the request was NOT recorded and cannot be resolved later."
+                .to_string(),
+        };
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "model": ctx.model,
+                    "iteration": iteration + 1,
+                    "tool": tool_name,
+                    "arguments": scrub_credentials(&tool_args.to_string()),
+                    "pending_id": pending_id,
+                    "trace_id": ctx.turn_id,
+                })),
+            "tool_call_result"
+        );
+        if let Some(tx) = ctx.on_delta {
+            let _ = tx
+                .send(StreamDelta::Status(format!(
+                    "\u{23f8}\u{fe0f} {}: {}\n",
+                    tool_name, message
+                )))
+                .await;
+        }
+        return ApprovalGateOutcome::Deny(ToolExecutionOutcome {
+            output: message.clone(),
+            success: false,
+            error_reason: Some(message),
+            duration: Duration::ZERO,
+            receipt: None,
+            output_data: pending_id.map(|id| serde_json::json!({"pending_id": id})),
+        });
+    }
+
     if let Some(mgr) = ctx.approval
         && approval_requirement == ApprovalRequirement::Prompt
     {

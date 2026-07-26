@@ -25,6 +25,12 @@ pub(crate) struct PreparedToolCalls {
     pub(crate) ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>>,
     pub(crate) executable_indices: Vec<usize>,
     pub(crate) executable_calls: Vec<ParsedToolCall>,
+    /// Cerveau (enterprise-hardening round 1, F-2): one slot per
+    /// `executable_calls` entry — `Some(key)` when that call claimed an F-2
+    /// idempotency key and post-exec must `complete`/`release` it,
+    /// `None` for a `Safe`-tier call or a manager with no ledger
+    /// configured (today's unchanged behavior).
+    pub(crate) claimed_idem_keys: Vec<Option<String>>,
 }
 
 fn tool_call_signature(tool_name: &str, tool_args: &serde_json::Value) -> (String, String) {
@@ -89,6 +95,7 @@ pub(crate) async fn prepare_tool_calls(
         (0..tool_calls.len()).map(|_| None).collect();
     let mut executable_indices: Vec<usize> = Vec::new();
     let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
+    let mut claimed_idem_keys: Vec<Option<String>> = Vec::new();
     let mut prompt_approval_tool_signatures_this_round: HashSet<(String, String)> = HashSet::new();
 
     for (idx, call) in tool_calls.iter().enumerate() {
@@ -233,6 +240,91 @@ pub(crate) async fn prepare_tool_calls(
             continue;
         }
 
+        // ── Cerveau (enterprise-hardening round 1, F-2): idempotency claim
+        // ─────────────────────────────────────────────────────────────
+        // Distinct from the in-round duplicate check above: this guards
+        // against a *replayed* call (a crashed turn re-entering with the
+        // same history) re-firing a side-effectful tool, not a same-round
+        // repeat. Only Safe-tier calls skip it; a manager with no ledger
+        // configured (today's default) is a no-op, same as before this
+        // round.
+        let mut claimed_key: Option<String> = None;
+        if let Some(mgr) = ctx.approval
+            && let Some(ledger) = mgr.idem_ledger()
+            && mgr.risk_tier(&tool_name) != zeroclaw_config::schema::ToolRiskTier::Safe
+        {
+            let principal = crate::agent::tenant::current_tenant()
+                .map(|t| t.platform_user_id.clone())
+                .unwrap_or_default();
+            // No separate goal-task id exists at this layer (a plain chat/
+            // webhook turn, not a goal-task) — turn_id doubles for both
+            // positions. Documented simplification: sufficient today since
+            // nothing yet replays a turn (F-1 auto-resume is unbuilt, ADR-003);
+            // this is forward-looking infrastructure for when it lands.
+            let key = crate::control_plane::tool_idem::derive_key(
+                &principal,
+                ctx.turn_id,
+                ctx.turn_id,
+                &tool_name,
+                &tool_args.to_string(),
+            );
+            match ledger.claim(&key) {
+                Ok(crate::control_plane::tool_idem::Claim::Claimed) => {
+                    claimed_key = Some(key);
+                }
+                Ok(crate::control_plane::tool_idem::Claim::AlreadyDone(output)) => {
+                    let outcome = ToolExecutionOutcome {
+                        output: output.clone(),
+                        success: true,
+                        error_reason: None,
+                        duration: Duration::ZERO,
+                        receipt: None,
+                        output_data: None,
+                    };
+                    if let Some(tx) = ctx.event_tx {
+                        emit_tool_call_pair(tx, call, &outcome).await;
+                    }
+                    ordered_results[idx] =
+                        Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
+                    continue;
+                }
+                Ok(crate::control_plane::tool_idem::Claim::InFlight) => {
+                    let msg = format!(
+                        "'{tool_name}' is already in progress from an earlier attempt \
+                         (idempotency key in flight, no recorded success yet) — not \
+                         re-executing to avoid a duplicate side effect."
+                    );
+                    let outcome = ToolExecutionOutcome {
+                        output: msg.clone(),
+                        success: false,
+                        error_reason: Some(msg),
+                        duration: Duration::ZERO,
+                        receipt: None,
+                        output_data: None,
+                    };
+                    if let Some(tx) = ctx.event_tx {
+                        emit_tool_call_pair(tx, call, &outcome).await;
+                    }
+                    ordered_results[idx] =
+                        Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
+                    continue;
+                }
+                Err(e) => {
+                    // Ledger I/O failure: fail open rather than blocking
+                    // every tool call on a control-plane storage hiccup —
+                    // execute without idempotency protection this once,
+                    // same as if no ledger were configured.
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
+                            .with_attrs(::serde_json::json!({"tool": tool_name, "error": e.to_string()})),
+                        "F-2 idempotency claim failed; executing without idempotency protection"
+                    );
+                }
+            }
+        }
+
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
@@ -293,11 +385,13 @@ pub(crate) async fn prepare_tool_calls(
             arguments: tool_args,
             tool_call_id: Some(call_id),
         });
+        claimed_idem_keys.push(claimed_key);
     }
 
     Ok(PreparedToolCalls {
         ordered_results,
         executable_indices,
         executable_calls,
+        claimed_idem_keys,
     })
 }

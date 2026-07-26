@@ -17,14 +17,44 @@ pub(crate) async fn record_executed_outcomes(
     executable_indices: &[usize],
     executable_calls: &[ParsedToolCall],
     executed_outcomes: Vec<ToolExecutionOutcome>,
+    idem_keys: &[Option<String>],
     ordered_results: &mut [Option<(String, Option<String>, ToolExecutionOutcome)>],
     iteration: usize,
 ) {
-    for ((idx, call), outcome) in executable_indices
+    for (((idx, call), outcome), idem_key) in executable_indices
         .iter()
         .zip(executable_calls.iter())
         .zip(executed_outcomes)
+        .zip(idem_keys.iter())
     {
+        // Cerveau (enterprise-hardening round 1, F-2): resolve the claim
+        // this call made in call_prep.rs — `complete` on success so a
+        // future replay reuses the output instead of re-executing;
+        // `release` on failure so a legitimate retry after a real error
+        // isn't permanently blocked by an `InFlight` tombstone.
+        if let Some(key) = idem_key
+            && let Some(mgr) = ctx.approval
+            && let Some(ledger) = mgr.idem_ledger()
+        {
+            let result = if outcome.success {
+                ledger.complete(key, &outcome.output)
+            } else {
+                ledger.release(key)
+            };
+            if let Err(e) = result {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                        .with_attrs(::serde_json::json!({
+                            "tool": call.name,
+                            "error": e.to_string(),
+                        })),
+                    "F-2 idempotency ledger resolve (complete/release) failed"
+                );
+            }
+        }
+
         // The pending ToolCall and terminal ToolResult are emitted by the
         // executor (execute_one_tool) at dispatch and completion time so serial
         // batches interleave call->result per tool. Post-exec only records the
