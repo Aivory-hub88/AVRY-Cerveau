@@ -4418,6 +4418,7 @@ impl Config {
         granted
             .into_iter()
             .filter_map(|server| apply_tenant_entity_scoping(server, tenant_platform_user_id))
+            .filter_map(|server| apply_tenant_workspace_scoping(server, tenant_platform_user_id))
             .collect()
     }
 
@@ -5147,6 +5148,32 @@ pub struct McpServerConfig {
     /// unset for servers that are not per-tenant (e.g. `n8n-mcp`).
     #[serde(default)]
     pub tenant_entity_query_param: Option<String>,
+    /// Cerveau (enterprise-hardening: OfficeCLI/MCP-stdio per-tenant
+    /// workspace isolation): a directory template for a stdio-transport
+    /// server whose tool calls should be filesystem-confined per tenant
+    /// (e.g. OfficeCLI's document reads/writes). Contains a literal
+    /// `{tenant}` placeholder resolved against the authenticated turn's
+    /// `TenantContext::platform_user_id` — same "config declares intent,
+    /// the tenant-scoping step fills in the real value" pattern as
+    /// `tenant_entity_query_param`, never resolved from agent/LLM output.
+    /// Leave unset for servers that don't need workspace confinement.
+    /// Resolution result lands in `tenant_workspace_dir` below; this field
+    /// itself is never read directly at spawn time.
+    #[serde(default)]
+    pub tenant_workspace_root: Option<String>,
+    /// The fully-resolved, tenant-specific workspace directory — set by
+    /// `Config::mcp_servers_for_agent_and_tenant` from
+    /// `tenant_workspace_root` + the authenticated tenant id, never set
+    /// directly in `[[mcp.servers]]` config. When present,
+    /// `StdioTransport::new` (`zeroclaw-tools`) creates this directory if
+    /// missing and Landlock-confines the spawned server to it via
+    /// `security::detect::create_sandbox` + `Sandbox::wrap_command`. Absent
+    /// on a vanilla (non-tenant) turn or when `tenant_workspace_root` is
+    /// unset — fail closed, same as `tenant_entity_query_param`: no tenant
+    /// ⇒ no server-specific directory ⇒ no confinement claim that isn't
+    /// actually backed by a real per-tenant boundary.
+    #[serde(default, skip_serializing)]
+    pub tenant_workspace_dir: Option<std::path::PathBuf>,
 }
 
 /// External MCP client configuration (`[mcp]` section).
@@ -12150,6 +12177,36 @@ pub fn apply_tenant_entity_scoping(
     let mut parsed = url::Url::parse(url).ok()?;
     parsed.query_pairs_mut().append_pair(&param, user_id);
     server.url = Some(parsed.into());
+    Some(server)
+}
+
+/// Resolve a `[[mcp.servers]]` entry's `tenant_workspace_root` template
+/// (e.g. `~/.zeroclaw-cerveau/tenant-workspaces/{tenant}/office-assistant`)
+/// into `tenant_workspace_dir`, substituting the authenticated tenant's
+/// platform user id for the literal `{tenant}` placeholder. Extracted as a
+/// free function alongside [`apply_tenant_entity_scoping`] so
+/// `zeroclaw-tools`' `StdioTransport::new` (which only sees the resolved
+/// `McpServerConfig`, not the tenant context) never has to re-derive it.
+///
+/// - Not workspace-gated (`tenant_workspace_root` unset) → passed through
+///   unchanged, `tenant_workspace_dir` stays `None`.
+/// - Workspace-gated but `tenant_platform_user_id` is `None` (a vanilla
+///   turn, or a caller that chose not to entity-scope) → dropped
+///   (`None`), same fail-closed contract as `apply_tenant_entity_scoping`:
+///   a server declared as needing per-tenant confinement is never
+///   connected without an actual tenant to confine it *to*.
+#[must_use]
+pub fn apply_tenant_workspace_scoping(
+    mut server: McpServerConfig,
+    tenant_platform_user_id: Option<&str>,
+) -> Option<McpServerConfig> {
+    let Some(template) = server.tenant_workspace_root.clone() else {
+        return Some(server);
+    };
+    let user_id = tenant_platform_user_id?;
+    server.tenant_workspace_dir = Some(std::path::PathBuf::from(
+        template.replace("{tenant}", user_id),
+    ));
     Some(server)
 }
 
