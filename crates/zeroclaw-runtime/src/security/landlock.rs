@@ -268,6 +268,13 @@ impl Sandbox for LandlockSandbox {
             .get_envs()
             .map(|(k, v)| (k.to_owned(), v.map(std::ffi::OsStr::to_owned)))
             .collect();
+        // Same "don't drop caller-set state" concern as env vars: the exec'd
+        // target inherits whatever CWD the `internal-landlock-exec` wrapper
+        // process itself started with (exec() doesn't change CWD), so it
+        // must carry this forward too — a caller that set `current_dir` to
+        // scope a server's CWD-relative I/O (e.g. an MCP stdio server with
+        // no native workspace flag) would otherwise silently lose that scoping.
+        let current_dir = cmd.get_current_dir().map(std::path::Path::to_path_buf);
 
         let mut wrapped = Command::new(current_exe);
         wrapped.arg("internal-landlock-exec");
@@ -285,6 +292,9 @@ impl Sandbox for LandlockSandbox {
                     wrapped.env_remove(key);
                 }
             }
+        }
+        if let Some(dir) = current_dir {
+            wrapped.current_dir(dir);
         }
 
         *cmd = wrapped;
@@ -606,6 +616,25 @@ mod tests {
             "an env var set on the original command must survive the rewrite, \
              unlike FirejailSandbox's equivalent (which doesn't need to, since \
              shell.rs always rebuilds env after wrapping regardless)"
+        );
+    }
+
+    #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+    #[test]
+    fn wrap_command_preserves_original_current_dir() {
+        let sandbox = LandlockSandbox {
+            workspace_dir: Some(std::path::PathBuf::from("/tmp/ws")),
+        };
+        let mut cmd = std::process::Command::new("echo");
+        cmd.current_dir("/tmp/some-caller-set-cwd");
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        assert_eq!(
+            cmd.get_current_dir(),
+            Some(std::path::Path::new("/tmp/some-caller-set-cwd")),
+            "current_dir set on the original command must survive the rewrite \
+             (the exec'd target inherits the wrapper process's CWD, so losing \
+             this would silently break CWD-relative I/O scoping)"
         );
     }
 

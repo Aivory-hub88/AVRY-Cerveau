@@ -502,6 +502,14 @@ impl StdioTransport {
                     workspace.display()
                 )
             })?;
+            // OfficeCLI (and stdio MCP servers generally) have no
+            // `--workspace`-style flag; document reads/writes resolve
+            // against the process's own CWD. Set it explicitly so
+            // CWD-relative behavior lands inside the confined directory
+            // regardless of whether a sandbox wrapper is registered below
+            // — the sandbox adds a hard OS-level boundary, this makes the
+            // server's own default behavior agree with that boundary.
+            raw_cmd.current_dir(workspace);
             match SANDBOX_WRAP.get() {
                 Some(wrap) => wrap(&mut raw_cmd, workspace).with_context(|| {
                     format!("failed to sandbox MCP server `{}`", config.name)
@@ -2462,8 +2470,13 @@ mod tests {
     static SPY_WRAP_CALLS: std::sync::Mutex<Vec<std::path::PathBuf>> =
         std::sync::Mutex::new(Vec::new());
 
-    fn spy_wrap(_cmd: &mut std::process::Command, workspace: &std::path::Path) -> std::io::Result<()> {
+    fn spy_wrap(cmd: &mut std::process::Command, workspace: &std::path::Path) -> std::io::Result<()> {
         SPY_WRAP_CALLS.lock().unwrap().push(workspace.to_path_buf());
+        // The real Landlock wrapper carries `current_dir` through its
+        // rewrite; assert it's already set to `workspace` by the time the
+        // wrapper runs, since it's the wrapper's job to preserve, not set,
+        // the caller's CWD scoping.
+        assert_eq!(cmd.get_current_dir(), Some(workspace));
         Ok(())
     }
 
