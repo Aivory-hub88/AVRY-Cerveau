@@ -263,13 +263,17 @@ impl ScopedToolRegistry {
 
         let agent_mcp_servers = if connect_mcp && config.mcp.enabled {
             // Cerveau (Phase 4.1): entity-scope tenant-gated servers (e.g.
-            // Composio) to the authenticated tenant's platform user id;
-            // `current_tenant()` is None outside a tenant-scoped turn, so
-            // vanilla installs resolve identically to `mcp_servers_for_agent`.
+            // Composio) to the authenticated tenant's platform user id, and
+            // (Phase 4.1 follow-on, patch 0012) merge in whatever the
+            // tenant's Aivory agent type additionally grants via
+            // `agent_type_mcp_bundles`. `current_tenant()` is None outside
+            // a tenant-scoped turn, so vanilla installs resolve identically
+            // to `mcp_servers_for_agent`.
             let tenant = crate::agent::tenant::current_tenant();
             config.mcp_servers_for_agent_and_tenant(
                 agent_alias,
                 tenant.as_deref().map(|t| t.platform_user_id.as_str()),
+                tenant.as_deref().map(|t| t.agent_type.as_str()),
             )
         } else {
             Vec::new()

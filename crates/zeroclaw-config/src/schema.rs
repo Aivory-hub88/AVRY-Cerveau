@@ -497,6 +497,18 @@ pub struct Config {
     #[nested]
     pub mcp_bundles: HashMap<String, McpBundleConfig>,
 
+    /// Cerveau (Phase 4.1 follow-on, patch 0012): MCP server bundles
+    /// granted to a tenant by their Aivory agent type
+    /// (`[agent_type_mcp_bundles.<agent_type>]`, e.g.
+    /// `[agent_type_mcp_bundles.finance_invoice_ops]`), in *addition* to
+    /// whatever the host `[agents.<alias>].mcp_bundles` already grants.
+    /// Same data-driven, per-turn pattern as `agent_type_skill_bundles`
+    /// (patch 0011) — deliberately not a second host-alias-per-agent-type
+    /// provisioning scheme. See `Config::mcp_bundle_names_for_tenant`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub agent_type_mcp_bundles: HashMap<String, TenantMcpBundleConfig>,
+
     /// Named peer groups (`[peer_groups.<name>]`). Each entry binds a
     /// channel, a list of member agents, and optional non-agent
     /// (external) members and a per-group blocklist. Mutual opt-in:
@@ -4346,7 +4358,15 @@ impl Config {
     /// Cerveau (Phase 4.1 — Composio-as-MCP, ADR-002 D2 extension): like
     /// [`Self::mcp_servers_for_agent`], but resolves servers whose
     /// `tenant_entity_query_param` is set (e.g. Composio's `user_id`)
-    /// against the *authenticated* tenant's platform user id.
+    /// against the *authenticated* tenant's platform user id, AND (Phase
+    /// 4.1 follow-on, patch 0012) merges in whatever
+    /// `[agent_type_mcp_bundles.<agent_type>]` grants on top of the host
+    /// `[agents.<alias>]`'s own `mcp_bundles` — the exact same
+    /// host-plus-tenant-type-additive pattern
+    /// `skill_bundle_aliases_for_tenant` (patch 0011) established for
+    /// skills. Before patch 0012, a Composio server added to a shared host
+    /// alias's `mcp_bundles` was granted to every tenant agent type
+    /// indiscriminately; this closes that gap.
     ///
     /// - `tenant_platform_user_id = None` — a vanilla (non-tenant) turn, or
     ///   a tenant turn the caller chose not to entity-scope: every
@@ -4357,16 +4377,31 @@ impl Config {
     ///   `zeroclaw-runtime`), never from agent output, tool results, or
     ///   message content; this function has no way to enforce that
     ///   itself, so it is the caller's obligation.
+    /// - `tenant_agent_type` — sourced from `TenantContext::agent_type`,
+    ///   same caller obligation. `None`, or an agent_type with no matching
+    ///   `[agent_type_mcp_bundles.<type>]` entry, grants nothing extra
+    ///   (fail closed, matching `skill_bundle_aliases_for_tenant`).
     ///
     /// A tenant-gated server whose `url` fails to parse is dropped rather
-    /// than connected unscoped (fail closed).
+    /// than connected unscoped (fail closed). When a server name is granted
+    /// by both the host alias and the tenant's agent type, the host
+    /// alias's copy wins (first-seen), matching `mcp_servers_for_bundles`'s
+    /// own first-seen-wins union semantics.
     #[must_use]
     pub fn mcp_servers_for_agent_and_tenant(
         &self,
         agent_alias: &str,
         tenant_platform_user_id: Option<&str>,
+        tenant_agent_type: Option<&str>,
     ) -> Vec<McpServerConfig> {
-        self.mcp_servers_for_agent(agent_alias)
+        let mut granted = self.mcp_servers_for_agent(agent_alias);
+        let tenant_bundle_names = self.mcp_bundle_names_for_tenant(tenant_agent_type);
+        for server in self.mcp_servers_for_bundles(&tenant_bundle_names) {
+            if !granted.iter().any(|g| g.name == server.name) {
+                granted.push(server);
+            }
+        }
+        granted
             .into_iter()
             .filter_map(|mut server| {
                 let Some(param) = server.tenant_entity_query_param.clone() else {
@@ -4380,6 +4415,28 @@ impl Config {
                 Some(server)
             })
             .collect()
+    }
+
+    /// Cerveau (Phase 4.1 follow-on, patch 0012): `[mcp_bundles.<alias>]`
+    /// names granted to a tenant by their Aivory agent type
+    /// (`[agent_type_mcp_bundles.<agent_type>]`), on top of whatever the
+    /// host `[agents.<alias>]` serving the turn already grants via its own
+    /// `mcp_bundles`. Direct parallel to `skill_bundle_aliases_for_tenant`
+    /// (patch 0011); consumed by `Self::mcp_servers_for_agent_and_tenant`.
+    ///
+    /// Fail closed: `tenant_agent_type = None` (a vanilla, non-tenant turn)
+    /// or an `agent_type` with no matching `[agent_type_mcp_bundles.<type>]`
+    /// entry both resolve to an empty grant, never a fallback or default
+    /// bundle.
+    #[must_use]
+    pub fn mcp_bundle_names_for_tenant(&self, tenant_agent_type: Option<&str>) -> Vec<String> {
+        let Some(agent_type) = tenant_agent_type else {
+            return Vec::new();
+        };
+        self.agent_type_mcp_bundles
+            .get(agent_type)
+            .map(|c| c.bundles.clone())
+            .unwrap_or_default()
     }
 
     /// Cerveau (Phase 4.1 follow-on, patch 0011): `[skill_bundles.<alias>]`
@@ -12184,6 +12241,20 @@ pub struct McpBundleConfig {
     pub exclude: Vec<String>,
 }
 
+/// Cerveau (Phase 4.1 follow-on, patch 0012): MCP server bundles granted to
+/// tenants of one Aivory agent type (`[agent_type_mcp_bundles.<agent_type>]`).
+/// Direct parallel to `TenantSkillBundleConfig` (patch 0011).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "agent_type_mcp_bundle"]
+#[serde(default)]
+pub struct TenantMcpBundleConfig {
+    /// `[mcp_bundles.<alias>]` names granted to every tenant of this
+    /// agent type, on top of whatever the host `[agents.<alias>]` serving
+    /// the turn already grants via its own `mcp_bundles`.
+    pub bundles: Vec<String>,
+}
+
 // ── Runtime ──────────────────────────────────────────────────────
 
 /// Runtime adapter kind.
@@ -17907,6 +17978,7 @@ impl Default for Config {
             agent_type_skill_bundles: HashMap::new(),
             knowledge_bundles: HashMap::new(),
             mcp_bundles: HashMap::new(),
+            agent_type_mcp_bundles: HashMap::new(),
             peer_groups: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
@@ -23942,7 +24014,7 @@ untrusted_outbound_redact = false
         // with no entity to scope it to, never fall back to a shared one.
         let config = config_with_tenant_gated_composio_server();
         let granted: Vec<String> = config
-            .mcp_servers_for_agent_and_tenant("aaatools", None)
+            .mcp_servers_for_agent_and_tenant("aaatools", None, None)
             .into_iter()
             .map(|s| s.name)
             .collect();
@@ -23956,7 +24028,7 @@ untrusted_outbound_redact = false
     #[test]
     async fn tenant_gated_mcp_server_gets_entity_scoped_url() {
         let config = config_with_tenant_gated_composio_server();
-        let servers = config.mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"));
+        let servers = config.mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"), None);
         let composio = servers
             .iter()
             .find(|s| s.name == "composio")
@@ -23978,7 +24050,7 @@ untrusted_outbound_redact = false
         let mut config = config_with_tenant_gated_composio_server();
         config.mcp.servers[0].url = Some("https://mcp.composio.dev/v1?region=us".to_string());
 
-        let servers = config.mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"));
+        let servers = config.mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"), None);
         let composio = servers.iter().find(|s| s.name == "composio").unwrap();
         assert_eq!(
             composio.url.as_deref(),
@@ -23993,7 +24065,7 @@ untrusted_outbound_redact = false
         config.mcp.servers[0].url = Some("not a url".to_string());
 
         let granted: Vec<String> = config
-            .mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"))
+            .mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"), None)
             .into_iter()
             .map(|s| s.name)
             .collect();
@@ -24048,6 +24120,165 @@ untrusted_outbound_redact = false
         assert_eq!(
             config.skill_bundle_aliases_for_tenant(Some("finance_invoice_ops")),
             vec!["finance-invoice-ops".to_string(), "shared-ops".to_string()]
+        );
+    }
+
+    #[test]
+    async fn mcp_bundle_names_for_tenant_none_grants_nothing() {
+        let mut config = Config::default();
+        config.agent_type_mcp_bundles.insert(
+            "finance_invoice_ops".to_string(),
+            TenantMcpBundleConfig {
+                bundles: vec!["finance-invoice-ops-stripe".to_string()],
+            },
+        );
+        assert!(
+            config.mcp_bundle_names_for_tenant(None).is_empty(),
+            "a vanilla, non-tenant turn is granted no tenant mcp bundles"
+        );
+    }
+
+    #[test]
+    async fn mcp_bundle_names_for_tenant_unknown_agent_type_grants_nothing() {
+        let mut config = Config::default();
+        config.agent_type_mcp_bundles.insert(
+            "finance_invoice_ops".to_string(),
+            TenantMcpBundleConfig {
+                bundles: vec!["finance-invoice-ops-stripe".to_string()],
+            },
+        );
+        assert!(
+            config
+                .mcp_bundle_names_for_tenant(Some("customer_service"))
+                .is_empty(),
+            "an agent_type with no configured entry grants nothing — never falls back to another type's bundles"
+        );
+    }
+
+    #[test]
+    async fn mcp_bundle_names_for_tenant_matching_type_resolves_its_bundles() {
+        let mut config = Config::default();
+        config.agent_type_mcp_bundles.insert(
+            "finance_invoice_ops".to_string(),
+            TenantMcpBundleConfig {
+                bundles: vec!["finance-invoice-ops-stripe".to_string(), "shared-ops".to_string()],
+            },
+        );
+        assert_eq!(
+            config.mcp_bundle_names_for_tenant(Some("finance_invoice_ops")),
+            vec!["finance-invoice-ops-stripe".to_string(), "shared-ops".to_string()]
+        );
+    }
+
+    /// Config with a host alias `"aaatools"` (bare, no mcp_bundles of its
+    /// own) plus a Stripe-shaped tenant-gated server granted only via
+    /// `[agent_type_mcp_bundles.finance_invoice_ops]` — the patch 0012
+    /// shape: the host alias grants nothing on its own, everything comes
+    /// from the tenant's agent type.
+    fn config_with_agent_type_gated_stripe_server() -> Config {
+        let mut config = Config::default();
+        config.mcp.servers.push(McpServerConfig {
+            name: "composio-stripe".to_string(),
+            url: Some("https://backend.composio.dev/v3/mcp/srv_stripe".to_string()),
+            tenant_entity_query_param: Some("user_id".to_string()),
+            ..McpServerConfig::default()
+        });
+        config.mcp_bundles.insert(
+            "finance-invoice-ops-stripe".to_string(),
+            McpBundleConfig {
+                servers: vec!["composio-stripe".to_string()],
+                exclude: vec![],
+            },
+        );
+        config.agent_type_mcp_bundles.insert(
+            "finance_invoice_ops".to_string(),
+            TenantMcpBundleConfig {
+                bundles: vec!["finance-invoice-ops-stripe".to_string()],
+            },
+        );
+        config
+            .agents
+            .insert("aaatools".to_string(), AliasedAgentConfig::default());
+        config
+    }
+
+    #[test]
+    async fn mcp_servers_for_agent_and_tenant_grants_agent_type_bundle_on_top_of_host() {
+        let config = config_with_agent_type_gated_stripe_server();
+        let granted: Vec<String> = config
+            .mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"), Some("finance_invoice_ops"))
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            granted,
+            vec!["composio-stripe"],
+            "a tenant of the matching agent type is granted the type-scoped server \
+             even though the host alias itself grants nothing"
+        );
+    }
+
+    #[test]
+    async fn mcp_servers_for_agent_and_tenant_isolates_by_agent_type() {
+        let config = config_with_agent_type_gated_stripe_server();
+        let granted = config.mcp_servers_for_agent_and_tenant(
+            "aaatools",
+            Some("u_42"),
+            Some("customer_service"),
+        );
+        assert!(
+            granted.is_empty(),
+            "a tenant of a DIFFERENT agent type must not see finance_invoice_ops's \
+             Stripe server — this is the actual isolation guarantee patch 0012 exists for"
+        );
+    }
+
+    #[test]
+    async fn mcp_servers_for_agent_and_tenant_vanilla_turn_gets_no_agent_type_grant() {
+        let config = config_with_agent_type_gated_stripe_server();
+        let granted =
+            config.mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"), None);
+        assert!(
+            granted.is_empty(),
+            "a turn with no agent_type at all (vanilla or type omitted) gets none of \
+             the agent-type-scoped grant, matching skill_bundle_aliases_for_tenant"
+        );
+    }
+
+    #[test]
+    async fn mcp_servers_for_agent_and_tenant_deduplicates_name_granted_by_both_paths() {
+        // Same server name ("composio-stripe") granted BOTH by the host
+        // alias's own mcp_bundles AND by the tenant's agent-type bundle —
+        // both resolve against the single matching `[[mcp.servers]]` entry
+        // (there is only ever one `McpServerConfig` per name), so this
+        // proves the merge doesn't double-grant/double-count, not that the
+        // two paths could disagree on content (they can't: same name,
+        // same underlying config entry).
+        let mut config = config_with_agent_type_gated_stripe_server();
+        config.mcp_bundles.insert(
+            "host-own-tools".to_string(),
+            McpBundleConfig {
+                servers: vec!["composio-stripe".to_string()],
+                exclude: vec![],
+            },
+        );
+        config.agents.insert(
+            "aaatools".to_string(),
+            AliasedAgentConfig {
+                mcp_bundles: vec!["host-own-tools".to_string()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let granted = config.mcp_servers_for_agent_and_tenant(
+            "aaatools",
+            Some("u_42"),
+            Some("finance_invoice_ops"),
+        );
+        assert_eq!(
+            granted.len(),
+            1,
+            "a server name granted by both host and tenant-type resolves once, not twice"
         );
     }
 
@@ -25885,6 +26116,7 @@ auto_save = true
             agent_type_skill_bundles: HashMap::new(),
             knowledge_bundles: HashMap::new(),
             mcp_bundles: HashMap::new(),
+            agent_type_mcp_bundles: HashMap::new(),
             peer_groups: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
@@ -26758,6 +26990,7 @@ default_temperature = 0.7
             agent_type_skill_bundles: HashMap::new(),
             knowledge_bundles: HashMap::new(),
             mcp_bundles: HashMap::new(),
+            agent_type_mcp_bundles: HashMap::new(),
             peer_groups: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
