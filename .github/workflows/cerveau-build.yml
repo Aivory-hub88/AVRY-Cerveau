@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-x86_64-linux:
@@ -115,3 +115,24 @@ jobs:
             zeroclaw-x86_64-unknown-linux-gnu.tar.gz
             zeroclaw-x86_64-unknown-linux-gnu.tar.gz.sha256
           retention-days: 30
+
+      # Actions artifacts (above) always require an authenticated API call
+      # to download, even on a public repo — every VPS deploy this whole
+      # patch series needed a personal token pasted by hand just to fetch
+      # the build. A GitHub Release's assets are plain public HTTPS URLs on
+      # a public repo, so publish the same two files there too, using the
+      # workflow's own auto-issued token (no PAT needed by anyone). This is
+      # a rolling release (one moving tag, replaced every build) — it's a
+      # deploy artifact, not a versioned release.
+      - name: Publish rolling release (public, token-free download for VPS deploy)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="cerveau-cd"
+          gh release delete "$TAG" --yes --cleanup-tag --repo "${{ github.repository }}" || true
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "Cerveau CD artifact ($(git rev-parse --short HEAD))" \
+            --notes "Rolling deploy artifact, auto-published from commit ${{ github.sha }}. Not a versioned release — always points at the latest cerveau-main build." \
+            zeroclaw-x86_64-unknown-linux-gnu.tar.gz \
+            zeroclaw-x86_64-unknown-linux-gnu.tar.gz.sha256
