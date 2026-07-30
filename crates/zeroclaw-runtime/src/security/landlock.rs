@@ -91,7 +91,14 @@ impl LandlockSandbox {
             .and_then(|ruleset| ruleset.create())
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        // Allow workspace directory (read/write)
+        // Allow workspace directory (read/write/create/remove). MakeReg and
+        // RemoveFile are handled access types (see handle_access above) but
+        // were missing from this rule, which made Landlock deny *creating*
+        // any new regular file anywhere on the system, including inside a
+        // tenant's own workspace — writing to an existing file worked,
+        // creating one didn't. Found live: a document tool tried to write a
+        // brand-new .docx into its own correctly-scoped workspace and got a
+        // plain "Access denied" with no cross-tenant angle involved at all.
         if let Some(ref workspace) = self.workspace_dir
             && workspace.exists()
         {
@@ -100,18 +107,29 @@ impl LandlockSandbox {
             ruleset = ruleset
                 .add_rule(PathBeneath::new(
                     workspace_fd,
-                    AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::ReadDir,
+                    AccessFs::ReadFile
+                        | AccessFs::WriteFile
+                        | AccessFs::ReadDir
+                        | AccessFs::MakeReg
+                        | AccessFs::RemoveFile,
                 ))
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
 
-        // Allow /tmp for general operations
+        // Allow /tmp for general operations. MakeReg/RemoveFile are required
+        // here too, not just in the workspace above: tools that keep a live
+        // resident process (e.g. OfficeCLI's Node/CoreCLR shim) take out a
+        // lock file under /tmp for the life of the resident and remove it on
+        // clean exit.
         let tmp_fd =
             PathFd::new(Path::new("/tmp")).map_err(|e| std::io::Error::other(e.to_string()))?;
         ruleset = ruleset
             .add_rule(PathBeneath::new(
                 tmp_fd,
-                AccessFs::ReadFile | AccessFs::WriteFile,
+                AccessFs::ReadFile
+                    | AccessFs::WriteFile
+                    | AccessFs::MakeReg
+                    | AccessFs::RemoveFile,
             ))
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
