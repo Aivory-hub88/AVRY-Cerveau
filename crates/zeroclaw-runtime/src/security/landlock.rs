@@ -105,9 +105,19 @@ fn generic_rules() -> [(&'static str, BitFlags<AccessFs>, bool); 25] {
     [
         // /tmp: general temp directory for child processes (pipes, sockets, temp files).
         // Execute is intentionally omitted to prevent running untrusted binaries from /tmp.
+        // MakeReg/RemoveFile are granted here (Cerveau: found live — tools
+        // that keep a resident process, e.g. OfficeCLI's Node/CoreCLR shim,
+        // create a lock file under /tmp for the resident's lifetime and
+        // remove it on clean exit; without these, `touch` of a new path
+        // fails while writing an existing file succeeds). The workspace
+        // rule needs no change: `read_write_access()` already carries both.
         (
             "/tmp",
-            AccessFs::Truncate | AccessFs::WriteFile | AccessFs::ReadFile,
+            AccessFs::Truncate
+                | AccessFs::WriteFile
+                | AccessFs::ReadFile
+                | AccessFs::MakeReg
+                | AccessFs::RemoveFile,
             true,
         ),
         // Linux dynamic linker (ld-linux-yourarch.so.version) which designed to run on FHS 3.0
