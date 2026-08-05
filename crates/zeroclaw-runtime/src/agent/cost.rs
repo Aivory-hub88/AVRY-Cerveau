@@ -16,6 +16,20 @@ use zeroclaw_providers::pricing::ModelRates;
 /// are USD per 1M tokens.
 pub type ModelProviderPricing = HashMap<String, HashMap<String, f64>>;
 
+/// Register this crate's [`super::tenant::current_tenant`] as the
+/// process-wide provider for `CostRecord.tenant_id` (Phase 5 — cost
+/// attribution per tenant). Call once at process startup, alongside
+/// `zeroclaw_runtime::security::install_mcp_sandbox_hook` — same
+/// crate-graph reason: `zeroclaw-config` sits *below* this crate (the
+/// reverse dependency would be circular) and cannot call
+/// `agent::tenant::current_tenant` directly. Idempotent; a no-op call here
+/// is harmless if invoked more than once.
+pub fn install_tenant_cost_hook() {
+    zeroclaw_config::cost::tracker::install_tenant_id_provider(|| {
+        super::tenant::current_tenant().map(|ctx| ctx.tenant_id.clone())
+    });
+}
+
 /// Per-scope token/cost accumulator derived from the usage events emitted
 /// during a single task-local runtime invocation.
 #[derive(Default, Clone, Copy, Debug)]

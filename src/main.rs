@@ -3586,6 +3586,13 @@ async fn main() -> Result<()> {
     #[cfg(feature = "agent-runtime")]
     zeroclaw_runtime::security::install_mcp_sandbox_hook();
 
+    // Cerveau (Phase 5 — per-tenant cost attribution): register this
+    // process's `current_tenant()` as the `CostRecord.tenant_id` provider
+    // (same crate-graph-inversion hook shape as the sandbox hook just
+    // above, same reason — see `install_tenant_cost_hook`'s doc comment).
+    #[cfg(feature = "agent-runtime")]
+    zeroclaw_runtime::agent::cost::install_tenant_cost_hook();
+
     // `zeroclaw onboard` is deprecated. The legacy section-by-section
     // wizard is gone; new installs run `zeroclaw quickstart`. Any old
     // flags (`--api-key`, `--model-provider`, `--quick`, `--<section>-only`,
