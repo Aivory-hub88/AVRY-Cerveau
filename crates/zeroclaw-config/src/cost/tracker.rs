@@ -11,6 +11,32 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+/// Process-wide hook for stamping the current Cerveau tenant id onto a
+/// [`CostRecord`] as it's persisted. `zeroclaw-config` sits *below*
+/// `zeroclaw-runtime` in the crate graph (the reverse dependency would be
+/// circular), so it cannot call `zeroclaw_runtime::agent::tenant::
+/// current_tenant` directly — the real binary registers it at startup
+/// instead (mirrors `zeroclaw_tools::mcp_transport::register_sandbox_wrapper`
+/// / `zeroclaw_runtime::security::install_mcp_sandbox_hook`'s exact same
+/// shape, for the exact same reason). Returns `None` outside a tenant-scoped
+/// turn — that's the normal, expected case for single-operator usage.
+pub type TenantIdProviderFn = fn() -> Option<String>;
+
+static TENANT_ID_PROVIDER: OnceLock<TenantIdProviderFn> = OnceLock::new();
+
+/// Register the process-wide tenant-id provider. Idempotent — only the
+/// first call takes effect. Never called ⇒ every `CostRecord.tenant_id`
+/// stays `None`, identical to pre-Phase-5 behavior.
+pub fn install_tenant_id_provider(f: TenantIdProviderFn) {
+    let _ = TENANT_ID_PROVIDER.set(f);
+}
+
+/// Cost tracker for API usage monitoring and budget enforcement.
+///
+/// The append-only JSONL file behind `storage` is the durable usage ledger.
+/// In-memory fields are process-local helpers for config reloads and cheap
+/// session summaries; goal and task budget views must derive consumed usage
+/// from persisted `CostRecord` rows instead of caching it elsewhere.
 pub struct CostTracker {
     /// Live cost policy. This is hot-swapped on config reload so budget checks
     /// see new global limits without rebuilding the tracker.
@@ -243,8 +269,9 @@ impl CostTracker {
         };
         let cost_usd = usage.cost_usd;
         let total_tokens = usage.total_tokens;
-        let record =
+        let mut record =
             CostRecord::with_attribution(&self.session_id, effective_alias.clone(), task_id, usage);
+        record.tenant_id = TENANT_ID_PROVIDER.get().and_then(|provider| provider());
 
         {
             let mut storage = self.lock_storage();
@@ -1017,6 +1044,31 @@ mod tests {
         assert_eq!(summary.request_count, 1);
         assert!(summary.session_cost_usd > 0.0);
         assert_eq!(summary.by_model.len(), 1);
+    }
+
+    /// Phase 5 (per-tenant cost attribution): `install_tenant_id_provider`
+    /// is a process-wide `OnceLock` — only the first call in this test
+    /// binary wins, and no other test in this module installs one or
+    /// asserts `tenant_id` is absent, so there's no cross-test race (same
+    /// reasoning documented on `zeroclaw-tools`' `register_sandbox_wrapper`
+    /// tests for the identically-shaped hook).
+    #[test]
+    fn record_usage_stamps_tenant_id_from_installed_provider() {
+        install_tenant_id_provider(|| Some("user-a.customer_service".to_string()));
+
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        tracker
+            .record_usage(TokenUsage::new("test/model", 1000, 500, 0, 1.0, 2.0, 0.0))
+            .unwrap();
+
+        let ledger_path = tmp.path().join("state").join("costs.jsonl");
+        let contents = fs::read_to_string(&ledger_path).unwrap();
+        let record: CostRecord = serde_json::from_str(contents.lines().last().unwrap()).unwrap();
+        assert_eq!(
+            record.tenant_id.as_deref(),
+            Some("user-a.customer_service")
+        );
     }
 
     #[test]
