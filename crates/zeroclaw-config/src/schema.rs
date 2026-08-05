@@ -7262,6 +7262,13 @@ pub struct GatewayConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub webhook_secret: Option<String>,
+    /// Max `/webhook` requests per minute per **tenant** (`X-Tenant-Id` +
+    /// `X-Agent-Type`), independent of the per-client-IP limit above.
+    /// Prevents one tenant from starving others sharing the same source
+    /// IP (e.g. the same bridge/proxy). Only applies to tenant-scoped
+    /// requests (both headers present); vanilla requests are unaffected.
+    #[serde(default = "default_tenant_webhook_rate_limit")]
+    pub tenant_webhook_rate_limit_per_minute: u32,
 
     /// Trust proxy-forwarded client IP headers (`X-Forwarded-For`, `X-Real-IP`).
     /// Disabled by default; enable only behind a trusted reverse proxy.
@@ -7375,6 +7382,10 @@ fn default_webhook_rate_limit() -> u32 {
     60
 }
 
+fn default_tenant_webhook_rate_limit() -> u32 {
+    60
+}
+
 fn default_idempotency_ttl_secs() -> u64 {
     300
 }
@@ -7415,6 +7426,7 @@ impl Default for GatewayConfig {
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
             webhook_secret: None,
+            tenant_webhook_rate_limit_per_minute: default_tenant_webhook_rate_limit(),
             trust_forwarded_headers: false,
             path_prefix: None,
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
@@ -31608,6 +31620,7 @@ allowed_numbers = ["+1", "+2"]
             pair_rate_limit_per_minute: 12,
             webhook_rate_limit_per_minute: 80,
             webhook_secret: None,
+            tenant_webhook_rate_limit_per_minute: 40,
             trust_forwarded_headers: true,
             path_prefix: Some("/zeroclaw".into()),
             rate_limit_max_keys: 2048,
@@ -31633,6 +31646,7 @@ allowed_numbers = ["+1", "+2"]
         assert_eq!(parsed.paired_tokens, vec!["zc_test_token"]);
         assert_eq!(parsed.pair_rate_limit_per_minute, 12);
         assert_eq!(parsed.webhook_rate_limit_per_minute, 80);
+        assert_eq!(parsed.tenant_webhook_rate_limit_per_minute, 40);
         assert!(parsed.trust_forwarded_headers);
         assert_eq!(parsed.path_prefix.as_deref(), Some("/zeroclaw"));
         assert_eq!(parsed.rate_limit_max_keys, 2048);

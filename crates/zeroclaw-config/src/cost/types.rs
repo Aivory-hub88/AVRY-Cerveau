@@ -149,6 +149,15 @@ pub struct CostRecord {
         skip_serializing_if = "Option::is_none"
     )]
     pub task_id: Option<String>,
+    /// Cerveau tenant identifier (`<user_id>.<agent_type>`) that incurred
+    /// this cost, when the call happened inside a tenant-scoped turn.
+    /// `None` for single-operator (non-tenant) usage, or when persisted
+    /// before this field existed. Stamped by [`super::tracker`] via a
+    /// process-wide hook — see `install_tenant_id_provider` — never passed
+    /// explicitly by callers, so this dimension didn't require touching
+    /// every `record_usage*` call site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
 }
 
 impl CostRecord {
@@ -160,6 +169,7 @@ impl CostRecord {
             session_id: session_id.into(),
             agent_alias: None,
             task_id: None,
+            tenant_id: None,
         }
     }
 
@@ -175,6 +185,7 @@ impl CostRecord {
             session_id: session_id.into(),
             agent_alias,
             task_id: None,
+            tenant_id: None,
         }
     }
 
@@ -191,6 +202,7 @@ impl CostRecord {
             session_id: session_id.into(),
             agent_alias,
             task_id,
+            tenant_id: None,
         }
     }
 }
