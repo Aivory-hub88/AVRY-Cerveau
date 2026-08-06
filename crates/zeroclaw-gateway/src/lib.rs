@@ -2643,7 +2643,22 @@ async fn handle_webhook(
 ) -> impl IntoResponse {
     let rate_key =
         client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
-    if !state.rate_limiter.allow_webhook(&rate_key) {
+
+    // Cerveau: parse (but do not yet trust) tenant headers up front — pure,
+    // side-effect-free (no DB, no auth). Real Phase 6 traffic proxies every
+    // tenant through one shared bridge IP; once a request proves its
+    // identity below (webhook secret valid + well-formed tenant headers),
+    // its rate limit is charged to the *tenant* via `allow_tenant` further
+    // down, not the shared IP — so one aggressive tenant (or just enough of
+    // them) can no longer exhaust the bucket every other tenant behind the
+    // same bridge shares. Anything that hasn't proven tenant identity yet
+    // (bad/missing secret, malformed tenant headers, legacy non-tenant
+    // callers) still passes through the coarse per-IP `allow_webhook` gate
+    // below, unchanged from before this patch.
+    let tenant_selector = tenant::TenantSelector::from_headers(&headers);
+    let claims_tenant = matches!(tenant_selector, Ok(Some(_)));
+
+    let too_many_webhook_requests = || {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2654,8 +2669,8 @@ async fn handle_webhook(
             "error": "Too many webhook requests. Please retry later.",
             "retry_after": RATE_LIMIT_WINDOW_SECS,
         });
-        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
-    }
+        (StatusCode::TOO_MANY_REQUESTS, Json(err))
+    };
 
     // ── Bearer token auth (pairing) with auth rate limiting ──
     if state.pairing.require_pairing() {
@@ -2694,6 +2709,7 @@ async fn handle_webhook(
     }
 
     // ── Webhook secret auth (optional, additional layer) ──
+    let webhook_secret_configured = state.webhook_secret_hash.is_some();
     if let Some(ref secret_hash) = state.webhook_secret_hash {
         let header_hash = headers
             .get("X-Webhook-Secret")
@@ -2704,6 +2720,12 @@ async fn handle_webhook(
         match header_hash {
             Some(val) if constant_time_eq(&val, secret_hash.as_ref()) => {}
             _ => {
+                // A bad/missing secret is exactly the brute-force case the
+                // per-IP ceiling exists to bound — still apply it here,
+                // since this request hasn't proven tenant identity.
+                if !state.rate_limiter.allow_webhook(&rate_key) {
+                    return too_many_webhook_requests();
+                }
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2714,6 +2736,16 @@ async fn handle_webhook(
                 return (StatusCode::UNAUTHORIZED, Json(err));
             }
         }
+    }
+
+    // Bridge-authenticated tenant traffic (valid secret + well-formed
+    // tenant headers) is rate-limited purely per-tenant via `allow_tenant`
+    // below, not the coarse per-IP bucket — see the `tenant_selector`
+    // comment above. Everything else still goes through the per-IP gate,
+    // unchanged from before this patch.
+    let is_authenticated_tenant_request = webhook_secret_configured && claims_tenant;
+    if !is_authenticated_tenant_request && !state.rate_limiter.allow_webhook(&rate_key) {
+        return too_many_webhook_requests();
     }
 
     // ── Parse body ──
@@ -2770,7 +2802,7 @@ async fn handle_webhook(
     // back to an unscoped (cross-tenant-visible) turn. Placed before
     // idempotency so a rejected tenant request doesn't consume the
     // caller's idempotency key.
-    let tenant_ctx = match tenant::TenantSelector::from_headers(&headers) {
+    let tenant_ctx = match tenant_selector {
         Ok(None) => None,
         Ok(Some(sel)) => {
             if state.webhook_secret_hash.is_none() {
@@ -6539,6 +6571,330 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Phase 5 follow-up (Finding 1, `webhook_rate_limit_per_minute` blocks
+    /// shared-bridge-IP traffic): a request that proves its identity — valid
+    /// `X-Webhook-Secret` plus well-formed `X-Tenant-Id`/`X-Agent-Type` — is
+    /// charged to the *tenant* limiter, never the coarse per-IP one. With
+    /// the per-IP budget set to 1 (so a single non-tenant request would
+    /// already trip it), three *distinct* tenants sharing one source IP
+    /// must all clear the gate. Persona resolution itself may still fail
+    /// past that point (no `CERVEAU_TENANT_DB_URL` in CI) — only whether
+    /// the response is ever 429 is asserted.
+    #[tokio::test]
+    async fn webhook_authenticated_tenant_requests_bypass_per_ip_limit() {
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let secret = generate_test_secret();
+
+        let state = AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 1, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-wati")]
+            wati: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        for i in 0..3 {
+            let mut headers = HeaderMap::new();
+            headers.insert("X-Webhook-Secret", HeaderValue::from_str(&secret).unwrap());
+            headers.insert(
+                "X-Tenant-Id",
+                HeaderValue::from_str(&format!("bridge-tenant-{i}")).unwrap(),
+            );
+            headers.insert("X-Agent-Type", HeaderValue::from_static("customer_service"));
+
+            let response = handle_webhook(
+                State(state.clone()),
+                test_connect_info(),
+                Query(WebhookQuery::default()),
+                headers,
+                Ok(Json(WebhookBody {
+                    message: "hello".into(),
+                })),
+            )
+            .await
+            .into_response();
+
+            assert_ne!(
+                response.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "tenant bridge-tenant-{i} must not be blocked by the shared per-IP limit"
+            );
+        }
+    }
+
+    /// Regression check paired with the test above: a request that never
+    /// proves a valid secret must still be bound by the coarse per-IP
+    /// limiter — moving authenticated tenant traffic off that bucket must
+    /// not also exempt webhook-secret brute-forcing.
+    #[tokio::test]
+    async fn webhook_invalid_secret_still_bound_by_per_ip_limit() {
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let valid_secret = generate_test_secret();
+        let wrong_secret = generate_test_secret();
+
+        let state = AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 1, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-wati")]
+            wati: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Webhook-Secret",
+            HeaderValue::from_str(&wrong_secret).unwrap(),
+        );
+
+        let first = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers.clone(),
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::UNAUTHORIZED);
+
+        let second = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a second bad-secret attempt from the same IP must still be rate-limited"
+        );
+    }
+
+    /// Second regression check: a *valid*-secret but non-tenant request
+    /// (no `X-Tenant-Id`/`X-Agent-Type` — the legacy single-tenant webhook
+    /// shape) must also still be bound by the per-IP limiter, exactly as
+    /// before this patch — only requests that additionally prove tenant
+    /// identity move to the per-tenant bucket.
+    #[tokio::test]
+    async fn webhook_non_tenant_traffic_still_bound_by_per_ip_limit() {
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let secret = generate_test_secret();
+
+        let state = AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 1, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-wati")]
+            wati: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Webhook-Secret", HeaderValue::from_str(&secret).unwrap());
+
+        let first = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers.clone(),
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+
+        let second = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a second non-tenant request from the same IP must still be rate-limited"
+        );
     }
 
     #[cfg(feature = "channel-nextcloud")]
