@@ -68,6 +68,18 @@ jobs:
           cargo test --locked -p zeroclaw-memory --features memory-postgres --test pg_lifecycle
           cargo test --locked -p zeroclaw-runtime control_plane::tool_idem
 
+      # Phase 5 follow-up (Finding 1): bridge-authenticated tenant traffic
+      # must bypass the coarse per-IP webhook limiter and be charged to its
+      # own tenant bucket instead, while unauthenticated/non-tenant traffic
+      # stays bound by the per-IP limiter exactly as before. These live in
+      # zeroclaw-gateway's crate-root `tests` module (not `tenant::`), so
+      # they need their own explicit filter — the `tenant::` filter above
+      # only covers tenant.rs's own submodule tests.
+      - name: Webhook rate-limit dimension tests
+        run: |
+          cargo test --locked -p zeroclaw-gateway --lib per_ip_limit
+          cargo test --locked -p zeroclaw-gateway --lib gateway_rate_limiter_tenant_limits_are_isolated_per_tenant
+
       # xtask wrapper: renders the gateway OpenAPI spec, generates
       # web/src/lib/api-generated.ts, then npm ci + vite build.
       # The gateway embeds web/dist/ into the binary.
