@@ -69,6 +69,22 @@ pub struct TenantContext {
     /// already fenced/framed as untrusted operator data by the gateway.
     /// `None` when the tenant has no persona configured (defaults apply).
     pub persona: Option<String>,
+    /// Composio toolkit slugs (e.g. `"stripe"`, `"zendesk"`) this tenant
+    /// currently has a live connected account for, resolved by the gateway
+    /// from a synced `product.agent_toolkit_connections` table — never from
+    /// agent/LLM output. Consumed by
+    /// `Config::mcp_servers_for_agent_and_tenant` /
+    /// `apply_toolkit_connection_gate` (`zeroclaw-config`) to drop any
+    /// `[[mcp.servers]]` entry whose `requires_composio_toolkit` slug isn't
+    /// in this list — Aivory's default toolkit (OfficeCLI, the native n8n
+    /// bridge) is never gated by this and stays granted regardless; only
+    /// external, tenant-owned-account toolkits are. Empty (not resolution
+    /// failure) both when the tenant genuinely has no connections and when
+    /// the connection-status lookup itself failed — that resolution is
+    /// deliberately fail-open on turn availability (a DB hiccup here must
+    /// never block memory/persona/native-tool access) but fail-closed on
+    /// the grant itself (never over-grant on an inconclusive read).
+    pub connected_toolkits: Vec<String>,
 }
 
 tokio::task_local! {
@@ -101,6 +117,7 @@ mod tests {
             platform_user_id: "u1".to_string(),
             agent_type: "customer_service".to_string(),
             persona: Some("<operator_config>…</operator_config>".to_string()),
+            connected_toolkits: Vec::new(),
         });
         TENANT_CONTEXT
             .scope(Some(ctx.clone()), async {
