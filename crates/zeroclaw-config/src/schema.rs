@@ -7096,6 +7096,67 @@ pub struct GatewayConfig {
     /// unless you trust every paired client. (default: false)
     #[serde(default)]
     pub allow_self_upgrade: bool,
+    /// Cerveau (ADR-005): storage backend for the pair/webhook/tenant rate
+    /// limiters. `in_process` (default) keeps today's per-instance
+    /// `Mutex<HashMap<..>>` counters — correct for a single instance, but
+    /// each of N instances behind a load balancer only sees its own slice
+    /// of a tenant's traffic. `redis` shares the sliding-window counters
+    /// across every instance pointed at the same Redis, so a tenant's rate
+    /// limit binds on its aggregate traffic regardless of which instance
+    /// handles which request. Requires `redis_url` when set to `redis`; a
+    /// failed connection at startup logs a warning and falls back to
+    /// `in_process` rather than refusing to start (fail-open, not
+    /// fail-closed — same posture as the F-2 idempotency ledger).
+    #[serde(default)]
+    pub rate_limit_backend: RateLimitBackendKind,
+
+    /// Redis connection URL for the shared rate limiter, e.g.
+    /// `redis://:password@127.0.0.1:6379`. Required when
+    /// `rate_limit_backend = "redis"`; ignored otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub redis_url: Option<String>,
+
+    /// Key prefix for rate-limit keys written to the shared Redis, so this
+    /// deployment's counters never collide with another consumer's key
+    /// space on the same Redis instance (e.g. an unrelated BullMQ queue).
+    #[serde(default = "default_redis_key_prefix")]
+    pub redis_key_prefix: String,
+
+    /// Cerveau (ADR-005): caps how many `/webhook` requests this instance
+    /// will run through the tenant-resolution/LLM-call path concurrently.
+    /// `None` (default) preserves today's unbounded behavior. When set, a
+    /// request over the cap waits (bounded by
+    /// `admission_queue_timeout_secs`) for a free slot rather than piling
+    /// straight onto an already-saturated instance; a request that times
+    /// out waiting gets a clean `503` instead of the undifferentiated `500`
+    /// CPU starvation can otherwise surface as.
+    #[serde(default)]
+    pub max_concurrent_llm_requests: Option<u32>,
+
+    /// Max seconds a request waits for a free admission-queue slot before
+    /// returning `503`. Only meaningful when `max_concurrent_llm_requests`
+    /// is set. Default: 15s.
+    #[serde(default = "default_admission_queue_timeout_secs")]
+    pub admission_queue_timeout_secs: u64,
+}
+
+/// Storage backend for [`GatewayConfig`]'s rate limiters (ADR-005).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitBackendKind {
+    /// Per-instance in-memory counters (today's behavior). Correct only
+    /// when a single instance serves all traffic.
+    #[default]
+    InProcess,
+    /// Counters shared via Redis across every instance pointed at it.
+    /// Required once more than one instance serves the same tenants.
+    Redis,
 }
 
 fn default_gateway_port() -> u16 {
@@ -7108,6 +7169,14 @@ fn default_gateway_request_timeout_secs() -> u64 {
 
 fn default_gateway_long_running_request_timeout_secs() -> u64 {
     600
+}
+
+fn default_redis_key_prefix() -> String {
+    "cerveau:ratelimit:".into()
+}
+
+fn default_admission_queue_timeout_secs() -> u64 {
+    15
 }
 
 fn default_gateway_host() -> String {
@@ -7180,6 +7249,11 @@ impl Default for GatewayConfig {
             long_running_request_timeout_secs: default_gateway_long_running_request_timeout_secs(),
             check_updates: true,
             allow_self_upgrade: false,
+            rate_limit_backend: RateLimitBackendKind::default(),
+            redis_url: None,
+            redis_key_prefix: default_redis_key_prefix(),
+            max_concurrent_llm_requests: None,
+            admission_queue_timeout_secs: default_admission_queue_timeout_secs(),
         }
     }
 }
@@ -28710,6 +28784,11 @@ allowed_numbers = ["+1", "+2"]
             long_running_request_timeout_secs: 600,
             check_updates: true,
             allow_self_upgrade: false,
+            rate_limit_backend: RateLimitBackendKind::Redis,
+            redis_url: Some("redis://127.0.0.1:6379".into()),
+            redis_key_prefix: "test:ratelimit:".into(),
+            max_concurrent_llm_requests: Some(64),
+            admission_queue_timeout_secs: 20,
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
@@ -28728,6 +28807,11 @@ allowed_numbers = ["+1", "+2"]
         assert_eq!(parsed.idempotency_max_keys, 4096);
         assert!(parsed.check_updates);
         assert!(!parsed.allow_self_upgrade);
+        assert_eq!(parsed.rate_limit_backend, RateLimitBackendKind::Redis);
+        assert_eq!(parsed.redis_url.as_deref(), Some("redis://127.0.0.1:6379"));
+        assert_eq!(parsed.redis_key_prefix, "test:ratelimit:");
+        assert_eq!(parsed.max_concurrent_llm_requests, Some(64));
+        assert_eq!(parsed.admission_queue_timeout_secs, 20);
     }
 
     #[test]

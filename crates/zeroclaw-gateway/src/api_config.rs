@@ -2554,6 +2554,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+            llm_admission: None,
             auth_limiter: Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -3760,7 +3761,14 @@ mod tests {
 
     #[test]
     fn every_gateway_secret_is_classified() {
-        const OPERATOR_EDITED_GATEWAY_SECRETS: &[&str] = &[];
+        // Secrets under `[gateway]` that are OPERATOR-EDITED (not gateway-
+        // managed). Add the field's prop-field name here only if the gateway
+        // does NOT mint/rotate/persist it itself, so legitimate drift between
+        // disk and memory IS surfaceable. `paired_tokens` is gateway-managed
+        // (classified via `is_gateway_managed_field` instead). `redis_url`
+        // (ADR-005) is operator-edited — the operator points it at their own
+        // Redis instance in config.toml, the gateway never mints/rotates it.
+        const OPERATOR_EDITED_GATEWAY_SECRETS: &[&str] = &["gateway.redis_url"];
 
         let cfg = zeroclaw_config::schema::Config::default();
         let unclassified: Vec<String> = cfg

@@ -31,7 +31,9 @@ pub mod api_webauthn;
     feature = "channel-whatsapp-cloud"
 ))]
 pub mod api_webhook;
+pub mod admission_queue;
 pub mod auth_rate_limit;
+pub mod redis_rate_limiter;
 pub mod tenant;
 pub mod canvas;
 pub mod hardware_context;
@@ -308,18 +310,43 @@ impl SlidingWindowRateLimiter {
     }
 }
 
+/// Storage backend for one named limiter (pair/webhook/tenant). `InProcess`
+/// is today's per-instance `Mutex<HashMap<..>>` counter; `Redis` (ADR-005)
+/// shares the counter across every instance pointed at the same Redis.
+/// Kept as an enum rather than a trait object — only two variants exist,
+/// dispatch is on a hot path, and neither implementation needs dynamic
+/// extensibility.
+#[derive(Debug)]
+enum RateLimiterBackend {
+    InProcess(SlidingWindowRateLimiter),
+    Redis(crate::redis_rate_limiter::RedisRateLimiter),
+}
+
+impl RateLimiterBackend {
+    async fn allow(&self, key: &str) -> bool {
+        match self {
+            RateLimiterBackend::InProcess(limiter) => limiter.allow(key),
+            RateLimiterBackend::Redis(limiter) => limiter.allow(key).await,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct GatewayRateLimiter {
-    pair: SlidingWindowRateLimiter,
-    webhook: SlidingWindowRateLimiter,
+    pair: RateLimiterBackend,
+    webhook: RateLimiterBackend,
     /// Keyed by `tenant_id` (`<user_id>.<agent_type>`), not client IP —
     /// independent of `webhook` above so one tenant hitting its own cap
     /// never blocks another tenant sharing the same source IP (e.g. the
     /// same bridge/proxy). Only consulted for tenant-scoped requests.
-    tenant: SlidingWindowRateLimiter,
+    tenant: RateLimiterBackend,
 }
 
 impl GatewayRateLimiter {
+    /// Always builds the in-process backend for all three limiters — every
+    /// existing call site (test fixtures included) keeps working unchanged.
+    /// The Redis backend is opted into afterward, only from the real daemon
+    /// startup path, via [`GatewayRateLimiter::upgrade_to_redis`].
     pub fn new(
         pair_per_minute: u32,
         webhook_per_minute: u32,
@@ -328,24 +355,69 @@ impl GatewayRateLimiter {
     ) -> Self {
         let window = Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
         Self {
-            pair: SlidingWindowRateLimiter::new(pair_per_minute, window, max_keys),
-            webhook: SlidingWindowRateLimiter::new(webhook_per_minute, window, max_keys),
-            tenant: SlidingWindowRateLimiter::new(tenant_per_minute, window, max_keys),
+            pair: RateLimiterBackend::InProcess(SlidingWindowRateLimiter::new(
+                pair_per_minute,
+                window,
+                max_keys,
+            )),
+            webhook: RateLimiterBackend::InProcess(SlidingWindowRateLimiter::new(
+                webhook_per_minute,
+                window,
+                max_keys,
+            )),
+            tenant: RateLimiterBackend::InProcess(SlidingWindowRateLimiter::new(
+                tenant_per_minute,
+                window,
+                max_keys,
+            )),
         }
     }
 
-    fn allow_pair(&self, key: &str) -> bool {
-        self.pair.allow(key)
+    /// Cerveau (ADR-005): connect to Redis once and swap all three limiters
+    /// to the shared backend, preserving each one's existing limit. Called
+    /// at most once, right after construction, before the limiter is ever
+    /// shared behind an `Arc` — never mutated concurrently.
+    ///
+    /// Fails open: a connection error is returned to the caller to log, but
+    /// `self` is left with its in-process backends untouched, so a Redis
+    /// outage at boot degrades to per-instance limiting rather than
+    /// blocking startup.
+    async fn upgrade_to_redis(
+        &mut self,
+        redis_url: &str,
+        key_prefix: String,
+        pair_per_minute: u32,
+        webhook_per_minute: u32,
+        tenant_per_minute: u32,
+    ) -> redis::RedisResult<()> {
+        let window = Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
+        let pair = crate::redis_rate_limiter::RedisRateLimiter::connect(
+            redis_url,
+            key_prefix,
+            pair_per_minute,
+            window,
+        )
+        .await?;
+        let webhook = pair.with_shared_connection(webhook_per_minute, window);
+        let tenant = pair.with_shared_connection(tenant_per_minute, window);
+        self.pair = RateLimiterBackend::Redis(pair);
+        self.webhook = RateLimiterBackend::Redis(webhook);
+        self.tenant = RateLimiterBackend::Redis(tenant);
+        Ok(())
     }
 
-    fn allow_webhook(&self, key: &str) -> bool {
-        self.webhook.allow(key)
+    async fn allow_pair(&self, key: &str) -> bool {
+        self.pair.allow(key).await
+    }
+
+    async fn allow_webhook(&self, key: &str) -> bool {
+        self.webhook.allow(key).await
     }
 
     /// Rate-limit a tenant-scoped `/webhook` request by `tenant_id`,
     /// independent of the per-IP `allow_webhook` check above.
-    fn allow_tenant(&self, tenant_id: &str) -> bool {
-        self.tenant.allow(tenant_id)
+    async fn allow_tenant(&self, tenant_id: &str) -> bool {
+        self.tenant.allow(tenant_id).await
     }
 }
 
@@ -479,6 +551,10 @@ pub struct AppState {
     pub rate_limiter: Arc<GatewayRateLimiter>,
     pub auth_limiter: Arc<auth_rate_limit::AuthRateLimiter>,
     pub idempotency_store: Arc<IdempotencyStore>,
+    /// Cerveau (ADR-005): bounds concurrent in-flight `/webhook` turns on
+    /// this instance. `None` (default) preserves today's unbounded
+    /// behavior — set via `[gateway].max_concurrent_llm_requests`.
+    pub llm_admission: Option<Arc<admission_queue::AdmissionQueue>>,
     /// `WhatsApp` channel instances keyed by config alias. Webhooks route by
     /// `/whatsapp/{alias}`; the bare `/whatsapp` path falls back to the first
     /// instance (see [`api_webhook`]).
@@ -1279,12 +1355,59 @@ pub async fn run_gateway(
         config.gateway.rate_limit_max_keys,
         RATE_LIMIT_MAX_KEYS_DEFAULT,
     );
-    let rate_limiter = Arc::new(GatewayRateLimiter::new(
+    let mut rate_limiter_inner = GatewayRateLimiter::new(
         config.gateway.pair_rate_limit_per_minute,
         config.gateway.webhook_rate_limit_per_minute,
         rate_limit_max_keys,
         config.gateway.tenant_webhook_rate_limit_per_minute,
-    ));
+    );
+    // ADR-005: opt-in shared rate limiting for when this instance is one of
+    // several behind a load balancer. A connection failure here must never
+    // stop the daemon from starting — log loudly and keep the in-process
+    // backend (fail open, not fail closed).
+    if config.gateway.rate_limit_backend == zeroclaw_config::schema::RateLimitBackendKind::Redis {
+        match &config.gateway.redis_url {
+            Some(redis_url) => {
+                match rate_limiter_inner
+                    .upgrade_to_redis(
+                        redis_url,
+                        config.gateway.redis_key_prefix.clone(),
+                        config.gateway.pair_rate_limit_per_minute,
+                        config.gateway.webhook_rate_limit_per_minute,
+                        config.gateway.tenant_webhook_rate_limit_per_minute,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Success),
+                            "gateway rate limiter: connected to Redis, counters now shared across instances"
+                        );
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                            "gateway rate limiter: Redis connection failed, falling back to in-process (per-instance) limiting"
+                        );
+                    }
+                }
+            }
+            None => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "gateway rate limiter: rate_limit_backend=redis but no redis_url configured, falling back to in-process"
+                );
+            }
+        }
+    }
+    let rate_limiter = Arc::new(rate_limiter_inner);
     let idempotency_max_keys = normalize_max_keys(
         config.gateway.idempotency_max_keys,
         IDEMPOTENCY_MAX_KEYS_DEFAULT,
@@ -1580,6 +1703,12 @@ pub async fn run_gateway(
         pairing,
         trust_forwarded_headers: config.gateway.trust_forwarded_headers,
         rate_limiter,
+        llm_admission: config.gateway.max_concurrent_llm_requests.map(|max| {
+            Arc::new(admission_queue::AdmissionQueue::new(
+                max,
+                Duration::from_secs(config.gateway.admission_queue_timeout_secs.max(1)),
+            ))
+        }),
         auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
         idempotency_store,
         #[cfg(feature = "channel-whatsapp-cloud")]
@@ -2271,7 +2400,7 @@ async fn handle_pair(
 ) -> impl IntoResponse {
     let rate_key =
         client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
-    if !state.rate_limiter.allow_pair(&rate_key) {
+    if !state.rate_limiter.allow_pair(&rate_key).await {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2723,7 +2852,7 @@ async fn handle_webhook(
                 // A bad/missing secret is exactly the brute-force case the
                 // per-IP ceiling exists to bound — still apply it here,
                 // since this request hasn't proven tenant identity.
-                if !state.rate_limiter.allow_webhook(&rate_key) {
+                if !state.rate_limiter.allow_webhook(&rate_key).await {
                     return too_many_webhook_requests();
                 }
                 ::zeroclaw_log::record!(
@@ -2744,7 +2873,7 @@ async fn handle_webhook(
     // comment above. Everything else still goes through the per-IP gate,
     // unchanged from before this patch.
     let is_authenticated_tenant_request = webhook_secret_configured && claims_tenant;
-    if !is_authenticated_tenant_request && !state.rate_limiter.allow_webhook(&rate_key) {
+    if !is_authenticated_tenant_request && !state.rate_limiter.allow_webhook(&rate_key).await {
         return too_many_webhook_requests();
     }
 
@@ -2822,7 +2951,7 @@ async fn handle_webhook(
             // tenant already over budget never reaches either. Prevents one
             // runaway tenant from starving others behind the same source IP.
             let tenant_id = sel.tenant_id();
-            if !state.rate_limiter.allow_tenant(&tenant_id) {
+            if !state.rate_limiter.allow_tenant(&tenant_id).await {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2926,6 +3055,36 @@ async fn handle_webhook(
     // dispatch below enters `process_message`, whose runtime turn guard is the
     // sole owner of lifecycle and LLM events. Emitting another bracket here
     // gives one webhook prompt two unrelated turn IDs.
+    // ── Cerveau (ADR-005): per-instance admission queue ──
+    // Gates only the expensive part (tenant resolution / rate limiting /
+    // idempotency above are all cheap). A request that can't get a slot
+    // within the configured timeout gets a clean 503 + Retry-After instead
+    // of piling onto an already-saturated instance — directly targets Phase
+    // 5 Finding 4 (CPU starvation surfacing as undifferentiated 500s).
+    // `None` (unset `max_concurrent_llm_requests`) preserves today's
+    // unbounded behavior exactly — no permit is ever acquired.
+    let _admission_permit = if let Some(admission) = state.llm_admission.as_ref() {
+        match admission.acquire().await {
+            Ok(permit) => Some(permit),
+            Err(_timeout) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "webhook: admission queue timed out — instance at capacity"
+                );
+                let retry_after = state.config.read().gateway.admission_queue_timeout_secs;
+                let err = serde_json::json!({
+                    "error": "This instance is at capacity. Please retry shortly.",
+                    "retry_after": retry_after,
+                });
+                return (StatusCode::SERVICE_UNAVAILABLE, Json(err));
+            }
+        }
+    } else {
+        None
+    };
+
     let started_at = Instant::now();
 
     match run_gateway_chat_with_tools(
@@ -4571,6 +4730,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(require_pairing, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+            llm_admission: None,
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -5200,6 +5360,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+            llm_admission: None,
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -5288,6 +5449,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+            llm_admission: None,
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -5342,12 +5504,12 @@ mod tests {
         assert!(text.contains("zeroclaw_heartbeat_ticks_total 1"));
     }
 
-    #[test]
-    fn gateway_rate_limiter_blocks_after_limit() {
+    #[tokio::test]
+    async fn gateway_rate_limiter_blocks_after_limit() {
         let limiter = GatewayRateLimiter::new(2, 2, 100, 100);
-        assert!(limiter.allow_pair("127.0.0.1"));
-        assert!(limiter.allow_pair("127.0.0.1"));
-        assert!(!limiter.allow_pair("127.0.0.1"));
+        assert!(limiter.allow_pair("127.0.0.1").await);
+        assert!(limiter.allow_pair("127.0.0.1").await);
+        assert!(!limiter.allow_pair("127.0.0.1").await);
     }
 
     #[test]
@@ -5883,6 +6045,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+            llm_admission: None,
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -5967,6 +6130,126 @@ mod tests {
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
     }
 
+    /// ADR-005: proves the admission queue is actually wired into
+    /// `handle_webhook`, not just correct in isolation (`admission_queue`'s
+    /// own unit tests cover the semaphore mechanics; this proves the real
+    /// request path honors it). Deterministic, no timing race: the test
+    /// holds the instance's only slot itself before calling `handle_webhook`,
+    /// so the request is guaranteed to find zero capacity rather than
+    /// hoping a mock provider is slow enough to overlap two real calls.
+    #[tokio::test]
+    async fn webhook_returns_503_when_admission_queue_is_saturated() {
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let admission = Arc::new(admission_queue::AdmissionQueue::new(
+            1,
+            Duration::from_millis(50),
+        ));
+
+        let state = AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+            llm_admission: Some(admission.clone()),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-wati")]
+            wati: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        // Hold the instance's only slot ourselves — the incoming request
+        // below is guaranteed to find zero capacity, deterministically.
+        let held_permit = admission.acquire().await.expect("test setup: acquire");
+
+        let body = Ok(Json(WebhookBody {
+            message: "hello".into(),
+        }));
+        let saturated = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .into_response();
+        assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload = saturated.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert!(parsed["retry_after"].is_number());
+        // The rejected request must never have reached the model provider.
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+
+        // Freeing the slot must let the very next request through normally.
+        drop(held_permit);
+        let body = Ok(Json(WebhookBody {
+            message: "hello".into(),
+        }));
+        let recovered = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .into_response();
+        assert_eq!(recovered.status(), StatusCode::OK);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn webhook_unknown_agent_rejected_before_dispatch() {
         let provider_impl = Arc::new(MockModelProvider::default());
@@ -5989,6 +6272,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+            llm_admission: None,
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6110,6 +6394,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+            llm_admission: None,
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6211,6 +6496,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+            llm_admission: None,
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6331,6 +6617,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+            llm_admission: None,
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6417,6 +6704,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+            llm_admission: None,
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6508,6 +6796,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+            llm_admission: None,
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6605,6 +6894,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 1, 100, 100)),
+            llm_admission: None,
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6707,6 +6997,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 1, 100, 100)),
+            llm_admission: None,
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6817,6 +7108,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 1, 100, 100)),
+            llm_admission: None,
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -7574,47 +7866,114 @@ mod tests {
         assert!(guard.0.contains_key("ip-4"));
     }
 
-    #[test]
-    fn gateway_rate_limiter_pair_and_webhook_are_independent() {
+    #[tokio::test]
+    async fn gateway_rate_limiter_pair_and_webhook_are_independent() {
         let limiter = GatewayRateLimiter::new(2, 3, 100, 100);
 
         // Exhaust pair limit
-        assert!(limiter.allow_pair("ip-1"));
-        assert!(limiter.allow_pair("ip-1"));
-        assert!(!limiter.allow_pair("ip-1")); // pair blocked
+        assert!(limiter.allow_pair("ip-1").await);
+        assert!(limiter.allow_pair("ip-1").await);
+        assert!(!limiter.allow_pair("ip-1").await); // pair blocked
 
         // Webhook should still work
-        assert!(limiter.allow_webhook("ip-1"));
-        assert!(limiter.allow_webhook("ip-1"));
-        assert!(limiter.allow_webhook("ip-1"));
-        assert!(!limiter.allow_webhook("ip-1")); // webhook now blocked
+        assert!(limiter.allow_webhook("ip-1").await);
+        assert!(limiter.allow_webhook("ip-1").await);
+        assert!(limiter.allow_webhook("ip-1").await);
+        assert!(!limiter.allow_webhook("ip-1").await); // webhook now blocked
     }
 
     /// Phase 5 exit-gate proof: a runaway tenant hitting its own rate limit
     /// must never starve another tenant sharing the same source IP — the
     /// tenant limiter is keyed by `tenant_id`, fully independent of the
     /// per-IP `webhook` limiter both tenants also share.
-    #[test]
-    fn gateway_rate_limiter_tenant_limits_are_isolated_per_tenant() {
+    #[tokio::test]
+    async fn gateway_rate_limiter_tenant_limits_are_isolated_per_tenant() {
         // Webhook (per-IP) budget set generously high so only the
         // per-tenant limit is what trips below.
         let limiter = GatewayRateLimiter::new(100, 100, 100, 2);
 
         // Tenant A bursts past its own per-tenant budget...
-        assert!(limiter.allow_tenant("user-a.customer_service"));
-        assert!(limiter.allow_tenant("user-a.customer_service"));
-        assert!(!limiter.allow_tenant("user-a.customer_service")); // A blocked
+        assert!(limiter.allow_tenant("user-a.customer_service").await);
+        assert!(limiter.allow_tenant("user-a.customer_service").await);
+        assert!(!limiter.allow_tenant("user-a.customer_service").await); // A blocked
 
         // ...but tenant B, sharing the same source IP as A in a real
         // request (the per-IP `allow_webhook` check is separate and
         // already exercised above), is completely unaffected.
-        assert!(limiter.allow_tenant("user-b.customer_service"));
-        assert!(limiter.allow_tenant("user-b.customer_service"));
-        assert!(!limiter.allow_tenant("user-b.customer_service")); // B hits its own cap, not A's
+        assert!(limiter.allow_tenant("user-b.customer_service").await);
+        assert!(limiter.allow_tenant("user-b.customer_service").await);
+        assert!(!limiter.allow_tenant("user-b.customer_service").await); // B hits its own cap, not A's
 
         // A's block doesn't leak into a different agent_type for the same
         // user_id either — tenant_id is the full `<user_id>.<agent_type>`.
-        assert!(limiter.allow_tenant("user-a.finance_invoice_ops"));
+        assert!(limiter.allow_tenant("user-a.finance_invoice_ops").await);
+    }
+
+    /// ADR-005: a bad/unreachable `redis_url` must fail open — the limiter
+    /// stays on its in-process backend and keeps working, it never poisons
+    /// startup or leaves the limiter in a broken state.
+    #[tokio::test]
+    async fn gateway_rate_limiter_upgrade_to_redis_fails_open_on_bad_url() {
+        let mut limiter = GatewayRateLimiter::new(2, 2, 100, 2);
+        let result = limiter
+            .upgrade_to_redis("redis://127.0.0.1:1", "test:".into(), 2, 2, 2)
+            .await;
+        assert!(result.is_err(), "an unreachable Redis must return Err");
+
+        // The limiter must still be fully functional on its in-process
+        // backend after a failed upgrade attempt.
+        assert!(limiter.allow_pair("still-works").await);
+        assert!(limiter.allow_pair("still-works").await);
+        assert!(!limiter.allow_pair("still-works").await);
+    }
+
+    /// ADR-005's one genuinely new correctness property: after a successful
+    /// upgrade, two SEPARATE `GatewayRateLimiter`s (standing in for two
+    /// Cerveau instances behind a load balancer) sharing the same Redis and
+    /// key prefix must enforce ONE aggregate limit for a given tenant, not
+    /// one each. Only runs when `CERVEAU_TEST_REDIS_URL` is set (CI
+    /// provides a redis service container), mirroring the Postgres
+    /// lifecycle tests' `CERVEAU_TEST_PG_URL` gating.
+    #[tokio::test]
+    async fn gateway_rate_limiter_upgrade_to_redis_shares_state_across_instances() {
+        let Ok(url) = std::env::var("CERVEAU_TEST_REDIS_URL") else {
+            eprintln!("skipping: CERVEAU_TEST_REDIS_URL not set");
+            return;
+        };
+        if url.is_empty() {
+            eprintln!("skipping: CERVEAU_TEST_REDIS_URL not set");
+            return;
+        }
+        let prefix = format!(
+            "test:gwrl:{}:",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+
+        let mut instance_a = GatewayRateLimiter::new(100, 100, 100, 100);
+        instance_a
+            .upgrade_to_redis(&url, prefix.clone(), 100, 100, 3)
+            .await
+            .expect("instance a connects");
+        let mut instance_b = GatewayRateLimiter::new(100, 100, 100, 100);
+        instance_b
+            .upgrade_to_redis(&url, prefix, 100, 100, 3)
+            .await
+            .expect("instance b connects");
+
+        // A tenant's requests land on instance_a, then instance_b, then
+        // instance_a again — exactly what round-robin behind a load
+        // balancer does. The aggregate cap of 3 must bind regardless.
+        assert!(instance_a.allow_tenant("shared-tenant").await);
+        assert!(instance_b.allow_tenant("shared-tenant").await);
+        assert!(instance_a.allow_tenant("shared-tenant").await);
+        assert!(
+            !instance_b.allow_tenant("shared-tenant").await,
+            "aggregate cap of 3 already reached across both instances"
+        );
+        assert!(!instance_a.allow_tenant("shared-tenant").await);
     }
 
     #[test]

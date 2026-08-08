@@ -36,6 +36,12 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["logg
 # Frontend asset MIME type detection (dashboard served from filesystem)
 mime_guess = "2"
 
+# Cerveau (patch 0023): Redis client for the shared cross-instance rate
+# limiter (opt-in, [gateway].rate_limit_backend = "redis"). ConnectionManager
+# gives us auto-reconnect without hand-rolled pooling; `script` for the
+# atomic sliding-window Lua EVAL.
+redis = { version = "1", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
+
 # Base64 encoding for binary file content in agent workspace `read` responses.
 base64 = "0.22"
 include_dir = { version = "0.7", optional = true }
