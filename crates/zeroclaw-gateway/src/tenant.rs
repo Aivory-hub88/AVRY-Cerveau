@@ -300,16 +300,162 @@ pub fn render_persona_block(persona: &TenantPersona) -> Option<String> {
 }
 
 /// Build the runtime [`TenantContext`] for a resolved tenant.
+///
+/// `connected_toolkits` — Composio toolkit slugs resolved by
+/// [`ToolkitConnectionResolver`], or an empty `Vec` (never a hard failure;
+/// see that resolver's doc comment for the fail-open-on-availability /
+/// fail-closed-on-grant rationale).
 pub fn build_tenant_context(
     sel: &TenantSelector,
     persona: Option<&TenantPersona>,
+    connected_toolkits: Vec<String>,
 ) -> Arc<TenantContext> {
     Arc::new(TenantContext {
         tenant_id: sel.tenant_id(),
         platform_user_id: sel.user_id.clone(),
         agent_type: sel.agent_type.clone(),
         persona: persona.and_then(render_persona_block),
+        connected_toolkits,
     })
+}
+
+/// Read-only resolver for which Composio toolkits a tenant has a live
+/// connected account for, over a synced `product.agent_toolkit_connections`
+/// table (populated by an out-of-band poller against Composio's own
+/// `connected_accounts` API — this resolver never calls Composio directly,
+/// consistent with the user's explicit choice of a cached/synced table over
+/// a live per-request API call). Same bounded-TTL'd-LRU-over-Postgres shape
+/// as [`TenantResolver`], keyed by `platform_user_id` alone (not
+/// `tenant_id`) because a Composio connection is per-platform-user, shared
+/// across every agent type that user deploys — the same reason
+/// `McpServerConfig::tenant_entity_query_param` scopes off
+/// `platform_user_id`, not `tenant_id`.
+///
+/// Deliberately does not return `Result`: unlike persona resolution (whose
+/// failure rejects the whole tenant turn — identity/memory scoping is the
+/// actual security boundary and must never proceed unscoped), a connection-
+/// status lookup failure degrades gracefully to "no external toolkits this
+/// turn" rather than blocking the turn entirely. The gate this feeds
+/// (`apply_toolkit_connection_gate`, `zeroclaw-config`) is fail-closed on
+/// its own terms — an inconclusive read never over-grants — so there is no
+/// safety gap in also being fail-open on availability here.
+pub struct ToolkitConnectionResolver {
+    db_url: Option<String>,
+    cache: Mutex<LruCache<String, ToolkitCacheEntry>>,
+}
+
+enum ToolkitCacheEntry {
+    Hit(Instant, Arc<Vec<String>>),
+    Miss(Instant),
+}
+
+impl ToolkitConnectionResolver {
+    fn new() -> Self {
+        let db_url = std::env::var("CERVEAU_TENANT_DB_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        Self {
+            db_url,
+            cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(CACHE_CAP).expect("cache cap is non-zero"),
+            )),
+        }
+    }
+
+    /// Process-wide resolver instance.
+    pub fn global() -> &'static ToolkitConnectionResolver {
+        static GLOBAL: OnceLock<ToolkitConnectionResolver> = OnceLock::new();
+        GLOBAL.get_or_init(ToolkitConnectionResolver::new)
+    }
+
+    /// Resolve the connected-toolkit slugs for `platform_user_id`,
+    /// consulting the cache first. Always returns a `Vec` — see the struct
+    /// doc for why this never propagates a hard error to the caller. A
+    /// missing DSN, a `spawn_blocking` panic, or a query error are all
+    /// logged at `WARN` and treated identically to a genuine "no
+    /// connections" row (empty result, negatively cached like a real miss
+    /// so a persistently misconfigured/unreachable DB doesn't hammer it on
+    /// every request).
+    pub async fn resolve(&self, platform_user_id: &str) -> Vec<String> {
+        let key = platform_user_id.to_string();
+        {
+            let mut cache = self.cache.lock();
+            match cache.get(&key) {
+                Some(ToolkitCacheEntry::Hit(at, toolkits)) if at.elapsed() < TTL_HIT => {
+                    return (**toolkits).clone();
+                }
+                Some(ToolkitCacheEntry::Miss(at)) if at.elapsed() < TTL_MISS => {
+                    return Vec::new();
+                }
+                _ => {}
+            }
+        }
+
+        let Some(db_url) = self.db_url.clone() else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "toolkit connection resolution unavailable: CERVEAU_TENANT_DB_URL/DATABASE_URL \
+                 not set — treating as no connected toolkits for this turn"
+            );
+            let mut cache = self.cache.lock();
+            cache.put(key, ToolkitCacheEntry::Miss(Instant::now()));
+            return Vec::new();
+        };
+        let user_id = platform_user_id.to_string();
+        let result =
+            tokio::task::spawn_blocking(move || query_connected_toolkits(&db_url, &user_id))
+                .await;
+
+        let toolkits = match result {
+            Ok(Ok(toolkits)) => toolkits,
+            Ok(Err(e)) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{e:#}")})),
+                    "toolkit connection query failed — treating as no connected toolkits for this turn"
+                );
+                Vec::new()
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "toolkit connection resolver task panicked — treating as no connected toolkits for this turn"
+                );
+                Vec::new()
+            }
+        };
+
+        let mut cache = self.cache.lock();
+        if toolkits.is_empty() {
+            cache.put(key, ToolkitCacheEntry::Miss(Instant::now()));
+        } else {
+            cache.put(
+                key,
+                ToolkitCacheEntry::Hit(Instant::now(), Arc::new(toolkits.clone())),
+            );
+        }
+        toolkits
+    }
+}
+
+fn query_connected_toolkits(db_url: &str, user_id: &str) -> anyhow::Result<Vec<String>> {
+    use postgres::{Client, NoTls};
+    let mut client = Client::connect(db_url, NoTls)?;
+    let rows = client.query(
+        "SELECT toolkit_slug FROM product.agent_toolkit_connections \
+         WHERE user_id = $1 AND status IN ('ACTIVE', 'INITIALIZING', 'INITIATED')",
+        &[&user_id],
+    )?;
+    Ok(rows.iter().map(|r| r.get(0)).collect())
 }
 
 #[cfg(test)]
@@ -388,7 +534,7 @@ mod tests {
             user_id: "user_d09".to_string(),
             agent_type: "cs".to_string(),
         };
-        let ctx = build_tenant_context(&sel, None);
+        let ctx = build_tenant_context(&sel, None, Vec::new());
         assert_eq!(ctx.platform_user_id, "user_d09");
         assert_eq!(ctx.tenant_id, "user_d09.cs");
         assert_ne!(ctx.platform_user_id, ctx.tenant_id);
@@ -400,7 +546,31 @@ mod tests {
             user_id: "user_d09".to_string(),
             agent_type: "finance_invoice_ops".to_string(),
         };
-        let ctx = build_tenant_context(&sel, None);
+        let ctx = build_tenant_context(&sel, None, Vec::new());
         assert_eq!(ctx.agent_type, "finance_invoice_ops");
+    }
+
+    #[test]
+    fn tenant_context_carries_resolved_connected_toolkits_through() {
+        let sel = TenantSelector {
+            user_id: "user_d09".to_string(),
+            agent_type: "finance_invoice_ops".to_string(),
+        };
+        let ctx = build_tenant_context(&sel, None, vec!["stripe".to_string()]);
+        assert_eq!(ctx.connected_toolkits, vec!["stripe".to_string()]);
+    }
+
+    #[test]
+    fn tenant_context_defaults_to_no_connected_toolkits() {
+        let sel = TenantSelector {
+            user_id: "user_d09".to_string(),
+            agent_type: "customer_service".to_string(),
+        };
+        let ctx = build_tenant_context(&sel, None, Vec::new());
+        assert!(
+            ctx.connected_toolkits.is_empty(),
+            "no resolved connections (genuine absence or a fail-open resolution failure) \
+             both collapse to empty — never a default/fallback grant"
+        );
     }
 }
