@@ -32,8 +32,21 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      # Redis for the shared cross-instance rate limiter tests (ADR-005).
+      # No auth needed here — CI's redis is throwaway per-run, unlike
+      # tencent-vps's `--requirepass`'d instance.
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       CERVEAU_TEST_PG_URL: "host=127.0.0.1 port=5432 user=cerveau password=cerveau dbname=cerveau_test"
+      CERVEAU_TEST_REDIS_URL: "redis://127.0.0.1:6379"
     steps:
       - uses: actions/checkout@v4
 
@@ -79,6 +92,21 @@ jobs:
         run: |
           cargo test --locked -p zeroclaw-gateway --lib per_ip_limit
           cargo test --locked -p zeroclaw-gateway --lib gateway_rate_limiter_tenant_limits_are_isolated_per_tenant
+
+      # ADR-005 (horizontal scaling): the shared Redis-backed rate limiter's
+      # one genuinely new correctness property — a tenant's limit binds on
+      # its *aggregate* traffic across two independently-connected limiter
+      # instances (standing in for two Cerveau instances behind a load
+      # balancer), not once per instance. Also covers fail-open behavior on
+      # a bad/unreachable redis_url (no CERVEAU_TEST_REDIS_URL needed for
+      # that half) and the per-instance admission-queue backpressure that
+      # replaces Phase 5 Finding 4's bare 500s with a clean 503.
+      - name: Shared rate limiter + admission queue tests (ADR-005)
+        run: |
+          cargo test --locked -p zeroclaw-gateway --lib redis_rate_limiter::
+          cargo test --locked -p zeroclaw-gateway --lib gateway_rate_limiter_upgrade_to_redis
+          cargo test --locked -p zeroclaw-gateway --lib admission_queue::
+          cargo test --locked -p zeroclaw-gateway --lib webhook_returns_503_when_admission_queue_is_saturated
 
       # xtask wrapper: renders the gateway OpenAPI spec, generates
       # web/src/lib/api-generated.ts, then npm ci + vite build.
