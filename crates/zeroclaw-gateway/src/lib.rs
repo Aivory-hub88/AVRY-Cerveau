@@ -2966,7 +2966,20 @@ async fn handle_webhook(
                 return (StatusCode::TOO_MANY_REQUESTS, Json(err));
             }
             match tenant::TenantResolver::global().resolve(&sel).await {
-                Ok(persona) => Some(tenant::build_tenant_context(&sel, persona.as_deref())),
+                Ok(persona) => {
+                    // Connection-gated toolkit grants (Stripe/Zendesk stay
+                    // opt-in per tenant, never blanket-granted): resolved
+                    // alongside persona, same DB round-trip shape, but
+                    // never rejects the request on its own — see
+                    // `ToolkitConnectionResolver::resolve`'s doc comment.
+                    let connected_toolkits =
+                        tenant::ToolkitConnectionResolver::global().resolve(&sel.user_id).await;
+                    Some(tenant::build_tenant_context(
+                        &sel,
+                        persona.as_deref(),
+                        connected_toolkits,
+                    ))
+                }
                 Err(e) => {
                     ::zeroclaw_log::record!(
                         WARN,
