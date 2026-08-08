@@ -463,7 +463,11 @@ pub async fn run(
     // the reaper (the prior iteration's reaper was cancelled when the old `channels_cancel`
     // fired). Spawning a fresh handle each reload would mint a new boot_id whose reaper
     // would then reap the daemon's OWN live tasks as "prior-boot orphans".
-    if crate::control_plane::control_plane().is_none()
+    // Freshly started (not reused from a prior reload) in THIS call iff the plane
+    // was absent before we tried. Gates the F-1 drive below so a reload never
+    // re-walks `resumable_goals` (harmless under F-2, but pure noise).
+    let freshly_started = crate::control_plane::control_plane().is_none();
+    if freshly_started
         && let Err(e) = crate::control_plane::ControlPlaneHandle::start(&config.data_dir)
             .await
             .map(crate::control_plane::init_control_plane)
@@ -484,6 +488,36 @@ pub async fn run(
             channels_cancel.clone(),
         );
         crate::health::mark_component_ok("control-plane");
+
+        // F-1 (ADR-003): best-effort auto-resume of goal tasks `recovery_pass`
+        // just parked `Paused`/`DaemonRestart`. Spawned (not awaited) so a
+        // real continuation turn's LLM latency never delays the rest of boot
+        // (channels/gateway coming up); errors are logged inside the drive
+        // loop itself, never propagated — same "must not take down the
+        // daemon" discipline as the reaper. Config is cloned once per
+        // candidate-bearing boot, not per reload.
+        if freshly_started && !handle.resumable_goals.is_empty() {
+            let drive_config = config.clone();
+            zeroclaw_spawn::spawn!(async move {
+                let outcome = crate::control_plane::drive_resumable_goals(
+                    crate::control_plane::control_plane()
+                        .expect("just installed above"),
+                    &drive_config,
+                )
+                .await;
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "resumed": outcome.resumed,
+                            "re_paused": outcome.re_paused,
+                            "interrupted": outcome.interrupted,
+                            "already_done": outcome.already_done,
+                        })),
+                    "F-1: boot-time goal auto-resume drive finished"
+                );
+            });
+        }
     }
 
     if let Some(channels_start) = registry.take_channels_start() {

@@ -11,7 +11,8 @@ use anyhow::Result;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::reaper;
+use super::goal_task::GoalTaskRegistry;
+use super::reaper::{self, ResumableGoal};
 use super::task_registry::TaskRegistry;
 use super::task_store_sqlite::SqliteTaskStore;
 
@@ -20,7 +21,24 @@ use super::task_store_sqlite::SqliteTaskStore;
 #[derive(Clone)]
 pub struct ControlPlaneHandle {
     pub store: Arc<dyn TaskRegistry>,
+    /// F-1 (ADR-003): the goal-extension repository surface, exposed on the
+    /// handle so a driver outside this module (`continuation_drive`, which
+    /// needs a live `Config` this module never has) can act on the resume
+    /// candidates in [`Self::resumable_goals`]. Same underlying
+    /// `SqliteTaskStore` as `store` — two trait-object views of one table set,
+    /// not a second store.
+    pub goal_store: Arc<dyn GoalTaskRegistry>,
     pub boot_id: String,
+    /// Goal tasks this boot's recovery pass durably parked
+    /// `Paused`/`DaemonRestart` because they carried a persisted continuation
+    /// context (see [`reaper::recovery_pass`]). Populated once, at `start`;
+    /// not re-derived on a `daemon::run` reload (the control-plane handle
+    /// itself is only started once — see the reload note on
+    /// `crate::daemon::run`). Read once by the caller right after install and
+    /// handed to `continuation_drive::drive_resumable_goals`; left in place on
+    /// the handle afterward only as a record of what this boot found, not a
+    /// work queue other code should re-drain.
+    pub resumable_goals: Vec<ResumableGoal>,
 }
 
 impl ControlPlaneHandle {
@@ -43,19 +61,37 @@ impl ControlPlaneHandle {
     /// As [`Self::start`] but with a caller-supplied `boot_id` — lets `DaemonRegistry`
     /// reuse a process-stable run-id across reloads instead of a fresh UUID.
     pub async fn start_with_boot_id(data_dir: &Path, boot_id: String) -> Result<Self> {
-        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new(data_dir)?);
-        let reclaimed = reaper::recovery_pass(store.as_ref(), &boot_id).await?;
-        if reclaimed > 0 {
+        let sqlite = Arc::new(SqliteTaskStore::new(data_dir)?);
+        let store: Arc<dyn TaskRegistry> = sqlite.clone();
+        let goal_store: Arc<dyn GoalTaskRegistry> = sqlite;
+        let outcome = reaper::recovery_pass(store.as_ref(), goal_store.as_ref(), &boot_id).await?;
+        if outcome.reclaimed > 0 {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(
-                        ::serde_json::json!({ "reclaimed": reclaimed, "boot_id": boot_id })
+                        ::serde_json::json!({ "reclaimed": outcome.reclaimed, "boot_id": boot_id })
                     ),
                 "control-plane: reclaimed prior-boot orphan tasks at startup"
             );
         }
-        Ok(Self { store, boot_id })
+        if !outcome.resumable_goals.is_empty() {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "resumable_goals": outcome.resumable_goals.len(),
+                        "boot_id": boot_id,
+                    })),
+                "control-plane: parked prior-boot goal orphans for F-1 auto-resume"
+            );
+        }
+        Ok(Self {
+            store,
+            goal_store,
+            boot_id,
+            resumable_goals: outcome.resumable_goals,
+        })
     }
 
     /// Spawn the periodic reaper as a detached task whose lifetime `DaemonRegistry`
