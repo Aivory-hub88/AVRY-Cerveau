@@ -390,7 +390,7 @@ pub async fn submit_pairing_enhanced(
     // per-key request cap plus the shared auth rate limiter. Both are keyed on
     // the connection-derived client id (not a spoofable header), so this handler
     // cannot bypass rate limiting by rotating untrusted forwarding headers.
-    if !state.rate_limiter.allow_pair(&client_id) {
+    if !state.rate_limiter.allow_pair(&client_id).await {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({

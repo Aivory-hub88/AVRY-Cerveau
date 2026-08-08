@@ -146,7 +146,7 @@ pub async fn handle_sop_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let auth_verdict = match authorize_webhook_request(&state, peer_addr, &headers) {
+    let auth_verdict = match authorize_webhook_request(&state, peer_addr, &headers).await {
         Ok(verdict) => verdict,
         Err(response) => return response.into_response(),
     };
