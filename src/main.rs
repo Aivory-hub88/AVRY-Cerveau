@@ -4459,6 +4459,58 @@ async fn main() -> Result<()> {
                 // RpcContext (RPC/TUI agent sessions) can share it.
                 registry.set_sop_engine(sop_engine, sop_audit);
 
+                // Cerveau (Phase 4.2): install the capability-graph ranker
+                // when `[capability_graph].enabled = true` and the active
+                // memory backend is Postgres (the graph reuses that same
+                // db_url/schema — no separate connection config). Idempotent
+                // (OnceLock inside `install_capability_graph_ranker`), so
+                // calling this again on every reload iteration is harmless;
+                // absent or misconfigured, `tool_search` behaves exactly as
+                // it did before this feature existed (see
+                // `zeroclaw_memory::capability_graph`'s module docs).
+                #[cfg(feature = "memory-postgres")]
+                if current_config.capability_graph.enabled {
+                    match current_config.resolve_active_storage() {
+                        zeroclaw_config::schema::ActiveStorage::Postgres(pg)
+                            if pg.db_url.as_deref().is_some_and(|u| !u.trim().is_empty()) =>
+                        {
+                            let db_url = pg.db_url.clone().unwrap_or_default();
+                            let schema = pg.schema.clone();
+                            match zeroclaw_memory::capability_graph::PgCapabilityGraph::connect(
+                                &db_url, &schema,
+                            )
+                            .await
+                            {
+                                Ok(graph) => {
+                                    zeroclaw_memory::capability_graph::install_capability_graph_ranker(
+                                        std::sync::Arc::new(graph),
+                                    );
+                                }
+                                Err(e) => {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Fail
+                                        )
+                                        .with_attrs(::serde_json::json!({ "error": e.to_string() })),
+                                        "capability_graph.enabled=true but connecting failed; \
+                                         tool_search reranking stays off this boot"
+                                    );
+                                }
+                            }
+                        }
+                        _ => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip),
+                                "capability_graph.enabled=true but memory.backend is not a \
+                                 configured Postgres storage; skipping"
+                            );
+                        }
+                    }
+                }
+
                 let exit = Box::pin(daemon::run(
                     current_config.clone(),
                     host.clone(),

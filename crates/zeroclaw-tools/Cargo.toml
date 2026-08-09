@@ -56,6 +56,7 @@ webpki-roots = "1.0.6"
 default = []
 browser-native = ["dep:fantoccini"]
 probe = ["dep:probe-rs"]
+memory-postgres = ["zeroclaw-memory/memory-postgres"]
 
 [dev-dependencies]
 zeroclaw-infra.workspace = true

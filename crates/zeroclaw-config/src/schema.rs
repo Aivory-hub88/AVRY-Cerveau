@@ -560,6 +560,12 @@ pub struct Config {
     #[nested]
     pub mcp: McpConfig,
 
+    /// Cerveau Phase 4.2: per-tenant capability graph (`[capability_graph]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Tools"]
+    pub capability_graph: CapabilityGraphConfig,
+
     /// Dynamic node discovery configuration (`[nodes]`).
     #[serde(default)]
     #[nested]
@@ -5193,6 +5199,31 @@ impl Default for McpConfig {
             deferred_loading: default_deferred_loading(),
             servers: Vec::new(),
         }
+    }
+}
+
+/// Cerveau Phase 4.2: per-tenant capability graph (`[capability_graph]`
+/// section). Learns, per tenant, which deferred MCP tools tend to get
+/// activated together via `tool_search`, and uses that to rerank future
+/// keyword-match results. Off by default: absent this section, `tool_search`
+/// behaves bit-for-bit as before this feature existed. See
+/// `zeroclaw_memory::capability_graph`'s module docs for the honest scope
+/// note on what this does and doesn't do yet.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "capability_graph"]
+pub struct CapabilityGraphConfig {
+    /// Enable the capability graph. Requires `memory.backend = "postgres"`
+    /// (the graph reuses the same Postgres instance + schema); silently
+    /// inert otherwise. Default `false`.
+    #[tab(Settings)]
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Default for CapabilityGraphConfig {
+    fn default() -> Self {
+        Self { enabled: false }
     }
 }
 
@@ -17548,6 +17579,7 @@ impl Default for Config {
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
+            capability_graph: CapabilityGraphConfig::default(),
             nodes: NodesConfig::default(),
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
@@ -24760,6 +24792,7 @@ auto_save = true
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
+            capability_graph: CapabilityGraphConfig::default(),
             nodes: NodesConfig::default(),
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
@@ -25475,6 +25508,7 @@ default_temperature = 0.7
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
+            capability_graph: CapabilityGraphConfig::default(),
             nodes: NodesConfig::default(),
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),

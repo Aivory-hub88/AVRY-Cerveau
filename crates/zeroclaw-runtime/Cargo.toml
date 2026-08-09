@@ -110,6 +110,7 @@ browser-native = []
 plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasmtime"]
 webauthn = []
 sandbox-bubblewrap = []
+memory-postgres = ["zeroclaw-memory/memory-postgres", "zeroclaw-tools/memory-postgres"]
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }

@@ -470,6 +470,22 @@ impl ScopedToolRegistry {
                             if let Some(policy) = mcp_policy {
                                 tool_search = tool_search.with_access_policy(policy);
                             }
+                            // Cerveau (Phase 4.2): attach the capability
+                            // graph when both a tenant-scoped turn and the
+                            // process-wide ranker are present. Absent
+                            // either (vanilla install, or
+                            // `[capability_graph].enabled = false`, the
+                            // default), `tool_search` behaves exactly as it
+                            // did before this feature existed.
+                            #[cfg(feature = "memory-postgres")]
+                            if let (Some(t), Some(ranker)) = (
+                                crate::agent::tenant::current_tenant(),
+                                zeroclaw_memory::capability_graph::current_capability_graph_ranker(
+                                ),
+                            ) {
+                                tool_search = tool_search
+                                    .with_capability_graph(t.tenant_id.clone(), ranker);
+                            }
                             // Newly-activated deferred tools are also exposed to the
                             // delegate parent set, matching the run/process_message paths.
                             if let Some(ref handle) = delegate_handle {
