@@ -142,8 +142,11 @@ impl LandlockSandbox {
         //
         // - /usr, /bin — the interpreter/loader and system binaries.
         // - /etc       — Node's OpenSSL init unconditionally reads
-        //                /etc/ssl/openssl.cnf; also resolv.conf, nsswitch,
-        //                ca-certificates, localtime.
+        //                /etc/ssl/openssl.cnf; also nsswitch,
+        //                ca-certificates, localtime. NOT resolv.conf on a
+        //                systemd-resolved host — see the dedicated grant
+        //                below, this one only covers the symlink's own
+        //                directory entry, not its resolved target.
         // - /proc      — CoreCLR (OfficeCLI ships a self-contained .NET
         //                binary) reads /proc/meminfo, /proc/self/maps,
         //                /proc/self/cgroup, /proc/stat to size its GC heap;
@@ -161,6 +164,34 @@ impl LandlockSandbox {
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
             ruleset = ruleset
                 .add_rule(PathBeneath::new(fd, AccessFs::ReadFile | AccessFs::ReadDir))
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
+
+        // /etc/resolv.conf is a symlink (systemd-resolved: `../run/systemd/
+        // resolve/stub-resolv.conf`), and Landlock evaluates a PathBeneath
+        // rule against the symlink's *resolved* target, not its directory
+        // entry — granting /etc alone lets a confined process see the
+        // symlink but not open what it points to. Found live: lightpanda
+        // (the first Landlock-sandboxed MCP tool in this fork to resolve
+        // arbitrary hostnames itself) failed every fetch with
+        // `CouldntResolveHost` although /etc/nsswitch.conf and /etc/hosts
+        // (real files, not symlinks) opened fine under the exact same
+        // ruleset — strace showed `openat("/etc/resolv.conf") = -1 EACCES`
+        // while the DNS socket connect() to 127.0.0.53:53 itself succeeded
+        // (Landlock's AccessFs rules never restrict network syscalls, only
+        // the filesystem paths a resolver reads first). Optional: only
+        // present on systemd-resolved hosts, so this degrades to a no-op
+        // (not a hard error) on distros without it, unlike the always-
+        // required paths in the loop above.
+        let resolve_dir = Path::new("/run/systemd/resolve");
+        if resolve_dir.exists() {
+            let resolve_fd =
+                PathFd::new(resolve_dir).map_err(|e| std::io::Error::other(e.to_string()))?;
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(
+                    resolve_fd,
+                    AccessFs::ReadFile | AccessFs::ReadDir,
+                ))
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
 
