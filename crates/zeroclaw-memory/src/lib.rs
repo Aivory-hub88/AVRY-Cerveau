@@ -11,6 +11,8 @@ pub mod agent_scoped_markdown;
 pub mod audit;
 pub mod backend;
 pub mod budget;
+#[cfg(feature = "memory-postgres")]
+pub mod capability_graph;
 pub mod chunker;
 pub mod classify;
 pub mod conflict;

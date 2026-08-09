@@ -126,6 +126,7 @@ sandbox-bubblewrap = []
 # enabled by any production dependency edge, so the assemble()-only seal on
 # `ScopedToolRegistry` remains intact in shipped builds.
 test-util = []
+memory-postgres = ["zeroclaw-memory/memory-postgres", "zeroclaw-tools/memory-postgres"]
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
