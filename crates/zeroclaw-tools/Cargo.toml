@@ -64,6 +64,7 @@ probe = ["dep:probe-rs"]
 # constructors panic on real use and exist purely to keep
 # daemon-side tests self-contained.
 test-helpers = []
+memory-postgres = ["zeroclaw-memory/memory-postgres"]
 
 [dev-dependencies]
 zeroclaw-infra.workspace = true
