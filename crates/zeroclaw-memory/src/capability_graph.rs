@@ -120,13 +120,57 @@ where
     })?
 }
 
+/// Drops its inner value on a background OS thread. `postgres::Client::drop`
+/// calls `Runtime::block_on` internally (to send a clean-shutdown message),
+/// which panics if the final drop happens on a thread already inside a Tokio
+/// runtime — exactly what happens when a `PgCapabilityGraph` (or its
+/// `Arc<Mutex<Client>>`) is simply dropped at the end of an async scope, e.g.
+/// a `#[tokio::test]` function going out of scope. Mirrors
+/// `postgres.rs::DropOnThread` exactly (duplicated, not shared — same
+/// small-connection-thread-bridge duplication precedent as
+/// `run_on_os_thread` above and in `knowledge_graph_pg.rs`).
+struct DropOnThread<T: Send + 'static>(Option<T>);
+
+impl<T: Send + 'static> DropOnThread<T> {
+    fn new(value: T) -> Self {
+        Self(Some(value))
+    }
+    fn get(&self) -> &T {
+        self.0.as_ref().expect("DropOnThread value already taken")
+    }
+}
+
+impl<T: Send + 'static> Drop for DropOnThread<T> {
+    fn drop(&mut self) {
+        let Some(value) = self.0.take() else { return };
+        // ManuallyDrop so the value is NOT dropped on the current thread if
+        // spawn fails — ManuallyDrop's own Drop is a no-op.
+        let slot = std::mem::ManuallyDrop::new(value);
+        if std::thread::Builder::new()
+            .name("pg-capability-graph-drop".to_string())
+            .spawn(move || drop(std::mem::ManuallyDrop::into_inner(slot)))
+            .is_err()
+        {
+            // The OS refused to spawn a thread. Intentionally leak rather
+            // than drop here: postgres::Client::drop's block_on would panic
+            // on a Tokio runtime thread. A controlled leak beats a crash.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "pg-capability-graph-drop thread spawn failed; leaking client to avoid nested-runtime panic"
+            );
+        }
+    }
+}
+
 /// Postgres-backed [`CapabilityGraphRanker`]. Own connection, independent of
 /// whatever `PostgresMemory`/`PgKnowledgeGraph` instance the daemon may also
 /// hold — simpler lifecycle than sharing a client, at the cost of one extra
 /// long-lived connection (well inside the tuned 200-connection budget — see
 /// memory `aivory-capacity-optimizations`).
 pub struct PgCapabilityGraph {
-    client: Arc<Mutex<Client>>,
+    client: DropOnThread<Arc<Mutex<Client>>>,
     schema: String,
 }
 
@@ -178,7 +222,7 @@ impl PgCapabilityGraph {
         })
         .await?;
         Ok(Self {
-            client: Arc::new(Mutex::new(client)),
+            client: DropOnThread::new(Arc::new(Mutex::new(client))),
             schema: schema.to_string(),
         })
     }
@@ -195,7 +239,7 @@ impl CapabilityGraphRanker for PgCapabilityGraph {
         if candidates.len() < 2 || recent.is_empty() {
             return candidates.to_vec();
         }
-        let client = Arc::clone(&self.client);
+        let client = Arc::clone(self.client.get());
         let schema = self.schema.clone();
         let tenant_id = tenant_id.to_string();
         let candidates_owned = candidates.to_vec();
@@ -248,7 +292,7 @@ impl CapabilityGraphRanker for PgCapabilityGraph {
         if pairs.is_empty() {
             return;
         }
-        let client = Arc::clone(&self.client);
+        let client = Arc::clone(self.client.get());
         let schema = self.schema.clone();
         let tenant_id = tenant_id.to_string();
         let result: Result<()> = run_on_os_thread(move || {
