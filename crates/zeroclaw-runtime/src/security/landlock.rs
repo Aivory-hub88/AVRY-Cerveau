@@ -187,6 +187,26 @@ impl LandlockSandbox {
             // running Landlock (5.13+) in the first place, so required.
             ("/proc", AccessFs::ReadFile | AccessFs::ReadDir, true),
             ("/sys", AccessFs::ReadFile | AccessFs::ReadDir, true),
+            // /etc/resolv.conf is a symlink on systemd-resolved hosts
+            // (`../run/systemd/resolve/stub-resolv.conf`), and Landlock
+            // evaluates a PathBeneath rule against the symlink's *resolved*
+            // target, not its directory entry — granting /etc alone lets a
+            // confined process see the symlink but not open what it points
+            // to. Found live: lightpanda (the first Landlock-sandboxed MCP
+            // tool in this fork to resolve arbitrary hostnames itself)
+            // failed every fetch with `CouldntResolveHost` although
+            // /etc/nsswitch.conf and /etc/hosts (real files) opened fine
+            // under the exact same ruleset — strace showed
+            // `openat("/etc/resolv.conf") = -1 EACCES` while the DNS socket
+            // connect() to 127.0.0.53:53 succeeded (Landlock's AccessFs
+            // rules never restrict network syscalls, only the filesystem
+            // paths a resolver reads first). Optional: absent on distros
+            // without systemd-resolved, where it correctly no-ops.
+            (
+                "/run/systemd/resolve",
+                AccessFs::ReadFile | AccessFs::ReadDir,
+                false,
+            ),
             // /dev needs write too, not just read: /dev/null and /dev/shm
             // (POSIX shared memory, which CoreCLR and other runtimes map)
             // are write targets, alongside read-only /dev/urandom.
