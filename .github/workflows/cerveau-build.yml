@@ -87,8 +87,10 @@ jobs:
       # of the crate's normal `cargo test`; this step covers the Postgres
       # read/write path and the tenant-isolation guarantee specifically.
       - name: Capability graph (Postgres) tests
+        env:
+          RUST_BACKTRACE: full
         run: |
-          cargo test --locked -p zeroclaw-memory --features memory-postgres --test pg_capability_graph
+          cargo test --locked -p zeroclaw-memory --features memory-postgres --test pg_capability_graph -- --test-threads=1
           cargo test --locked -p zeroclaw-memory --features memory-postgres capability_graph::
 
       # Phase 5 follow-up (Finding 1): bridge-authenticated tenant traffic
