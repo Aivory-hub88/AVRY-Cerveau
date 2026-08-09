@@ -138,26 +138,30 @@ impl PgCapabilityGraph {
     pub async fn connect(db_url: &str, schema: &str) -> Result<Self> {
         let db_url = db_url.to_string();
         let schema_owned = schema.to_string();
-        let client = run_on_os_thread(move || {
-            Client::connect(&db_url, postgres::NoTls).context("connect to Postgres")
-        })
-        .await?;
-        let graph = Self {
-            client: Arc::new(Mutex::new(client)),
-            schema: schema_owned,
-        };
-        graph.init_schema().await?;
-        Ok(graph)
-    }
-
-    async fn init_schema(&self) -> Result<()> {
-        let client = Arc::clone(&self.client);
-        let schema = self.schema.clone();
-        run_on_os_thread(move || {
-            let mut client = client.lock();
+        // Connect AND run schema init on the SAME spawned OS thread, in one
+        // continuous synchronous call chain — mirrors
+        // `PostgresMemory::initialize_client`'s exact proven shape (see its
+        // doc comment). A `postgres::Client` owns a `current_thread` Tokio
+        // `Runtime` internally and every blocking call
+        // (`connect`/`batch_execute`/`query`/...) drives it via
+        // `.block_on()`; splitting connect and schema-init into two
+        // *separate* `run_on_os_thread` calls (each spawning its own new OS
+        // thread, with the client crossing the boundary between them via
+        // the oneshot channel) hit a real "Cannot start a runtime from
+        // within a runtime" panic on the second call in CI — reproducing
+        // this class of bug with a fresh symptom rather than actually
+        // avoiding it. Every later per-operation call (`rerank`,
+        // `record_co_activation`) still gets its own fresh thread, exactly
+        // like `PostgresMemory`'s `store`/`recall`/etc. do — that shape is
+        // proven safe (CI-green); it's specifically CONSTRUCTION's
+        // connect-then-immediately-init-schema pair that isn't safe to
+        // split.
+        let client = run_on_os_thread(move || -> Result<Client> {
+            let mut client =
+                Client::connect(&db_url, postgres::NoTls).context("connect to Postgres")?;
             client.batch_execute(&format!(
                 r#"
-                CREATE TABLE IF NOT EXISTS "{schema}".kg_capability_edges (
+                CREATE TABLE IF NOT EXISTS "{schema_owned}".kg_capability_edges (
                     id BIGSERIAL PRIMARY KEY,
                     tenant_id TEXT NOT NULL,
                     tool_a TEXT NOT NULL,
@@ -167,12 +171,16 @@ impl PgCapabilityGraph {
                     UNIQUE (tenant_id, tool_a, tool_b)
                 );
                 CREATE INDEX IF NOT EXISTS idx_kg_cap_edges_lookup
-                    ON "{schema}".kg_capability_edges(tenant_id, tool_a);
+                    ON "{schema_owned}".kg_capability_edges(tenant_id, tool_a);
                 "#
             ))?;
-            Ok(())
+            Ok(client)
         })
-        .await
+        .await?;
+        Ok(Self {
+            client: Arc::new(Mutex::new(client)),
+            schema: schema.to_string(),
+        })
     }
 }
 
