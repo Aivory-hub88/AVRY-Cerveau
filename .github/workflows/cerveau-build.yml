@@ -81,6 +81,17 @@ jobs:
           cargo test --locked -p zeroclaw-memory --features memory-postgres --test pg_lifecycle
           cargo test --locked -p zeroclaw-runtime control_plane::tool_idem
 
+      # Postgres memory backend embedding wiring: found missing entirely
+      # while verifying vector_enabled=true in production (the `embedding`
+      # column existed via pgvector, but nothing ever computed or read a
+      # value from it). Proves real store-time embedding + hybrid recall —
+      # including the WHERE-clause widening needed so a zero-keyword-
+      # overlap semantic match isn't filtered out before scoring — with a
+      # deterministic fake embedder, not an LLM-dependent one.
+      - name: Postgres memory embedding + hybrid recall tests
+        run: |
+          cargo test --locked -p zeroclaw-memory --features memory-postgres --test pg_embedding_recall
+
       # Phase 4.2: per-tenant capability graph (learned "commonly used
       # together" tool edges, used to rerank tool_search's keyword-match
       # results). Pure ranking-logic unit tests run unconditionally as part

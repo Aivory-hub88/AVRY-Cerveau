@@ -93,8 +93,9 @@ async fn postgres_lifecycle_end_to_end() {
     ))
     .await;
 
-    let mem = PostgresMemory::new("test", &url, SCHEMA, "memories", Some(5), Some(false), None)
-        .expect("connect + migrate");
+    let mem =
+        PostgresMemory::new("test", &url, SCHEMA, "memories", Some(5), Some(false), None, None, 0.7, 0.3)
+            .expect("connect + migrate");
     mem.init_lifecycle_schema().await.expect("init lifecycle");
 
     // ── Scenario 1: budget enforced independently per tenant ──────────

@@ -76,9 +76,9 @@ async fn v3_migration_is_schema_scoped() {
     ))
     .await;
 
-    PostgresMemory::new("test_a", &url, SCHEMA_A, "memories", Some(5), Some(false), None)
+    PostgresMemory::new("test_a", &url, SCHEMA_A, "memories", Some(5), Some(false), None, None, 0.7, 0.3)
         .expect("migrate schema A");
-    PostgresMemory::new("test_b", &url, SCHEMA_B, "memories", Some(5), Some(false), None)
+    PostgresMemory::new("test_b", &url, SCHEMA_B, "memories", Some(5), Some(false), None, None, 0.7, 0.3)
         .expect("migrate schema B — this failed pre-fix");
 
     for schema in [SCHEMA_A, SCHEMA_B] {

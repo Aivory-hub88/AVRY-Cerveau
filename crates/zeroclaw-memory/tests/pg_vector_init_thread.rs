@@ -65,6 +65,9 @@ async fn pgvector_enable_does_not_panic_on_a_tokio_worker_thread() {
         Some(5),
         Some(true),
         Some(64),
+        None,
+        0.7,
+        0.3,
     );
 
     assert!(
