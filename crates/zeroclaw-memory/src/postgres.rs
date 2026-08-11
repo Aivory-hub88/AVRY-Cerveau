@@ -221,10 +221,18 @@ impl PostgresMemory {
                 // The synchronous postgres client uses block_on internally,
                 // so pgvector setup must also stay on this plain OS thread —
                 // calling it from a Tokio runtime thread panics.
+                // (Cerveau: schema/table/dimensions threading is the
+                // race-hardening from the pgvector-enable fix — the
+                // information_schema verification inside needs them.)
                 let pgvector_ok = match pgvector {
-                    Some(dimensions) => {
-                        Self::try_enable_pgvector(&mut client, &qualified_table, dimensions).is_ok()
-                    }
+                    Some(dimensions) => Self::try_enable_pgvector(
+                        &mut client,
+                        &qualified_table,
+                        &schema,
+                        &table,
+                        dimensions,
+                    )
+                    .is_ok(),
                     None => true,
                 };
                 Ok((client, pgvector_ok))
@@ -339,9 +347,37 @@ impl PostgresMemory {
     fn try_enable_pgvector(
         client: &mut Client,
         qualified_table: &str,
+        schema: &str,
+        table: &str,
         dimensions: usize,
     ) -> Result<()> {
-        client.batch_execute("CREATE EXTENSION IF NOT EXISTS vector")?;
+        // `CREATE EXTENSION IF NOT EXISTS vector` is not safe against a
+        // genuine first-time-creation race: two `PostgresMemory::new()`
+        // calls hitting an empty pg_extension catalog at once (e.g. CI
+        // running this crate's Postgres test files in parallel, each
+        // constructing its own instance with pgvector_enabled=true) can
+        // make the loser's attempt fail outright. A few short retries
+        // absorbs that instead of failing the whole enable step on a
+        // transient catalog conflict.
+        let mut last_err = None;
+        for attempt in 0..3u32 {
+            match client.batch_execute("CREATE EXTENSION IF NOT EXISTS vector") {
+                Ok(()) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt < 2 {
+                        std::thread::sleep(Duration::from_millis(100 * u64::from(attempt + 1)));
+                    }
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(e).context("CREATE EXTENSION IF NOT EXISTS vector failed after retries");
+        }
+
         client.batch_execute(&format!(
             r#"
             DO $$ BEGIN
@@ -354,6 +390,32 @@ impl PostgresMemory {
             CREATE INDEX IF NOT EXISTS idx_memories_namespace ON {qualified_table}(namespace);
             "#
         ))?;
+
+        // The DO block above deliberately swallows its own errors (RAISE
+        // NOTICE, not re-thrown) so one failed ALTER never blocks the rest
+        // of table setup — but that means the batch_execute above succeeding
+        // does NOT guarantee the `embedding` column actually exists. Verify
+        // directly: `pgvector_ready` is the one signal store/recall trust to
+        // decide whether referencing `m.embedding` is safe, so it must be
+        // an honest reflection of catalog state, not just "the DDL request
+        // didn't throw."
+        let embedding_col_exists: bool = client
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = $1 AND table_name = $2 AND column_name = 'embedding'
+                )",
+                &[&schema, &table],
+            )?
+            .get(0);
+
+        if !embedding_col_exists {
+            anyhow::bail!(
+                "pgvector embedding column was not created on {qualified_table} \
+                 (DO block swallowed the real ALTER TABLE error — check server logs)"
+            );
+        }
+
         Ok(())
     }
 
