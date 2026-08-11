@@ -20,6 +20,7 @@ pub mod api_quickstart;
 pub mod api_sections;
 pub mod api_skills;
 pub mod api_approvals;
+pub mod api_tenant_approvals;
 pub mod api_sop;
 pub mod api_sop_author;
 #[cfg(feature = "webauthn")]
