@@ -5201,6 +5201,7 @@ mod tests {
             tenant_entity_query_param: None,
             tenant_workspace_root: None,
             tenant_workspace_dir: None,
+            requires_composio_toolkit: None,
             max_response_bytes: None,
         });
         let agent_alias = "ops".to_string();
