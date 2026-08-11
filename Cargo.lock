@@ -6957,6 +6957,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgvector"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3673cba5b9a124916096a423b806a9f29620972c6c97b08db5f2053e9428b481"
+dependencies = [
+ "bytes",
+ "postgres-types",
+]
+
+[[package]]
 name = "phf"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13475,6 +13485,7 @@ dependencies = [
  "chrono",
  "filetime",
  "parking_lot",
+ "pgvector",
  "postgres",
  "regex",
  "reqwest 0.12.28",

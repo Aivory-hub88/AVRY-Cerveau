@@ -9,6 +9,7 @@
 //! a single durable memory store with concurrent writes — the SQLite backend
 //! cannot serve that use case.
 
+use super::embeddings::EmbeddingProvider;
 use super::traits::{Memory, MemoryCategory, MemoryEntry, normalize_recent_recall_query};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -70,17 +71,29 @@ impl<T: Send + 'static> Drop for DropOnThread<T> {
 /// PostgreSQL-backed persistent memory.
 ///
 /// Reliable CRUD and keyword recall via SQL. Hybrid keyword + vector recall
-/// is available when pgvector is installed and `vector_enabled = true`;
-/// otherwise the backend falls back to keyword-only recall and logs a
-/// warning at construction.
+/// is available when pgvector is installed, `vector_enabled = true`, AND a
+/// real (non-Noop) embedder is configured; otherwise the backend falls back
+/// to keyword-only recall and logs a warning at construction.
 pub struct PostgresMemory {
     alias: String,
     client: DropOnThread<Arc<Mutex<Client>>>,
     qualified_table: String,
     qualified_agents: String,
+    /// `true` only when `try_enable_pgvector` actually succeeded at
+    /// construction — i.e. the `embedding vector(N)` column genuinely
+    /// exists on this table. Every SQL statement that references
+    /// `m.embedding` or binds a vector parameter must be gated on this:
+    /// referencing a column that doesn't exist would break every store/
+    /// recall call outright on a deployment that never enabled pgvector,
+    /// not just degrade gracefully.
+    pgvector_ready: bool,
+    embedder: Option<Arc<dyn EmbeddingProvider>>,
+    vector_weight: f32,
+    keyword_weight: f32,
 }
 
 impl PostgresMemory {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         alias: &str,
         db_url: &str,
@@ -89,6 +102,9 @@ impl PostgresMemory {
         connect_timeout_secs: Option<u64>,
         pgvector_enabled: Option<bool>,
         pgvector_dimensions: Option<usize>,
+        embedder: Option<Arc<dyn EmbeddingProvider>>,
+        vector_weight: f32,
+        keyword_weight: f32,
     ) -> Result<Self> {
         validate_identifier(schema, "storage schema")?;
         validate_identifier(table, "storage table")?;
@@ -126,7 +142,48 @@ impl PostgresMemory {
             client: DropOnThread::new(Arc::new(Mutex::new(client))),
             qualified_table,
             qualified_agents,
+            pgvector_ready: pgvector_ext_ok,
+            embedder,
+            vector_weight,
+            keyword_weight,
         })
+    }
+
+    /// Whether this store can produce/consume real vectors right now: the
+    /// `embedding` column genuinely exists (pgvector extension confirmed at
+    /// construction) AND a real, non-Noop embedder is configured. Gates
+    /// every SQL statement that references `m.embedding` or binds a vector
+    /// parameter — see the field doc on [`PostgresMemory::pgvector_ready`].
+    fn vector_ready(&self) -> bool {
+        self.pgvector_ready && self.embedder.as_ref().is_some_and(|e| e.dimensions() > 0)
+    }
+
+    /// Embed `text`, degrading to `None` (keyword-only for this call) on any
+    /// failure — mirrors `SqliteMemory::store_row_with_metadata`'s own "log
+    /// a warning, continue without a vector" posture. An embedder outage
+    /// must never block a memory store or recall.
+    async fn try_embed(&self, text: &str, op: &str) -> Option<Vec<f32>> {
+        if !self.vector_ready() {
+            return None;
+        }
+        let embedder = self.embedder.as_ref()?;
+        match embedder.embed_one(text).await {
+            Ok(v) => Some(v),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "alias": self.alias,
+                            "op": op,
+                            "error": format!("{e}"),
+                        })),
+                    "postgres memory: embedding failed; continuing keyword-only for this call"
+                );
+                None
+            }
+        }
     }
 
     /// Connects, migrates, and (if requested) enables pgvector — all on one
@@ -435,27 +492,27 @@ impl Memory for PostgresMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
+        let query = normalize_recent_recall_query(query).trim().to_string();
+        // Computed before the blocking closure — see `store_with_agent`'s
+        // same comment on why embedding can't happen inside
+        // `run_on_os_thread`.
+        let query_vector = self
+            .try_embed(&query, "recall")
+            .await
+            .map(pgvector::Vector::from);
+        let pgvector_ready = self.pgvector_ready;
+        let vector_weight = self.vector_weight;
+        let keyword_weight = self.keyword_weight;
+
         let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
-        let query = normalize_recent_recall_query(query).trim().to_string();
         let sid = session_id.map(str::to_string);
         let since_owned = since.map(str::to_string);
         let until_owned = until.map(str::to_string);
 
         run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
             let mut client = client.lock();
-            let since_ref = since_owned.as_deref();
-            let until_ref = until_owned.as_deref();
-
-            let time_filter: String = match (since_ref, until_ref) {
-                (Some(_), Some(_)) => {
-                    " AND created_at >= $4::TIMESTAMPTZ AND created_at <= $5::TIMESTAMPTZ".into()
-                }
-                (Some(_), None) => " AND created_at >= $4::TIMESTAMPTZ".into(),
-                (None, Some(_)) => " AND created_at <= $4::TIMESTAMPTZ".into(),
-                (None, None) => String::new(),
-            };
 
             // Cerveau: recall is a ranked top-k search, so keyword matching
             // uses OR semantics (match ANY query term, rank by ts_rank_cd)
@@ -463,43 +520,91 @@ impl Memory for PostgresMemory {
             // query word absent from the row ("preferensi" vs a row that
             // says "lebih suka") hides an obviously relevant memory. The
             // OR tsquery is composed once from the query's own lexemes.
-            let stmt = format!(
-                "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id,
-                       (
-                         CASE WHEN q.tsq IS NOT NULL AND to_tsvector('simple', m.key) @@ q.tsq
-                           THEN ts_rank_cd(to_tsvector('simple', m.key), q.tsq) * 2.0
-                           ELSE 0.0 END +
-                         CASE WHEN q.tsq IS NOT NULL AND to_tsvector('simple', m.content) @@ q.tsq
-                           THEN ts_rank_cd(to_tsvector('simple', m.content), q.tsq)
-                           ELSE 0.0 END
-                       ) AS score
-                FROM {qualified_table} m
-                LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
-                CROSS JOIN (
-                  SELECT CASE WHEN length(trim($1)) = 0 THEN NULL
-                    ELSE to_tsquery('simple',
-                      (SELECT string_agg(lex, ' | ')
-                         FROM unnest(tsvector_to_array(to_tsvector('simple', $1))) AS lex))
-                  END AS tsq
-                ) q
-                WHERE ($2::TEXT IS NULL OR m.session_id = $2)
-                  AND ($1 = '' OR (q.tsq IS NOT NULL
-                       AND to_tsvector('simple', m.key || ' ' || m.content) @@ q.tsq))
-                  {time_filter}
-                ORDER BY score DESC, m.updated_at DESC
-                LIMIT $3
-                ",
-            );
-
+            //
+            // Two statement variants (not one with an always-bound vector
+            // parameter): on a deployment that never enabled pgvector, the
+            // `embedding` column doesn't exist, and referencing it would
+            // break every recall outright — see `pgvector_ready`'s field
+            // doc. When it IS ready, the WHERE clause's keyword gate is
+            // deliberately widened with `OR (embedding similarity)` — a row
+            // with zero keyword overlap but a genuinely close embedding
+            // must not be filtered out before scoring ever sees it, or
+            // "hybrid" search silently degrades to keyword-only for the
+            // exact case (paraphrased, no shared words) it exists to catch.
             #[allow(clippy::cast_possible_wrap)]
             let limit_i64 = limit as i64;
 
-            let rows = match (since_ref, until_ref) {
-                (Some(s), Some(u)) => client.query(&stmt, &[&query, &sid, &limit_i64, &s, &u])?,
-                (Some(s), None) => client.query(&stmt, &[&query, &sid, &limit_i64, &s])?,
-                (None, Some(u)) => client.query(&stmt, &[&query, &sid, &limit_i64, &u])?,
-                (None, None) => client.query(&stmt, &[&query, &sid, &limit_i64])?,
+            let rows = if pgvector_ready {
+                let stmt = format!(
+                    "
+                    SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id,
+                           (
+                             (
+                               CASE WHEN q.tsq IS NOT NULL AND to_tsvector('simple', m.key) @@ q.tsq
+                                 THEN ts_rank_cd(to_tsvector('simple', m.key), q.tsq) * 2.0
+                                 ELSE 0.0 END +
+                               CASE WHEN q.tsq IS NOT NULL AND to_tsvector('simple', m.content) @@ q.tsq
+                                 THEN ts_rank_cd(to_tsvector('simple', m.content), q.tsq)
+                                 ELSE 0.0 END
+                             ) * {keyword_weight} +
+                             CASE WHEN $6::vector IS NOT NULL AND m.embedding IS NOT NULL
+                               THEN (1.0 - (m.embedding <=> $6::vector)) * {vector_weight}
+                               ELSE 0.0 END
+                           ) AS score
+                    FROM {qualified_table} m
+                    LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                    CROSS JOIN (
+                      SELECT CASE WHEN length(trim($1)) = 0 THEN NULL
+                        ELSE to_tsquery('simple',
+                          (SELECT string_agg(lex, ' | ')
+                             FROM unnest(tsvector_to_array(to_tsvector('simple', $1))) AS lex))
+                      END AS tsq
+                    ) q
+                    WHERE ($2::TEXT IS NULL OR m.session_id = $2)
+                      AND ($1 = '' OR
+                           (q.tsq IS NOT NULL AND to_tsvector('simple', m.key || ' ' || m.content) @@ q.tsq) OR
+                           ($6::vector IS NOT NULL AND m.embedding IS NOT NULL))
+                      AND ($4::TIMESTAMPTZ IS NULL OR m.created_at >= $4::TIMESTAMPTZ)
+                      AND ($5::TIMESTAMPTZ IS NULL OR m.created_at <= $5::TIMESTAMPTZ)
+                    ORDER BY score DESC, m.updated_at DESC
+                    LIMIT $3
+                    ",
+                );
+                client.query(
+                    &stmt,
+                    &[&query, &sid, &limit_i64, &since_owned, &until_owned, &query_vector],
+                )?
+            } else {
+                let stmt = format!(
+                    "
+                    SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id,
+                           (
+                             CASE WHEN q.tsq IS NOT NULL AND to_tsvector('simple', m.key) @@ q.tsq
+                               THEN ts_rank_cd(to_tsvector('simple', m.key), q.tsq) * 2.0
+                               ELSE 0.0 END +
+                             CASE WHEN q.tsq IS NOT NULL AND to_tsvector('simple', m.content) @@ q.tsq
+                               THEN ts_rank_cd(to_tsvector('simple', m.content), q.tsq)
+                               ELSE 0.0 END
+                           ) AS score
+                    FROM {qualified_table} m
+                    LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                    CROSS JOIN (
+                      SELECT CASE WHEN length(trim($1)) = 0 THEN NULL
+                        ELSE to_tsquery('simple',
+                          (SELECT string_agg(lex, ' | ')
+                             FROM unnest(tsvector_to_array(to_tsvector('simple', $1))) AS lex))
+                      END AS tsq
+                    ) q
+                    WHERE ($2::TEXT IS NULL OR m.session_id = $2)
+                      AND ($1 = '' OR (q.tsq IS NOT NULL
+                           AND to_tsvector('simple', m.key || ' ' || m.content) @@ q.tsq))
+                      AND ($4::TIMESTAMPTZ IS NULL OR m.created_at >= $4::TIMESTAMPTZ)
+                      AND ($5::TIMESTAMPTZ IS NULL OR m.created_at <= $5::TIMESTAMPTZ)
+                    ORDER BY score DESC, m.updated_at DESC
+                    LIMIT $3
+                    ",
+                );
+                client.query(&stmt, &[&query, &sid, &limit_i64, &since_owned, &until_owned])?
             };
             rows.iter()
                 .map(Self::row_to_entry)
@@ -771,6 +876,15 @@ impl Memory for PostgresMemory {
         _importance: Option<f64>,
         agent_id: Option<&str>,
     ) -> Result<()> {
+        // Computed before the blocking closure: embedding is an async call
+        // (HTTP to the embedding provider), which cannot run inside
+        // `run_on_os_thread`'s plain-OS-thread sync closure.
+        let embedding = self
+            .try_embed(content, "store")
+            .await
+            .map(pgvector::Vector::from);
+        let pgvector_ready = self.pgvector_ready;
+
         let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
@@ -788,26 +902,54 @@ impl Memory for PostgresMemory {
             // by attributing to the synthesized default agent. The
             // subquery is indexed (UNIQUE alias) so the lookup is
             // metadata-cached after the first call.
-            let stmt = format!(
-                "
-                INSERT INTO {qualified_table}
-                    (id, key, content, category, created_at, updated_at, session_id, agent_id)
-                VALUES
-                    ($1, $2, $3, $4, $5, $6, $7,
-                     COALESCE($8, (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)))
-                ON CONFLICT (agent_id, key) DO UPDATE SET
-                    content = EXCLUDED.content,
-                    category = EXCLUDED.category,
-                    updated_at = EXCLUDED.updated_at,
-                    session_id = EXCLUDED.session_id
-                "
-            );
-
+            //
+            // Two statement variants, not one with an always-present
+            // `embedding` column: on a deployment that never enabled
+            // pgvector, the `embedding` column plain doesn't exist, and
+            // referencing it would break every store call outright rather
+            // than degrading gracefully — see `pgvector_ready`'s field doc.
             let id = Uuid::new_v4().to_string();
-            client.execute(
-                &stmt,
-                &[&id, &key, &content, &category, &now, &now, &sid, &aid],
-            )?;
+            if pgvector_ready {
+                let stmt = format!(
+                    "
+                    INSERT INTO {qualified_table}
+                        (id, key, content, category, created_at, updated_at, session_id, agent_id, embedding)
+                    VALUES
+                        ($1, $2, $3, $4, $5, $6, $7,
+                         COALESCE($8, (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)),
+                         $9)
+                    ON CONFLICT (agent_id, key) DO UPDATE SET
+                        content = EXCLUDED.content,
+                        category = EXCLUDED.category,
+                        updated_at = EXCLUDED.updated_at,
+                        session_id = EXCLUDED.session_id,
+                        embedding = COALESCE(EXCLUDED.embedding, {qualified_table}.embedding)
+                    "
+                );
+                client.execute(
+                    &stmt,
+                    &[&id, &key, &content, &category, &now, &now, &sid, &aid, &embedding],
+                )?;
+            } else {
+                let stmt = format!(
+                    "
+                    INSERT INTO {qualified_table}
+                        (id, key, content, category, created_at, updated_at, session_id, agent_id)
+                    VALUES
+                        ($1, $2, $3, $4, $5, $6, $7,
+                         COALESCE($8, (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)))
+                    ON CONFLICT (agent_id, key) DO UPDATE SET
+                        content = EXCLUDED.content,
+                        category = EXCLUDED.category,
+                        updated_at = EXCLUDED.updated_at,
+                        session_id = EXCLUDED.session_id
+                    "
+                );
+                client.execute(
+                    &stmt,
+                    &[&id, &key, &content, &category, &now, &now, &sid, &aid],
+                )?;
+            }
             Ok(())
         })
         .await
@@ -829,10 +971,18 @@ impl Memory for PostgresMemory {
             return self.recall(query, limit, session_id, since, until).await;
         }
 
+        let q = normalize_recent_recall_query(query).trim().to_string();
+        // Computed before the blocking closure — see `store_with_agent`'s
+        // same comment on why embedding can't happen inside
+        // `run_on_os_thread`.
+        let query_vector = self.try_embed(&q, "recall_for_agents").await.map(pgvector::Vector::from);
+        let pgvector_ready = self.pgvector_ready;
+        let vector_weight = self.vector_weight;
+        let keyword_weight = self.keyword_weight;
+
         let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
-        let q = normalize_recent_recall_query(query).trim().to_string();
         let sid = session_id.map(str::to_string);
         let since_owned = since.map(str::to_string);
         let until_owned = until.map(str::to_string);
@@ -840,8 +990,6 @@ impl Memory for PostgresMemory {
 
         run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
             let mut client = client.lock();
-            let since_ref = since_owned.as_deref();
-            let until_ref = until_owned.as_deref();
 
             // The agent_id filter lives in the WHERE clause so the
             // backend never returns a foreign-agent row to the caller;
@@ -849,56 +997,88 @@ impl Memory for PostgresMemory {
             // privacy escape Audacity flagged. The NOT NULL FK on
             // `memories.agent_id` means there are no legacy
             // unattributed rows to special-case.
-            let time_filter: String = match (since_ref, until_ref) {
-                (Some(_), Some(_)) => {
-                    " AND m.created_at >= $5::TIMESTAMPTZ AND m.created_at <= $6::TIMESTAMPTZ".into()
-                }
-                (Some(_), None) => " AND m.created_at >= $5::TIMESTAMPTZ".into(),
-                (None, Some(_)) => " AND m.created_at <= $5::TIMESTAMPTZ".into(),
-                (None, None) => String::new(),
-            };
-
-            // Same OR-semantics rationale as `recall` above.
-            let stmt = format!(
-                "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id,
-                       (
-                         CASE WHEN q.tsq IS NOT NULL AND to_tsvector('simple', m.key) @@ q.tsq
-                           THEN ts_rank_cd(to_tsvector('simple', m.key), q.tsq) * 2.0
-                           ELSE 0.0 END +
-                         CASE WHEN q.tsq IS NOT NULL AND to_tsvector('simple', m.content) @@ q.tsq
-                           THEN ts_rank_cd(to_tsvector('simple', m.content), q.tsq)
-                           ELSE 0.0 END
-                       ) AS score
-                FROM {qualified_table} m
-                LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
-                CROSS JOIN (
-                  SELECT CASE WHEN length(trim($1)) = 0 THEN NULL
-                    ELSE to_tsquery('simple',
-                      (SELECT string_agg(lex, ' | ')
-                         FROM unnest(tsvector_to_array(to_tsvector('simple', $1))) AS lex))
-                  END AS tsq
-                ) q
-                WHERE ($2::TEXT IS NULL OR m.session_id = $2)
-                  AND ($1 = '' OR (q.tsq IS NOT NULL
-                       AND to_tsvector('simple', m.key || ' ' || m.content) @@ q.tsq))
-                  AND m.agent_id = ANY($4)
-                  {time_filter}
-                ORDER BY score DESC, m.updated_at DESC
-                LIMIT $3
-                ",
-            );
-
+            //
+            // Same two-variant / widened-WHERE-clause rationale as
+            // `recall` above.
             #[allow(clippy::cast_possible_wrap)]
             let limit_i64 = limit as i64;
 
-            let rows = match (since_ref, until_ref) {
-                (Some(s), Some(u)) => {
-                    client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &s, &u])?
-                }
-                (Some(s), None) => client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &s])?,
-                (None, Some(u)) => client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &u])?,
-                (None, None) => client.query(&stmt, &[&q, &sid, &limit_i64, &allowed])?,
+            let rows = if pgvector_ready {
+                let stmt = format!(
+                    "
+                    SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id,
+                           (
+                             (
+                               CASE WHEN q.tsq IS NOT NULL AND to_tsvector('simple', m.key) @@ q.tsq
+                                 THEN ts_rank_cd(to_tsvector('simple', m.key), q.tsq) * 2.0
+                                 ELSE 0.0 END +
+                               CASE WHEN q.tsq IS NOT NULL AND to_tsvector('simple', m.content) @@ q.tsq
+                                 THEN ts_rank_cd(to_tsvector('simple', m.content), q.tsq)
+                                 ELSE 0.0 END
+                             ) * {keyword_weight} +
+                             CASE WHEN $7::vector IS NOT NULL AND m.embedding IS NOT NULL
+                               THEN (1.0 - (m.embedding <=> $7::vector)) * {vector_weight}
+                               ELSE 0.0 END
+                           ) AS score
+                    FROM {qualified_table} m
+                    LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                    CROSS JOIN (
+                      SELECT CASE WHEN length(trim($1)) = 0 THEN NULL
+                        ELSE to_tsquery('simple',
+                          (SELECT string_agg(lex, ' | ')
+                             FROM unnest(tsvector_to_array(to_tsvector('simple', $1))) AS lex))
+                      END AS tsq
+                    ) q
+                    WHERE ($2::TEXT IS NULL OR m.session_id = $2)
+                      AND ($1 = '' OR
+                           (q.tsq IS NOT NULL AND to_tsvector('simple', m.key || ' ' || m.content) @@ q.tsq) OR
+                           ($7::vector IS NOT NULL AND m.embedding IS NOT NULL))
+                      AND m.agent_id = ANY($4)
+                      AND ($5::TIMESTAMPTZ IS NULL OR m.created_at >= $5::TIMESTAMPTZ)
+                      AND ($6::TIMESTAMPTZ IS NULL OR m.created_at <= $6::TIMESTAMPTZ)
+                    ORDER BY score DESC, m.updated_at DESC
+                    LIMIT $3
+                    ",
+                );
+                client.query(
+                    &stmt,
+                    &[&q, &sid, &limit_i64, &allowed, &since_owned, &until_owned, &query_vector],
+                )?
+            } else {
+                let stmt = format!(
+                    "
+                    SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id,
+                           (
+                             CASE WHEN q.tsq IS NOT NULL AND to_tsvector('simple', m.key) @@ q.tsq
+                               THEN ts_rank_cd(to_tsvector('simple', m.key), q.tsq) * 2.0
+                               ELSE 0.0 END +
+                             CASE WHEN q.tsq IS NOT NULL AND to_tsvector('simple', m.content) @@ q.tsq
+                               THEN ts_rank_cd(to_tsvector('simple', m.content), q.tsq)
+                               ELSE 0.0 END
+                           ) AS score
+                    FROM {qualified_table} m
+                    LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                    CROSS JOIN (
+                      SELECT CASE WHEN length(trim($1)) = 0 THEN NULL
+                        ELSE to_tsquery('simple',
+                          (SELECT string_agg(lex, ' | ')
+                             FROM unnest(tsvector_to_array(to_tsvector('simple', $1))) AS lex))
+                      END AS tsq
+                    ) q
+                    WHERE ($2::TEXT IS NULL OR m.session_id = $2)
+                      AND ($1 = '' OR (q.tsq IS NOT NULL
+                           AND to_tsvector('simple', m.key || ' ' || m.content) @@ q.tsq))
+                      AND m.agent_id = ANY($4)
+                      AND ($5::TIMESTAMPTZ IS NULL OR m.created_at >= $5::TIMESTAMPTZ)
+                      AND ($6::TIMESTAMPTZ IS NULL OR m.created_at <= $6::TIMESTAMPTZ)
+                    ORDER BY score DESC, m.updated_at DESC
+                    LIMIT $3
+                    ",
+                );
+                client.query(
+                    &stmt,
+                    &[&q, &sid, &limit_i64, &allowed, &since_owned, &until_owned],
+                )?
             };
             rows.iter()
                 .map(Self::row_to_entry)
@@ -1020,6 +1200,9 @@ mod tests {
                 Some(1),
                 None,
                 None,
+                None,
+                0.7,
+                0.3,
             )
         });
 
