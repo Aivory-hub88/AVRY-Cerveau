@@ -114,6 +114,23 @@ impl OpenAiEmbedding {
             format!("{}/v1/embeddings", self.base_url)
         }
     }
+
+    /// Builds the request body for `POST .../embeddings`. Pulled out of
+    /// `embed()` so the actual wire shape — specifically, whether the
+    /// configured `dims` is passed through as OpenAI's Matryoshka
+    /// `dimensions` truncation parameter — is unit-testable without a
+    /// network call. `dims == 0` omits the field entirely rather than
+    /// sending `"dimensions": 0`, which OpenAI-compatible APIs reject.
+    fn build_embed_body(&self, texts: &[&str]) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "input": texts,
+        });
+        if self.dims > 0 {
+            body["dimensions"] = serde_json::json!(self.dims);
+        }
+        body
+    }
 }
 
 #[async_trait]
@@ -131,10 +148,7 @@ impl EmbeddingProvider for OpenAiEmbedding {
             return Ok(Vec::new());
         }
 
-        let body = serde_json::json!({
-            "model": self.model,
-            "input": texts,
-        });
+        let body = self.build_embed_body(texts);
 
         let resp = self
             .http_client()
@@ -229,6 +243,38 @@ pub fn create_embedding_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── build_embed_body: the actual wire shape sent to the embeddings
+    //    API — regression coverage for the patch-0033 dimension-mismatch
+    //    bug, where `dims` was threaded through the whole call chain but
+    //    never actually placed on the request, so OpenAI/OpenRouter always
+    //    returned the model's native (larger) size regardless of config. ──
+
+    #[test]
+    fn build_embed_body_includes_dimensions_when_dims_positive() {
+        let p = OpenAiEmbedding::new("https://openrouter.ai/api/v1", "key", "text-embedding-3-small", 768);
+        let body = p.build_embed_body(&["hello world"]);
+        assert_eq!(body["model"], "text-embedding-3-small");
+        assert_eq!(body["input"], serde_json::json!(["hello world"]));
+        assert_eq!(body["dimensions"], 768);
+    }
+
+    #[test]
+    fn build_embed_body_omits_dimensions_when_dims_zero() {
+        // dims == 0 means "use the model's native size" — sending
+        // "dimensions": 0 would make OpenAI-compatible APIs reject the
+        // request outright, so the field must be absent, not zero.
+        let p = OpenAiEmbedding::new("https://api.openai.com", "key", "text-embedding-3-large", 0);
+        let body = p.build_embed_body(&["hello"]);
+        assert!(body.get("dimensions").is_none());
+    }
+
+    #[test]
+    fn build_embed_body_carries_multiple_texts() {
+        let p = OpenAiEmbedding::new("https://api.openai.com", "key", "text-embedding-3-small", 768);
+        let body = p.build_embed_body(&["a", "b", "c"]);
+        assert_eq!(body["input"], serde_json::json!(["a", "b", "c"]));
+    }
 
     #[test]
     fn noop_name() {
