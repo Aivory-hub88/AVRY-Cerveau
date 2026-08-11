@@ -40,12 +40,30 @@ pub(crate) async fn gate_tool_approval(
     // a human can resolve it out-of-band later (see the `pending_approvals`
     // module doc for why this doesn't try to resume the original turn).
     if approval_requirement == ApprovalRequirement::Pending {
-        let principal = crate::agent::tenant::current_tenant()
+        let tenant = crate::agent::tenant::current_tenant();
+        let principal = tenant
+            .as_ref()
             .map(|t| t.platform_user_id.clone())
             .unwrap_or_default();
+        let turn_origin = crate::agent::tenant::current_turn_origin();
+        // Patch 0028: carry tenant/session/origin-message context on the
+        // row whenever we have it, so a later tenant-scoped resolve call
+        // can durably resume this turn instead of just executing the tool
+        // out-of-band (see `pending_approvals`'s module doc). A row with no
+        // tenant context (loopback/CLI-originated) still works exactly as
+        // before — out-of-band execution only.
         let pending_id = match ctx.approval.and_then(|mgr| mgr.pending_store()) {
             Some(store) => store
-                .insert(&principal, tool_name, &tool_args.to_string(), "irreversible")
+                .insert_with_context(
+                    &principal,
+                    tool_name,
+                    &tool_args.to_string(),
+                    "irreversible",
+                    tenant.as_ref().map(|t| t.tenant_id.as_str()),
+                    tenant.as_ref().map(|t| t.agent_type.as_str()),
+                    turn_origin.as_ref().and_then(|o| o.session_id.as_deref()),
+                    turn_origin.as_ref().map(|o| o.origin_message.as_str()),
+                )
                 .ok(),
             None => None,
         };

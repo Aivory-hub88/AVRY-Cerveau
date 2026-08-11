@@ -101,6 +101,39 @@ pub fn current_tenant() -> Option<Arc<TenantContext>> {
     TENANT_CONTEXT.try_with(std::clone::Clone::clone).ok().flatten()
 }
 
+/// Cerveau (F-1-for-approvals, patch 0028): what a later, out-of-band
+/// resume of a `Pending` approval needs to react to "what did the user
+/// actually ask", captured once at turn start.
+///
+/// `process_message` rebuilds `history` from scratch on every call — a
+/// webhook-driven tenant turn has no literal saved transcript to pull this
+/// back out of later (continuity today comes only from memory recall
+/// scoped by `session_id`, never from replaying prior messages). So a
+/// resume path that wants to synthesize a coherent continuation prompt
+/// (mirroring `control_plane::continuation_drive`'s established shape)
+/// must have the original message captured up front, not reconstructed
+/// after the fact — there is nothing to reconstruct it from.
+#[derive(Debug, Clone)]
+pub struct TurnOriginContext {
+    /// Session id, when the caller supplied one — threaded into a resumed
+    /// turn so its memory recall sees the same tenant facts the original
+    /// turn did. `None` for a turn with no session scoping.
+    pub session_id: Option<String>,
+    /// Verbatim user message that started this turn.
+    pub origin_message: String,
+}
+
+tokio::task_local! {
+    /// Origin context for the current turn. Scoped by the gateway
+    /// alongside [`TENANT_CONTEXT`]; `None`/unset everywhere else.
+    pub static TURN_ORIGIN_CONTEXT: Option<Arc<TurnOriginContext>>;
+}
+
+/// The turn-origin context for the current task, if any.
+pub fn current_turn_origin() -> Option<Arc<TurnOriginContext>> {
+    TURN_ORIGIN_CONTEXT.try_with(std::clone::Clone::clone).ok().flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +159,26 @@ mod tests {
             })
             .await;
         assert!(current_tenant().is_none());
+    }
+
+    #[tokio::test]
+    async fn absent_turn_origin_reads_none() {
+        assert!(current_turn_origin().is_none());
+    }
+
+    #[tokio::test]
+    async fn scoped_turn_origin_is_visible_inside_and_gone_outside() {
+        let ctx = Arc::new(TurnOriginContext {
+            session_id: Some("sess-1".to_string()),
+            origin_message: "please finalize invoice inv_123".to_string(),
+        });
+        TURN_ORIGIN_CONTEXT
+            .scope(Some(ctx.clone()), async {
+                let seen = current_turn_origin().expect("turn origin visible inside scope");
+                assert_eq!(seen.session_id.as_deref(), Some("sess-1"));
+                assert_eq!(seen.origin_message, "please finalize invoice inv_123");
+            })
+            .await;
+        assert!(current_turn_origin().is_none());
     }
 }

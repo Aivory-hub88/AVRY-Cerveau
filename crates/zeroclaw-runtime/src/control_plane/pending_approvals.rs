@@ -5,15 +5,16 @@
 //! OfficeCLI — see the `approval` module's `Pending` variant for the full
 //! rationale).
 //!
-//! Deliberately NOT a resume mechanism: a pending row does not keep the
-//! original conversational turn open, and resolving it does not re-inject a
-//! result into that turn (that needs Cerveau's still-unbuilt F-1
-//! auto-resume driver, ADR-003). Resolving a row instead executes the tool
-//! directly, out-of-band, from the resolve handler — the human sees
-//! "approved, action executed," not the original chat thread continuing.
-//! This is a documented, intentional simplification: the row shape here
-//! (principal/tool/arguments/risk_tier) is exactly what a future F-1-driven
-//! resume would also need, so this is a stepping stone, not a dead end.
+//! As of patch 0028, a row also optionally carries enough context
+//! (`tenant_id`/`agent_type`/`session_id`/`origin_message`, via
+//! [`PendingApprovalsStore::insert_with_context`]) for a *tenant-scoped*
+//! resolve path (patch 0029/0030,
+//! `zeroclaw_gateway::api_tenant_approvals`) to durably resume the original
+//! conversation instead of just executing the tool out-of-band — see that
+//! module for the resume mechanics. The loopback-only admin resolve path
+//! (`zeroclaw_gateway::api_approvals::execute_approved_tool`) is unchanged
+//! by this and still only executes the tool directly; it has no channel to
+//! resume a reply into.
 //!
 //! Modelled on [`super::tool_idem::ToolIdemLedger`]: one SQLite table in the
 //! same `control_plane.db`, behind a `parking_lot::Mutex`, WAL pragmas.
@@ -45,6 +46,26 @@ pub struct PendingApproval {
     /// `"api"` for an unauthenticated dev-mode call) — an audit trail
     /// field, not an authorization check.
     pub resolved_by: Option<String>,
+    /// Cerveau (patch 0028): the tenant's flattened id
+    /// (`TenantContext::tenant_id`), when this row was created from a
+    /// tenant webhook turn — `None` for a loopback/CLI-originated row.
+    /// The tenant-scoped resolve path (`api_tenant_approvals`) uses this as
+    /// the authorization boundary: a caller may only resolve a row whose
+    /// `tenant_id` matches its own authenticated tenant.
+    pub tenant_id: Option<String>,
+    /// Cerveau (patch 0028): the tenant's Aivory agent type
+    /// (`TenantContext::agent_type`), needed to re-resolve the serving
+    /// host alias and persona when synthesizing a continuation turn.
+    pub agent_type: Option<String>,
+    /// Cerveau (patch 0028): the original turn's session id, so a resumed
+    /// continuation turn's memory recall sees the same tenant facts the
+    /// original turn did.
+    pub session_id: Option<String>,
+    /// Cerveau (patch 0028): the verbatim user message that started the
+    /// original turn — captured now because a webhook-driven turn has no
+    /// saved transcript to pull it back out of later. `None` for a row
+    /// inserted via the plain [`Self::insert`] (no origin context available).
+    pub origin_message: Option<String>,
 }
 
 /// SQLite-backed store for pending-approval records.
@@ -88,12 +109,39 @@ impl PendingApprovalsStore {
              );",
         )
         .context("init pending_approvals schema")?;
+        // Patch 0028: additive columns for durable tenant-turn resume.
+        // SQLite has no `ADD COLUMN IF NOT EXISTS` — the standard-idiom
+        // migration here is one `ALTER TABLE` per column, tolerating
+        // exactly the "duplicate column name" error a re-run against an
+        // already-migrated (post-0028) DB produces, and propagating any
+        // other error as real. Safe on both a brand-new DB (columns never
+        // existed) and a pre-0028 DB (columns genuinely added for the
+        // first time).
+        for (column, ddl) in [
+            ("tenant_id", "ALTER TABLE pending_approvals ADD COLUMN tenant_id TEXT"),
+            ("agent_type", "ALTER TABLE pending_approvals ADD COLUMN agent_type TEXT"),
+            ("session_id", "ALTER TABLE pending_approvals ADD COLUMN session_id TEXT"),
+            (
+                "origin_message",
+                "ALTER TABLE pending_approvals ADD COLUMN origin_message TEXT",
+            ),
+        ] {
+            if let Err(e) = conn.execute(ddl, []) {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(e).with_context(|| format!("add pending_approvals.{column} column"));
+                }
+            }
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    /// Insert a new pending row and return its id.
+    /// Insert a new pending row and return its id. No origin context is
+    /// recorded — a row inserted this way can only ever be resolved
+    /// out-of-band (`api_approvals::execute_approved_tool`), never
+    /// durably resumed. Kept for any non-tenant (loopback/CLI) caller.
     pub fn insert(
         &self,
         principal: &str,
@@ -101,14 +149,49 @@ impl PendingApprovalsStore {
         arguments: &str,
         risk_tier: &str,
     ) -> Result<String> {
+        self.insert_with_context(principal, tool_name, arguments, risk_tier, None, None, None, None)
+    }
+
+    /// Insert a new pending row carrying enough context
+    /// (`tenant_id`/`agent_type`/`session_id`/`origin_message`) for a
+    /// later tenant-scoped resolve call (`zeroclaw_gateway::api_tenant_approvals`,
+    /// patch 0029) to synthesize a coherent continuation turn instead of
+    /// just executing the tool out-of-band. Any of the four may be `None`
+    /// (e.g. a tenant turn with no session id) — a resume path must
+    /// tolerate a missing `origin_message` by falling back to a generic
+    /// continuation prompt, not by failing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_with_context(
+        &self,
+        principal: &str,
+        tool_name: &str,
+        arguments: &str,
+        risk_tier: &str,
+        tenant_id: Option<&str>,
+        agent_type: Option<&str>,
+        session_id: Option<&str>,
+        origin_message: Option<&str>,
+    ) -> Result<String> {
         let id = format!("pa_{}", uuid::Uuid::new_v4());
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO pending_approvals
-                 (id, principal, tool_name, arguments, risk_tier, requested_at, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')",
-            params![id, principal, tool_name, arguments, risk_tier, now],
+                 (id, principal, tool_name, arguments, risk_tier, requested_at, status,
+                  tenant_id, agent_type, session_id, origin_message)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9, ?10)",
+            params![
+                id,
+                principal,
+                tool_name,
+                arguments,
+                risk_tier,
+                now,
+                tenant_id,
+                agent_type,
+                session_id,
+                origin_message
+            ],
         )?;
         Ok(id)
     }
@@ -118,7 +201,8 @@ impl PendingApprovalsStore {
         let conn = self.conn.lock();
         conn.query_row(
             "SELECT id, principal, tool_name, arguments, risk_tier, requested_at,
-                    status, resolved_at, resolved_by
+                    status, resolved_at, resolved_by,
+                    tenant_id, agent_type, session_id, origin_message
                FROM pending_approvals WHERE id = ?1",
             params![id],
             Self::row_to_pending_approval,
@@ -134,13 +218,15 @@ impl PendingApprovalsStore {
         let mut stmt = if status.is_some() {
             conn.prepare(
                 "SELECT id, principal, tool_name, arguments, risk_tier, requested_at,
-                        status, resolved_at, resolved_by
+                        status, resolved_at, resolved_by,
+                        tenant_id, agent_type, session_id, origin_message
                    FROM pending_approvals WHERE status = ?1 ORDER BY requested_at DESC",
             )?
         } else {
             conn.prepare(
                 "SELECT id, principal, tool_name, arguments, risk_tier, requested_at,
-                        status, resolved_at, resolved_by
+                        status, resolved_at, resolved_by,
+                        tenant_id, agent_type, session_id, origin_message
                    FROM pending_approvals ORDER BY requested_at DESC",
             )?
         };
@@ -180,6 +266,10 @@ impl PendingApprovalsStore {
             status: r.get(6)?,
             resolved_at: r.get(7)?,
             resolved_by: r.get(8)?,
+            tenant_id: r.get(9)?,
+            agent_type: r.get(10)?,
+            session_id: r.get(11)?,
+            origin_message: r.get(12)?,
         })
     }
 }
@@ -215,6 +305,47 @@ mod tests {
         assert_eq!(row.tool_name, "finalize_invoice");
         assert_eq!(row.status, "pending");
         assert!(row.resolved_at.is_none());
+        // Plain `insert` carries no origin context — a resume path must
+        // treat this row as out-of-band-only.
+        assert!(row.tenant_id.is_none());
+        assert!(row.agent_type.is_none());
+        assert!(row.session_id.is_none());
+        assert!(row.origin_message.is_none());
+    }
+
+    #[test]
+    fn insert_with_context_round_trips_all_four_fields() {
+        let store = PendingApprovalsStore::new_in_memory().unwrap();
+        let id = store
+            .insert_with_context(
+                "u1",
+                "finalize_invoice",
+                "{}",
+                "irreversible",
+                Some("u1:finance_invoice_ops"),
+                Some("finance_invoice_ops"),
+                Some("sess-1"),
+                Some("please finalize invoice inv_123"),
+            )
+            .unwrap();
+        let row = store.get(&id).unwrap().expect("row must exist");
+        assert_eq!(row.tenant_id.as_deref(), Some("u1:finance_invoice_ops"));
+        assert_eq!(row.agent_type.as_deref(), Some("finance_invoice_ops"));
+        assert_eq!(row.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(
+            row.origin_message.as_deref(),
+            Some("please finalize invoice inv_123")
+        );
+    }
+
+    #[test]
+    fn insert_with_context_tolerates_all_none_context() {
+        let store = PendingApprovalsStore::new_in_memory().unwrap();
+        let id = store
+            .insert_with_context("u1", "tool_a", "{}", "irreversible", None, None, None, None)
+            .unwrap();
+        let row = store.get(&id).unwrap().expect("row must exist");
+        assert!(row.origin_message.is_none());
     }
 
     #[test]
