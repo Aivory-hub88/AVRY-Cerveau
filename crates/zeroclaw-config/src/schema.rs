@@ -7202,6 +7202,31 @@ pub struct GatewayConfig {
     /// is set. Default: 15s.
     #[serde(default = "default_admission_queue_timeout_secs")]
     pub admission_queue_timeout_secs: u64,
+
+    /// Cerveau (F-1-for-approvals, patch 0031): outbound URL Cerveau calls
+    /// to redeliver an approval-resume reply that could not be returned
+    /// synchronously in the `/webhook/approvals/{id}/resolve` response —
+    /// today, only the boot-time reaper sweep (patch 0032) for a row that
+    /// was approved but never delivered (e.g. the daemon restarted between
+    /// F-2 `complete()` and the response reaching its caller). The happy
+    /// path (a live resolve call) always returns `reply_text` directly in
+    /// its own HTTP response and never uses this. `None` (default)
+    /// disables redelivery entirely — an attempt with no URL configured
+    /// logs and stops rather than erroring the caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_redelivery_url: Option<String>,
+
+    /// Shared secret sent as `X-Redelivery-Secret` on redelivery POSTs, so
+    /// the receiving bridge can verify the call genuinely came from this
+    /// Cerveau instance. Enforced at the call site (not here): a redelivery
+    /// attempt with a URL but no secret still sends the request, since some
+    /// deployments may front the redelivery endpoint with other auth (e.g.
+    /// a loopback-only bind) instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub approval_redelivery_secret: Option<String>,
 }
 
 /// Storage backend for [`GatewayConfig`]'s rate limiters (ADR-005).
@@ -7315,6 +7340,8 @@ impl Default for GatewayConfig {
             redis_key_prefix: default_redis_key_prefix(),
             max_concurrent_llm_requests: None,
             admission_queue_timeout_secs: default_admission_queue_timeout_secs(),
+            approval_redelivery_url: None,
+            approval_redelivery_secret: None,
         }
     }
 }
@@ -29023,6 +29050,8 @@ allowed_numbers = ["+1", "+2"]
             redis_key_prefix: "test:ratelimit:".into(),
             max_concurrent_llm_requests: Some(64),
             admission_queue_timeout_secs: 20,
+            approval_redelivery_url: Some("http://127.0.0.1:3003/approval-redelivery".into()),
+            approval_redelivery_secret: Some("test-redelivery-secret".into()),
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
@@ -29046,6 +29075,14 @@ allowed_numbers = ["+1", "+2"]
         assert_eq!(parsed.redis_key_prefix, "test:ratelimit:");
         assert_eq!(parsed.max_concurrent_llm_requests, Some(64));
         assert_eq!(parsed.admission_queue_timeout_secs, 20);
+        assert_eq!(
+            parsed.approval_redelivery_url.as_deref(),
+            Some("http://127.0.0.1:3003/approval-redelivery")
+        );
+        assert_eq!(
+            parsed.approval_redelivery_secret.as_deref(),
+            Some("test-redelivery-secret")
+        );
     }
 
     #[test]

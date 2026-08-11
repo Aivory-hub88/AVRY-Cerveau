@@ -13455,6 +13455,7 @@ dependencies = [
  "rand 0.10.1",
  "rcgen",
  "redis",
+ "reqwest 0.12.28",
  "rusqlite",
  "rustls",
  "rustls-pemfile",

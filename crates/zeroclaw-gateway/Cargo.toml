@@ -36,6 +36,13 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["logg
 # Frontend asset MIME type detection (dashboard served from filesystem)
 mime_guess = "2"
 
+# Cerveau (F-1-for-approvals, patch 0031): outbound HTTP client for
+# approval-resume redelivery (crates/zeroclaw-gateway/src/api_tenant_approvals.rs).
+# Minimal feature set, same pattern as zeroclaw-hardware's override — this
+# crate only ever does a simple async JSON POST, no blocking/multipart/
+# stream/socks.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
 # Cerveau (patch 0023): Redis client for the shared cross-instance rate
 # limiter (opt-in, [gateway].rate_limit_backend = "redis"). ConnectionManager
 # gives us auto-reconnect without hand-rolled pooling; `script` for the

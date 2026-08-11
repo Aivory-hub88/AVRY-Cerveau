@@ -27,6 +27,7 @@
 
 use std::sync::Arc;
 
+use anyhow::Context;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -332,6 +333,62 @@ async fn run_continuation(state: &AppState, row: &PendingApproval, prompt: Strin
         ),
     ))
     .await
+}
+
+/// Cerveau (patch 0031): best-effort outbound redelivery of an approval-
+/// resume reply. Not called from the happy path — `handle_webhook_approval_
+/// resolve` already returns `reply_text` directly in its own HTTP response.
+/// This exists solely for the future reaper sweep (patch 0032) to re-drive
+/// delivery for a row that was approved (and, on approve, whose tool side
+/// effect already ran — F-2-protected, unaffected by this call succeeding
+/// or failing) but whose reply was never delivered, e.g. because the
+/// daemon restarted between F-2 `complete()` and the resolve response
+/// reaching its caller.
+///
+/// Fire-and-forget: returns `Err` on any failure (no URL configured,
+/// unreachable endpoint, non-2xx, timeout) rather than retrying — retrying
+/// a failed redelivery is the reaper's own job on its next sweep, not
+/// this function's.
+#[allow(dead_code)]
+pub(crate) async fn redeliver_resume_reply(
+    state: &AppState,
+    row: &PendingApproval,
+    reply_text: &str,
+) -> anyhow::Result<()> {
+    let (url, secret) = {
+        let config = state.config.read();
+        (
+            config.gateway.approval_redelivery_url.clone(),
+            config.gateway.approval_redelivery_secret.clone(),
+        )
+    };
+    let Some(url) = url else {
+        anyhow::bail!("no gateway.approval_redelivery_url configured — redelivery skipped");
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("build redelivery HTTP client")?;
+    let mut req = client.post(&url).json(&serde_json::json!({
+        "pending_id": row.id,
+        "tenant_id": row.tenant_id,
+        "agent_type": row.agent_type,
+        "principal": row.principal,
+        "session_id": row.session_id,
+        "reply_text": reply_text,
+    }));
+    if let Some(secret) = secret {
+        req = req.header("X-Redelivery-Secret", secret);
+    }
+
+    let resp = req.send().await.context("redelivery POST failed")?;
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "redelivery endpoint returned {}",
+        resp.status()
+    );
+    Ok(())
 }
 
 #[cfg(test)]

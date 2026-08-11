@@ -3768,7 +3768,8 @@ mod tests {
         // (classified via `is_gateway_managed_field` instead). `redis_url`
         // (ADR-005) is operator-edited — the operator points it at their own
         // Redis instance in config.toml, the gateway never mints/rotates it.
-        const OPERATOR_EDITED_GATEWAY_SECRETS: &[&str] = &["gateway.redis_url"];
+        const OPERATOR_EDITED_GATEWAY_SECRETS: &[&str] =
+            &["gateway.redis_url", "gateway.approval_redelivery_secret"];
 
         let cfg = zeroclaw_config::schema::Config::default();
         let unclassified: Vec<String> = cfg
