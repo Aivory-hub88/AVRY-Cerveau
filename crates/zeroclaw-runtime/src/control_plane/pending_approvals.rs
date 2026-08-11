@@ -66,6 +66,15 @@ pub struct PendingApproval {
     /// saved transcript to pull it back out of later. `None` for a row
     /// inserted via the plain [`Self::insert`] (no origin context available).
     pub origin_message: Option<String>,
+    /// Cerveau (patch 0032): when the continuation-turn reply for this
+    /// (already-`approved`/`denied`) row was actually handed back to a
+    /// caller — either synchronously, in `handle_webhook_approval_resolve`'s
+    /// own HTTP response, or later via the reaper's redelivery sweep.
+    /// `None` on a still-`pending` row (nothing to deliver yet) and on a
+    /// resolved row whose reply generation crashed or is still in flight —
+    /// that `None` state is exactly what makes a row a reaper candidate;
+    /// see [`Self::list_undelivered_resolved`].
+    pub delivered_at: Option<String>,
 }
 
 /// SQLite-backed store for pending-approval records.
@@ -124,6 +133,10 @@ impl PendingApprovalsStore {
             (
                 "origin_message",
                 "ALTER TABLE pending_approvals ADD COLUMN origin_message TEXT",
+            ),
+            (
+                "delivered_at",
+                "ALTER TABLE pending_approvals ADD COLUMN delivered_at TEXT",
             ),
         ] {
             if let Err(e) = conn.execute(ddl, []) {
@@ -202,7 +215,7 @@ impl PendingApprovalsStore {
         conn.query_row(
             "SELECT id, principal, tool_name, arguments, risk_tier, requested_at,
                     status, resolved_at, resolved_by,
-                    tenant_id, agent_type, session_id, origin_message
+                    tenant_id, agent_type, session_id, origin_message, delivered_at
                FROM pending_approvals WHERE id = ?1",
             params![id],
             Self::row_to_pending_approval,
@@ -219,14 +232,14 @@ impl PendingApprovalsStore {
             conn.prepare(
                 "SELECT id, principal, tool_name, arguments, risk_tier, requested_at,
                         status, resolved_at, resolved_by,
-                        tenant_id, agent_type, session_id, origin_message
+                        tenant_id, agent_type, session_id, origin_message, delivered_at
                    FROM pending_approvals WHERE status = ?1 ORDER BY requested_at DESC",
             )?
         } else {
             conn.prepare(
                 "SELECT id, principal, tool_name, arguments, risk_tier, requested_at,
                         status, resolved_at, resolved_by,
-                        tenant_id, agent_type, session_id, origin_message
+                        tenant_id, agent_type, session_id, origin_message, delivered_at
                    FROM pending_approvals ORDER BY requested_at DESC",
             )?
         };
@@ -270,7 +283,51 @@ impl PendingApprovalsStore {
             agent_type: r.get(10)?,
             session_id: r.get(11)?,
             origin_message: r.get(12)?,
+            delivered_at: r.get(13)?,
         })
+    }
+
+    /// Mark a resolved row's reply as delivered. Returns `true` if a row
+    /// was actually updated (idempotent: marking an already-delivered row
+    /// again is a harmless no-op — the reaper may race a live resolve call
+    /// that delivers synchronously moments before a sweep picks up the same
+    /// row, and both must be safe).
+    pub fn mark_delivered(&self, id: &str) -> Result<bool> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE pending_approvals SET delivered_at = ?2 WHERE id = ?1 AND delivered_at IS NULL",
+            params![id, now],
+        )?;
+        Ok(updated == 1)
+    }
+
+    /// Cerveau (patch 0032): candidates for the reaper's redelivery sweep —
+    /// resolved (`approved`/`denied`) rows with no `delivered_at` yet.
+    /// Scoped to rows carrying `tenant_id` (patch 0028 context): a row with
+    /// no tenant context was created by a non-tenant/loopback caller
+    /// (`execute_approved_tool`'s own path), which never sets `delivered_at`
+    /// in the first place and has no continuation/reply concept to redeliver.
+    /// Newest-resolved-first is deliberate: a very recently resolved row is
+    /// far more likely to be a live in-flight synchronous resolve the sweep
+    /// would otherwise race pointlessly — callers should still apply their
+    /// own age/grace-period filter on `resolved_at` before acting, this
+    /// query only narrows the field.
+    pub fn list_undelivered_resolved(&self) -> Result<Vec<PendingApproval>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, principal, tool_name, arguments, risk_tier, requested_at,
+                    status, resolved_at, resolved_by,
+                    tenant_id, agent_type, session_id, origin_message, delivered_at
+               FROM pending_approvals
+              WHERE status IN ('approved', 'denied')
+                AND delivered_at IS NULL
+                AND tenant_id IS NOT NULL
+              ORDER BY resolved_at DESC",
+        )?;
+        stmt.query_map(params![], Self::row_to_pending_approval)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("list undelivered resolved pending_approvals")
     }
 }
 
@@ -386,5 +443,98 @@ mod tests {
     fn get_unknown_id_returns_none() {
         let store = PendingApprovalsStore::new_in_memory().unwrap();
         assert!(store.get("pa_does-not-exist").unwrap().is_none());
+    }
+
+    #[test]
+    fn new_rows_have_no_delivered_at() {
+        let store = PendingApprovalsStore::new_in_memory().unwrap();
+        let id = store
+            .insert_with_context(
+                "u1",
+                "tool_a",
+                "{}",
+                "irreversible",
+                Some("u1.cs"),
+                Some("customer_service"),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(store.get(&id).unwrap().unwrap().delivered_at.is_none());
+    }
+
+    #[test]
+    fn mark_delivered_sets_the_field_once_and_is_idempotent() {
+        let store = PendingApprovalsStore::new_in_memory().unwrap();
+        let id = store.insert("u1", "tool_a", "{}", "irreversible").unwrap();
+        store.resolve(&id, "approved", "tenant-webhook").unwrap();
+
+        assert!(store.mark_delivered(&id).unwrap());
+        let row = store.get(&id).unwrap().unwrap();
+        assert!(row.delivered_at.is_some());
+
+        // A second mark is a no-op, not an overwrite — proves the reaper
+        // can safely race a synchronous resolve that delivers first.
+        assert!(!store.mark_delivered(&id).unwrap());
+        assert_eq!(store.get(&id).unwrap().unwrap().delivered_at, row.delivered_at);
+    }
+
+    #[test]
+    fn list_undelivered_resolved_excludes_pending_delivered_and_no_tenant_context() {
+        let store = PendingApprovalsStore::new_in_memory().unwrap();
+
+        // Candidate: resolved, tenant-scoped, never delivered.
+        let candidate = store
+            .insert_with_context(
+                "u1",
+                "tool_a",
+                "{}",
+                "irreversible",
+                Some("u1.cs"),
+                Some("customer_service"),
+                Some("sess-1"),
+                Some("hi"),
+            )
+            .unwrap();
+        store.resolve(&candidate, "approved", "tenant-webhook").unwrap();
+
+        // Not a candidate: still pending.
+        store
+            .insert_with_context(
+                "u1",
+                "tool_b",
+                "{}",
+                "irreversible",
+                Some("u1.cs"),
+                Some("customer_service"),
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Not a candidate: resolved AND already delivered.
+        let delivered = store
+            .insert_with_context(
+                "u1",
+                "tool_c",
+                "{}",
+                "irreversible",
+                Some("u1.cs"),
+                Some("customer_service"),
+                None,
+                None,
+            )
+            .unwrap();
+        store.resolve(&delivered, "approved", "tenant-webhook").unwrap();
+        store.mark_delivered(&delivered).unwrap();
+
+        // Not a candidate: resolved but no tenant context (loopback/admin
+        // path — no continuation/reply concept to redeliver).
+        let no_tenant = store.insert("u1", "tool_d", "{}", "irreversible").unwrap();
+        store.resolve(&no_tenant, "approved", "loopback-cli").unwrap();
+
+        let candidates = store.list_undelivered_resolved().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, candidate);
     }
 }

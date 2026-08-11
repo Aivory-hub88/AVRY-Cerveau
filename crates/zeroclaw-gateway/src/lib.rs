@@ -1776,6 +1776,26 @@ pub async fn run_gateway(
         },
     };
 
+    // Cerveau (F-1-for-approvals, patch 0032): periodic background sweep
+    // for resolved-but-undelivered approval-resume replies (see
+    // `api_tenant_approvals::sweep_undelivered_approvals`'s own doc for the
+    // restart/redelivery gap this closes). Spawned once per gateway boot,
+    // runs for the life of the process — never awaited, never blocks
+    // startup or any request; a panic inside one sweep pass would only
+    // take down this background task, not the gateway itself, though the
+    // sweep body is designed to never panic (log-and-continue throughout).
+    {
+        let sweep_state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                api_tenant_approvals::sweep_undelivered_approvals(&sweep_state).await;
+            }
+        });
+    }
+
     // Build router with middleware
     let inner = Router::new()
         // ── Admin routes (for CLI management) ──
