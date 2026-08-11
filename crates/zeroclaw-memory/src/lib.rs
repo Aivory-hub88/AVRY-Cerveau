@@ -87,16 +87,36 @@ use zeroclaw_config::schema::{
     PostgresStorageConfig,
 };
 
+/// `vector_weight`/`keyword_weight` come from `[memory]` (the same fields
+/// `build_sqlite_memory` reads via `config.vector_weight`/`config.keyword_weight`)
+/// — there is no separate `[storage.postgres.<alias>]` copy of these, since
+/// they're a recall-blending policy, not a storage-connection detail.
 #[cfg(feature = "memory-postgres")]
 fn build_postgres_memory(
     storage: &PostgresStorageConfig,
-) -> anyhow::Result<postgres::PostgresMemory> {
+    resolved_embedding: &ResolvedEmbeddingConfig,
+    vector_weight: f32,
+    keyword_weight: f32,
+) -> anyhow::Result<Box<dyn Memory>> {
     use postgres::PostgresMemory;
     let db_url = storage
         .db_url
         .as_deref()
         .context("memory backend 'postgres' requires [storage.postgres.<alias>].db_url")?;
-    PostgresMemory::new(
+    let embedder: Arc<dyn embeddings::EmbeddingProvider> =
+        Arc::from(embeddings::create_embedding_provider(
+            &resolved_embedding.model_provider,
+            resolved_embedding.api_key.as_deref(),
+            &resolved_embedding.model,
+            resolved_embedding.dimensions,
+        ));
+    // A Noop embedder (unresolved/`"none"` provider) must behave exactly
+    // like "no embedder configured" — `PostgresMemory::vector_ready()`
+    // already treats `dimensions() == 0` as not-ready, but passing `None`
+    // here too avoids ever calling `embed_one` on a provider that can only
+    // return an empty vector.
+    let embedder = (embedder.dimensions() > 0).then_some(embedder);
+    let memory = PostgresMemory::new(
         "postgres",
         db_url,
         &storage.schema,
@@ -104,11 +124,20 @@ fn build_postgres_memory(
         storage.connect_timeout_secs,
         Some(storage.vector_enabled),
         Some(storage.vector_dimensions),
-    )
+        embedder,
+        vector_weight,
+        keyword_weight,
+    )?;
+    Ok(Box::new(memory))
 }
 
 #[cfg(not(feature = "memory-postgres"))]
-fn build_postgres_memory(_storage: &PostgresStorageConfig) -> anyhow::Result<Box<dyn Memory>> {
+fn build_postgres_memory(
+    _storage: &PostgresStorageConfig,
+    _resolved_embedding: &ResolvedEmbeddingConfig,
+    _vector_weight: f32,
+    _keyword_weight: f32,
+) -> anyhow::Result<Box<dyn Memory>> {
     anyhow::bail!(
         "memory backend 'postgres' requested but this build was compiled without \
          `memory-postgres`; rebuild with `--features memory-postgres`"
@@ -696,33 +725,11 @@ pub fn create_memory_with_storage_and_routes(
                  referenced by `memory.backend = \"postgres.<alias>\"`"
             ),
         };
-        #[cfg(feature = "memory-postgres")]
-        {
-            return wrap_scanned_and_audit(
-                build_postgres_memory(pg_cfg)?,
-                &config.policy,
-                workspace_dir,
-                config.audit_enabled,
-            );
-        }
-        #[cfg(not(feature = "memory-postgres"))]
-        {
-            return build_postgres_memory(pg_cfg);
-        }
-    }
-
-    if matches!(backend_kind, MemoryBackendKind::Lucid) {
-        let local = build_sqlite_memory(
-            config,
-            sqlite_open_timeout_secs,
-            workspace_dir,
+        return build_postgres_memory(
+            pg_cfg,
             &resolved_embedding,
-        )?;
-        return wrap_scanned_and_audit(
-            build_lucid_memory(workspace_dir, local, active_storage),
-            &config.policy,
-            workspace_dir,
-            config.audit_enabled,
+            config.vector_weight as f32,
+            config.keyword_weight as f32,
         );
     }
 
