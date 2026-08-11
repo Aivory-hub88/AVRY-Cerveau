@@ -18,19 +18,28 @@
 //! prompt + one more real turn" shape (patch 0025), adapted for a tenant
 //! turn instead of a crashed goal task.
 //!
-//! Not yet reachable from any public route — patch 0030 adds the
-//! `X-Webhook-Secret`-authenticated, tenant-scoped
-//! `POST /webhook/approvals/{id}/resolve` on top of this core. Verified
-//! this round via a CLI/test harness call site only, per this fork's
-//! "prove the mechanism before opening a new attack surface" convention.
+//! Reachable via `POST /webhook/approvals/{id}/resolve`
+//! ([`handle_webhook_approval_resolve`], patch 0030) — the same
+//! `X-Webhook-Secret` contract `/webhook` already uses, plus a row-
+//! ownership check (the row's stored `tenant_id` must match the caller's
+//! `X-Tenant-Id`/`X-Agent-Type`) since a valid shared secret alone proves
+//! only "this is the bridge," not "this is the tenant that owns this row".
 
 use std::sync::Arc;
 
+use axum::Json;
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
+use serde::Deserialize;
 use zeroclaw_api::ingress::TurnOrigin;
 use zeroclaw_runtime::control_plane::pending_approvals::PendingApproval;
+use zeroclaw_runtime::security::pairing::constant_time_eq;
 
 use crate::AppState;
 use crate::tenant::{TenantResolver, TenantSelector, ToolkitConnectionResolver, build_tenant_context};
+
+type JsonErr = (StatusCode, Json<serde_json::Value>);
 
 /// Outcome of resolving one tenant-scoped pending approval.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +53,101 @@ pub struct TenantResolveOutcome {
     /// see `run_continuation`'s doc for why a reply failure is logged and
     /// swallowed here rather than propagated.
     pub reply_text: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ResolveBody {
+    /// `"approve"` | `"deny"`.
+    decision: String,
+}
+
+/// `POST /webhook/approvals/{id}/resolve` — tenant-scoped, patch 0030.
+///
+/// Auth is two layers, both required: (1) the same `X-Webhook-Secret`
+/// check `handle_webhook` already does — proves the caller is genuinely
+/// the bridge, not an arbitrary internet request; (2) the row's own
+/// `tenant_id` must match the caller's `X-Tenant-Id`/`X-Agent-Type` —
+/// proves the caller is resolving a row that actually belongs to the
+/// tenant it claims to be, since a valid shared secret alone proves
+/// nothing about *which* tenant is calling. A mismatch (or an id that
+/// simply doesn't exist) both return 404, not 403 — this endpoint never
+/// confirms whether a given pending-approval id exists to a caller who
+/// doesn't already own it.
+pub async fn handle_webhook_approval_resolve(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<ResolveBody>,
+) -> Result<impl IntoResponse, JsonErr> {
+    fn not_found(id: &str) -> JsonErr {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("no pending approval with id {id}") })),
+        )
+    }
+    fn unauthorized(msg: &str) -> JsonErr {
+        (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": msg })))
+    }
+    fn unavailable(msg: String) -> JsonErr {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": msg })))
+    }
+
+    // ── Layer 1: prove this is really the bridge ──
+    let Some(ref secret_hash) = state.webhook_secret_hash else {
+        return Err(unauthorized(
+            "tenant-scoped approval resolution requires X-Webhook-Secret auth on this deployment",
+        ));
+    };
+    let header_hash = headers
+        .get("X-Webhook-Secret")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(crate::hash_webhook_secret);
+    match header_hash {
+        Some(val) if constant_time_eq(&val, secret_hash.as_ref()) => {}
+        _ => return Err(unauthorized("invalid or missing X-Webhook-Secret header")),
+    }
+
+    // ── Layer 2: prove this is really the tenant that owns this row ──
+    let sel = match crate::tenant::TenantSelector::from_headers(&headers) {
+        Ok(Some(sel)) => sel,
+        Ok(None) => {
+            return Err(unauthorized(
+                "X-Tenant-Id and X-Agent-Type are required to resolve a pending approval",
+            ));
+        }
+        Err(reason) => return Err(unauthorized(reason)),
+    };
+
+    let data_dir = state.config.read().data_dir.clone();
+    let store = zeroclaw_runtime::control_plane::pending_approvals::PendingApprovalsStore::shared(&data_dir)
+        .map_err(|e| unavailable(format!("pending-approval store unavailable: {e}")))?;
+    let row = store
+        .get(&id)
+        .map_err(|e| unavailable(format!("lookup failed: {e}")))?
+        .ok_or_else(|| not_found(&id))?;
+
+    // Row ownership, not the secret, is the actual authorization boundary
+    // here — see this handler's own doc comment.
+    if row.tenant_id.as_deref() != Some(sel.tenant_id().as_str()) {
+        return Err(not_found(&id));
+    }
+
+    match resolve_and_continue_tenant_approval(&state, &row, &body.decision, "tenant-webhook").await {
+        Ok(outcome) => Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "outcome": outcome.outcome,
+                "id": id,
+                "reply_text": outcome.reply_text,
+            })),
+        )),
+        Err(e) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )),
+    }
 }
 
 /// Resolve a tenant-scoped pending approval and, unless it was already
