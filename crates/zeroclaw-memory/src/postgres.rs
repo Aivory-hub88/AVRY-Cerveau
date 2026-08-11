@@ -529,8 +529,8 @@ impl Memory for PostgresMemory {
                       AND ($1 = '' OR
                            (q.tsq IS NOT NULL AND to_tsvector('simple', m.key || ' ' || m.content) @@ q.tsq) OR
                            ($6::vector IS NOT NULL AND m.embedding IS NOT NULL))
-                      AND ($4::TIMESTAMPTZ IS NULL OR m.created_at >= $4::TIMESTAMPTZ)
-                      AND ($5::TIMESTAMPTZ IS NULL OR m.created_at <= $5::TIMESTAMPTZ)
+                      AND ($4::TEXT::TIMESTAMPTZ IS NULL OR m.created_at >= $4::TEXT::TIMESTAMPTZ)
+                      AND ($5::TEXT::TIMESTAMPTZ IS NULL OR m.created_at <= $5::TEXT::TIMESTAMPTZ)
                     ORDER BY score DESC, m.updated_at DESC
                     LIMIT $3
                     ",
@@ -563,8 +563,8 @@ impl Memory for PostgresMemory {
                     WHERE ($2::TEXT IS NULL OR m.session_id = $2)
                       AND ($1 = '' OR (q.tsq IS NOT NULL
                            AND to_tsvector('simple', m.key || ' ' || m.content) @@ q.tsq))
-                      AND ($4::TIMESTAMPTZ IS NULL OR m.created_at >= $4::TIMESTAMPTZ)
-                      AND ($5::TIMESTAMPTZ IS NULL OR m.created_at <= $5::TIMESTAMPTZ)
+                      AND ($4::TEXT::TIMESTAMPTZ IS NULL OR m.created_at >= $4::TEXT::TIMESTAMPTZ)
+                      AND ($5::TEXT::TIMESTAMPTZ IS NULL OR m.created_at <= $5::TEXT::TIMESTAMPTZ)
                     ORDER BY score DESC, m.updated_at DESC
                     LIMIT $3
                     ",
@@ -993,8 +993,8 @@ impl Memory for PostgresMemory {
                            (q.tsq IS NOT NULL AND to_tsvector('simple', m.key || ' ' || m.content) @@ q.tsq) OR
                            ($7::vector IS NOT NULL AND m.embedding IS NOT NULL))
                       AND m.agent_id = ANY($4)
-                      AND ($5::TIMESTAMPTZ IS NULL OR m.created_at >= $5::TIMESTAMPTZ)
-                      AND ($6::TIMESTAMPTZ IS NULL OR m.created_at <= $6::TIMESTAMPTZ)
+                      AND ($5::TEXT::TIMESTAMPTZ IS NULL OR m.created_at >= $5::TEXT::TIMESTAMPTZ)
+                      AND ($6::TEXT::TIMESTAMPTZ IS NULL OR m.created_at <= $6::TEXT::TIMESTAMPTZ)
                     ORDER BY score DESC, m.updated_at DESC
                     LIMIT $3
                     ",
@@ -1028,8 +1028,8 @@ impl Memory for PostgresMemory {
                       AND ($1 = '' OR (q.tsq IS NOT NULL
                            AND to_tsvector('simple', m.key || ' ' || m.content) @@ q.tsq))
                       AND m.agent_id = ANY($4)
-                      AND ($5::TIMESTAMPTZ IS NULL OR m.created_at >= $5::TIMESTAMPTZ)
-                      AND ($6::TIMESTAMPTZ IS NULL OR m.created_at <= $6::TIMESTAMPTZ)
+                      AND ($5::TEXT::TIMESTAMPTZ IS NULL OR m.created_at >= $5::TEXT::TIMESTAMPTZ)
+                      AND ($6::TEXT::TIMESTAMPTZ IS NULL OR m.created_at <= $6::TEXT::TIMESTAMPTZ)
                     ORDER BY score DESC, m.updated_at DESC
                     LIMIT $3
                     ",
