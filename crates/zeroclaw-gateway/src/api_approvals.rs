@@ -192,7 +192,13 @@ pub async fn handle_resolve_approval(
 /// (`agent_type_mcp_bundles`), because that check already gated whether this
 /// row could be *created* in the first place (`gate_tool_approval`); this is
 /// authorization to run the ALREADY-approved call, not a fresh grant.
-async fn execute_approved_tool(
+///
+/// `pub(crate)`: also called by `api_tenant_approvals::resolve_and_continue_
+/// tenant_approval` (patch 0029) — the tool-execution mechanics are identical
+/// for the loopback-admin and tenant-scoped-resume paths; only what happens
+/// after execution differs (nothing further here vs. a continuation turn
+/// there).
+pub(crate) async fn execute_approved_tool(
     state: &AppState,
     row: &zeroclaw_runtime::control_plane::pending_approvals::PendingApproval,
 ) -> serde_json::Value {
