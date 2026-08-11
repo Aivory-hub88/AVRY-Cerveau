@@ -2667,20 +2667,34 @@ pub(crate) async fn run_gateway_chat_with_tools(
                 zeroclaw_runtime::agent::cost::TurnUsage::default(),
             ))
         });
+        // Cerveau (patch 0028): scope the turn-origin context (session id +
+        // verbatim message) so a `Pending` approval created deep inside this
+        // turn can later be durably resumed — see `TurnOriginContext`'s doc
+        // for why this must be captured now rather than reconstructed after
+        // the fact. Always populated (not gated on `tenant.is_some()`):
+        // cheap to build, and keeps this scope's shape independent of the
+        // tenant overlay's.
+        let turn_origin = std::sync::Arc::new(zeroclaw_runtime::agent::tenant::TurnOriginContext {
+            session_id: session_id.map(str::to_owned),
+            origin_message: message.to_owned(),
+        });
         // Cerveau: scope the tenant overlay (if any) around the turn using
         // the same task-local pattern as the cost-tracking contexts.
         let response = Box::pin(zeroclaw_runtime::agent::tenant::TENANT_CONTEXT.scope(
             tenant,
-            zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
-                turn_usage.clone(),
-                zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
-                    cost_tracking_context,
-                    zeroclaw_runtime::agent::process_message(
-                        config,
-                        &agent_alias,
-                        message,
-                        session_id,
-                        zeroclaw_api::ingress::TurnOrigin::Interactive,
+            zeroclaw_runtime::agent::tenant::TURN_ORIGIN_CONTEXT.scope(
+                Some(turn_origin),
+                zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
+                    turn_usage.clone(),
+                    zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                        cost_tracking_context,
+                        zeroclaw_runtime::agent::process_message(
+                            config,
+                            &agent_alias,
+                            message,
+                            session_id,
+                            zeroclaw_api::ingress::TurnOrigin::Interactive,
+                        ),
                     ),
                 ),
             ),
