@@ -198,7 +198,27 @@ pub(crate) async fn resolve_and_continue_tenant_approval(
 
     let prompt = continuation_prompt(row, decision, tool_result.as_ref());
     let reply_text = match run_continuation(state, row, prompt).await {
-        Ok(text) => Some(text),
+        Ok(text) => {
+            // Patch 0032: mark delivered now that the reply is actually
+            // about to be handed back in this response — this is what
+            // makes an interrupted-before-here row (daemon restart between
+            // the line above and the caller receiving these bytes) a
+            // genuine reaper candidate, and a normally-completed one not.
+            if let Err(e) = store.mark_delivered(&row.id) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "pending_id": row.id,
+                            "error": format!("{e:#}"),
+                        })),
+                    "approval resume: mark_delivered failed after a successful reply — the \
+                     reaper may attempt a harmless redundant redelivery for this row later"
+                );
+            }
+            Some(text)
+        }
         Err(e) => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -349,7 +369,6 @@ async fn run_continuation(state: &AppState, row: &PendingApproval, prompt: Strin
 /// unreachable endpoint, non-2xx, timeout) rather than retrying — retrying
 /// a failed redelivery is the reaper's own job on its next sweep, not
 /// this function's.
-#[allow(dead_code)]
 pub(crate) async fn redeliver_resume_reply(
     state: &AppState,
     row: &PendingApproval,
@@ -391,6 +410,160 @@ pub(crate) async fn redeliver_resume_reply(
     Ok(())
 }
 
+/// Cerveau (patch 0032): a resolved row is skipped from this sweep until
+/// it's been sitting undelivered for at least this long — a row resolved
+/// moments ago is far more likely a live, still-in-flight synchronous
+/// resolve call than a genuinely stuck one, and racing it would only waste
+/// a redundant continuation turn (harmless, since `mark_delivered` is
+/// idempotent, but still pure waste).
+const REDELIVERY_MIN_AGE: chrono::Duration = chrono::Duration::minutes(2);
+
+/// Cerveau (patch 0032): best-effort periodic sweep for resolved-but-
+/// undelivered approval rows — the restart/redelivery gap this patch
+/// series' own design doc flagged (a daemon restart between a continuation
+/// turn completing and its reply reaching the caller in
+/// `resolve_and_continue_tenant_approval`'s own response). Mirrors
+/// `control_plane::continuation_drive`'s "log, never fail the daemon"
+/// posture for background supervision work — one candidate's failure never
+/// stops the rest, and nothing here is a fatal error.
+pub(crate) async fn sweep_undelivered_approvals(state: &AppState) {
+    let data_dir = state.config.read().data_dir.clone();
+    let store = match zeroclaw_runtime::control_plane::pending_approvals::PendingApprovalsStore::shared(
+        &data_dir,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            log_sweep_note("n/a", "open_store_failed", &format!("{e:#}"));
+            return;
+        }
+    };
+    let candidates = match store.list_undelivered_resolved() {
+        Ok(rows) => rows,
+        Err(e) => {
+            log_sweep_note("n/a", "list_failed", &format!("{e:#}"));
+            return;
+        }
+    };
+
+    let now = chrono::Utc::now();
+    for row in candidates {
+        let old_enough = row
+            .resolved_at
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .is_some_and(|resolved_at| now.signed_duration_since(resolved_at) >= REDELIVERY_MIN_AGE);
+        if !old_enough {
+            continue;
+        }
+        redeliver_one_candidate(state, &store, &row).await;
+    }
+}
+
+async fn redeliver_one_candidate(
+    state: &AppState,
+    store: &zeroclaw_runtime::control_plane::pending_approvals::PendingApprovalsStore,
+    row: &PendingApproval,
+) {
+    let tool_result = if row.status == "approved" {
+        match cached_tool_result(state, row) {
+            Ok(Some(v)) => Some(v),
+            Ok(None) => {
+                // The F-2 ledger has no record at all for this row's tool
+                // call — it never actually ran (the crash happened before
+                // execution even started). Re-executing an irreversible
+                // action unattended, from a background sweep with nobody
+                // immediately able to notice a problem, is a materially
+                // different risk than redelivering a reply for work that's
+                // already done — deliberately NOT attempted here. Left for
+                // operator visibility instead.
+                log_sweep_note(
+                    &row.id,
+                    "tool_never_executed",
+                    "F-2 ledger has no entry for this row's tool call — the decision was \
+                     recorded but the action itself never ran; not auto-executing it from a \
+                     background sweep, needs operator attention",
+                );
+                return;
+            }
+            Err(e) => {
+                log_sweep_note(&row.id, "ledger_check_failed", &format!("{e:#}"));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    let decision = if row.status == "approved" { "approve" } else { "deny" };
+    let prompt = continuation_prompt(row, decision, tool_result.as_ref());
+    let reply_text = match run_continuation(state, row, prompt).await {
+        Ok(text) => text,
+        Err(e) => {
+            log_sweep_note(&row.id, "continuation_failed", &format!("{e:#}"));
+            return;
+        }
+    };
+
+    if let Err(e) = redeliver_resume_reply(state, row, &reply_text).await {
+        log_sweep_note(&row.id, "redelivery_failed", &format!("{e:#}"));
+        return;
+    }
+
+    if let Err(e) = store.mark_delivered(&row.id) {
+        log_sweep_note(&row.id, "mark_delivered_failed", &format!("{e:#}"));
+    }
+}
+
+/// Read-only lookup of a prior tool execution's cached result for an
+/// `approved` row, via [`zeroclaw_runtime::control_plane::tool_idem::ToolIdemLedger::status`]
+/// — deliberately the non-mutating lookup, not `claim()`: this function
+/// must never itself claim (and thereby block any future legitimate
+/// attempt at) a tool call that hasn't actually run yet. `Ok(None)` means
+/// no attempt was ever recorded; `Ok(Some(_))` always carries a result
+/// (an `InFlight` status is treated the same as "not safely reusable" —
+/// see the call site).
+fn cached_tool_result(state: &AppState, row: &PendingApproval) -> anyhow::Result<Option<serde_json::Value>> {
+    let config = state.config.read();
+    let principal = (!row.principal.is_empty()).then_some(row.principal.as_str());
+    let idem_key = zeroclaw_runtime::control_plane::tool_idem::derive_key(
+        principal.unwrap_or(""),
+        &row.id,
+        &row.id,
+        &row.tool_name,
+        &row.arguments,
+    );
+    let ledger = zeroclaw_runtime::control_plane::tool_idem::ToolIdemLedger::shared(&config.data_dir)?;
+    Ok(match ledger.status(&idem_key)? {
+        Some(zeroclaw_runtime::control_plane::tool_idem::Claim::AlreadyDone(output)) => {
+            Some(serde_json::json!({ "success": true, "output": output }))
+        }
+        // InFlight (claimed but never completed) or no record at all are
+        // both "not safely reusable" from this read-only vantage point —
+        // neither proves the tool's real side effect happened.
+        Some(zeroclaw_runtime::control_plane::tool_idem::Claim::InFlight) | None => None,
+        Some(zeroclaw_runtime::control_plane::tool_idem::Claim::Claimed) => {
+            // `status()` never returns `Claimed` (see its own doc — that
+            // variant is only ever produced by `claim()`'s insert path);
+            // unreachable in practice, handled for exhaustiveness only.
+            None
+        }
+    })
+}
+
+fn log_sweep_note(pending_id: &str, kind: &str, detail: &str) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "pending_id": pending_id,
+                "kind": kind,
+                "detail": detail,
+            })),
+        "approval redelivery sweep: notable event"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,6 +590,7 @@ mod tests {
             agent_type: Some("customer_service".into()),
             session_id: Some("sess-1".into()),
             origin_message: Some("please reply to ticket 42".into()),
+            delivered_at: None,
         };
         let result = serde_json::json!({"success": true, "output": "ok"});
         let prompt = continuation_prompt(&row, "approve", Some(&result));
@@ -442,6 +616,7 @@ mod tests {
             agent_type: None,
             session_id: None,
             origin_message: None,
+            delivered_at: None,
         };
         let prompt = continuation_prompt(&row, "deny", None);
         assert!(prompt.contains("declined to approve"));
@@ -468,6 +643,7 @@ mod tests {
             agent_type: None,
             session_id: None,
             origin_message: None,
+            delivered_at: None,
         };
         let err = tenant_selector_for_resume(&row).unwrap_err();
         assert!(err.to_string().contains("no agent_type"));
@@ -489,6 +665,7 @@ mod tests {
             agent_type: Some("customer_service".into()),
             session_id: None,
             origin_message: None,
+            delivered_at: None,
         };
         let err = tenant_selector_for_resume(&row).unwrap_err();
         assert!(err.to_string().contains("no principal"));
@@ -510,6 +687,7 @@ mod tests {
             agent_type: Some("customer_service".into()),
             session_id: Some("sess-1".into()),
             origin_message: Some("hi".into()),
+            delivered_at: None,
         };
         let sel = tenant_selector_for_resume(&row).unwrap();
         assert_eq!(sel.user_id, "u1");

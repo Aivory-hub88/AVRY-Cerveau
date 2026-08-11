@@ -156,6 +156,32 @@ impl ToolIdemLedger {
         Ok(())
     }
 
+    /// Cerveau (patch 0032): read-only lookup — unlike [`claim`](Self::claim),
+    /// never inserts a fresh row for a key nobody holds yet. `None` means no
+    /// attempt has ever been made for this key (deliberately distinct from
+    /// `claim()`'s `Claimed`, which would create one); a caller that only
+    /// wants to know "did this already finish?" without risking claiming an
+    /// execution that was never actually attempted (e.g. a background sweep
+    /// deciding whether it's safe to reuse a cached result, not whether it
+    /// should perform the side effect itself) should use this, not `claim`.
+    pub fn status(&self, key: &str) -> Result<Option<Claim>> {
+        let conn = self.conn.lock();
+        let row: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT status, output FROM tool_idempotency WHERE key = ?1",
+                params![key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            Some((status, output)) if status == "complete" => {
+                Some(Claim::AlreadyDone(output.unwrap_or_default()))
+            }
+            Some(_) => Some(Claim::InFlight),
+            None => None,
+        })
+    }
+
     /// Release a claimed-but-not-completed key so a caller that decided NOT to
     /// proceed (e.g. the tool errored before any side effect) doesn't leave a
     /// permanent `InFlight` tombstone blocking a legitimate retry.
@@ -259,5 +285,33 @@ mod tests {
         l.complete(&k1, "sent to a for t1").unwrap();
         // Different tenant, same shape → independent, still claimable.
         assert_eq!(l.claim(&k2).unwrap(), Claim::Claimed);
+    }
+
+    #[test]
+    fn status_never_claims_an_untouched_key() {
+        let l = ToolIdemLedger::new_in_memory().unwrap();
+        let k = derive_key("t1", "task", "turn", "send_email", "{}");
+        assert_eq!(l.status(&k).unwrap(), None, "no attempt yet — must not fabricate one");
+        // Confirm the lookup truly didn't claim it: a real claim afterward
+        // still sees a fresh Claimed, not InFlight/AlreadyDone from a
+        // phantom row `status` might have inserted.
+        assert_eq!(l.claim(&k).unwrap(), Claim::Claimed);
+    }
+
+    #[test]
+    fn status_reports_in_flight_and_already_done_without_mutating() {
+        let l = ToolIdemLedger::new_in_memory().unwrap();
+        let k = derive_key("t1", "task", "turn", "record_invoice", "{}");
+        l.claim(&k).unwrap();
+        assert_eq!(l.status(&k).unwrap(), Some(Claim::InFlight));
+        // Repeated status() calls while InFlight must not themselves
+        // complete or otherwise change the row.
+        assert_eq!(l.status(&k).unwrap(), Some(Claim::InFlight));
+
+        l.complete(&k, "invoice#9 saved").unwrap();
+        assert_eq!(
+            l.status(&k).unwrap(),
+            Some(Claim::AlreadyDone("invoice#9 saved".into()))
+        );
     }
 }
