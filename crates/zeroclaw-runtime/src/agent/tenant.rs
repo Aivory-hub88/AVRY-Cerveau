@@ -134,6 +134,55 @@ pub fn current_turn_origin() -> Option<Arc<TurnOriginContext>> {
     TURN_ORIGIN_CONTEXT.try_with(std::clone::Clone::clone).ok().flatten()
 }
 
+/// Cerveau (patch 0035): a structured, wire-shape-stable summary of the
+/// `Pending` approval a turn created, if any — what a channel front-end
+/// (e.g. `avry-backend`'s Telegram inline-approval buttons) needs to attach
+/// an "Approve"/"Deny" affordance to a reply, without having to scrape the
+/// id back out of the model's own free-text response.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PendingApprovalSummary {
+    pub id: String,
+    pub tool_name: String,
+    pub risk_tier: String,
+}
+
+tokio::task_local! {
+    /// Write side of [`PendingApprovalSummary`] plumbing. Unlike
+    /// `TENANT_CONTEXT`/`TURN_ORIGIN_CONTEXT` (set once at scope entry,
+    /// read-only thereafter), this cell starts empty and is written to
+    /// *during* the turn by [`record_pending_approval`] (called from deep
+    /// inside `approval_gate::gate_tool_approval`, the only place a
+    /// `Pending` row is ever created) — hence the `Mutex`-wrapped interior
+    /// mutability rather than a plain `Option<Arc<T>>`. `None` when unset
+    /// (no scope) or never written to during a vanilla/non-tenant turn.
+    pub static LAST_PENDING_APPROVAL: Option<Arc<parking_lot::Mutex<Option<PendingApprovalSummary>>>>;
+}
+
+/// Record that this turn's tool call was gated into a durable `Pending`
+/// approval — a no-op (not an error) when the current task was never
+/// scoped with `LAST_PENDING_APPROVAL`, so this is safe to call
+/// unconditionally from `gate_tool_approval` regardless of caller.
+pub fn record_pending_approval(summary: PendingApprovalSummary) {
+    let _ = LAST_PENDING_APPROVAL.try_with(|cell| {
+        if let Some(cell) = cell {
+            *cell.lock() = Some(summary);
+        }
+    });
+}
+
+/// Take (and clear) this turn's recorded pending-approval summary, if any.
+/// "Take" rather than "get": a turn produces at most one HTTP response, so
+/// the value is consumed exactly once by the caller that scoped it — a
+/// second read after that (there shouldn't be one) sees `None`, not stale
+/// data from a previous turn that happened to reuse the same task-local
+/// slot.
+pub fn take_pending_approval() -> Option<PendingApprovalSummary> {
+    LAST_PENDING_APPROVAL
+        .try_with(|cell| cell.as_ref().and_then(|cell| cell.lock().take()))
+        .ok()
+        .flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +229,74 @@ mod tests {
             })
             .await;
         assert!(current_turn_origin().is_none());
+    }
+
+    #[tokio::test]
+    async fn record_pending_approval_outside_any_scope_is_a_safe_noop() {
+        // No panic, no error — just nothing recorded, since there's nowhere
+        // to record it. Mirrors how a non-tenant/CLI turn never scopes this
+        // at all, so `gate_tool_approval` can call this unconditionally.
+        record_pending_approval(PendingApprovalSummary {
+            id: "pa_1".to_string(),
+            tool_name: "STRIPE_FINALIZE_INVOICE".to_string(),
+            risk_tier: "irreversible".to_string(),
+        });
+        assert!(take_pending_approval().is_none());
+    }
+
+    #[tokio::test]
+    async fn scoped_but_untouched_reads_none() {
+        let cell = Arc::new(parking_lot::Mutex::new(None));
+        LAST_PENDING_APPROVAL
+            .scope(Some(cell), async {
+                assert!(take_pending_approval().is_none());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn record_then_take_returns_it_once_and_clears() {
+        let cell = Arc::new(parking_lot::Mutex::new(None));
+        LAST_PENDING_APPROVAL
+            .scope(Some(cell), async {
+                record_pending_approval(PendingApprovalSummary {
+                    id: "pa_42".to_string(),
+                    tool_name: "STRIPE_FINALIZE_INVOICE".to_string(),
+                    risk_tier: "irreversible".to_string(),
+                });
+                let seen = take_pending_approval().expect("recorded summary visible");
+                assert_eq!(seen.id, "pa_42");
+                assert_eq!(seen.tool_name, "STRIPE_FINALIZE_INVOICE");
+                assert_eq!(seen.risk_tier, "irreversible");
+                // Second read is empty — "take", not "get".
+                assert!(take_pending_approval().is_none());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_later_record_overwrites_an_earlier_unread_one() {
+        // Concurrent-tool-call turns (patch 0026's 4.4) can in principle hit
+        // this gate twice in one turn — last-write-wins is the correct,
+        // simple behavior here: the HTTP response can only carry one
+        // pending_approval, and the most recent block is the most relevant
+        // one for a human resolving via the very next message.
+        let cell = Arc::new(parking_lot::Mutex::new(None));
+        LAST_PENDING_APPROVAL
+            .scope(Some(cell), async {
+                record_pending_approval(PendingApprovalSummary {
+                    id: "pa_1".to_string(),
+                    tool_name: "TOOL_A".to_string(),
+                    risk_tier: "irreversible".to_string(),
+                });
+                record_pending_approval(PendingApprovalSummary {
+                    id: "pa_2".to_string(),
+                    tool_name: "TOOL_B".to_string(),
+                    risk_tier: "irreversible".to_string(),
+                });
+                let seen = take_pending_approval().expect("recorded summary visible");
+                assert_eq!(seen.id, "pa_2");
+            })
+            .await;
     }
 }

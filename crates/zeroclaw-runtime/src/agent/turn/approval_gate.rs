@@ -62,6 +62,18 @@ pub(crate) async fn gate_tool_approval(
                 .ok(),
             None => None,
         };
+        if let Some(id) = &pending_id {
+            // Cerveau (patch 0035): surface this structurally to whatever
+            // scoped this turn (e.g. the webhook handler), so a channel
+            // front-end can attach a real approve/deny affordance without
+            // scraping the id back out of the model's own reply text — see
+            // `PendingApprovalSummary`'s doc.
+            crate::agent::tenant::record_pending_approval(crate::agent::tenant::PendingApprovalSummary {
+                id: id.clone(),
+                tool_name: tool_name.to_string(),
+                risk_tier: "irreversible".to_string(),
+            });
+        }
         let message = match &pending_id {
             Some(id) => format!(
                 "Requires human approval before it can run (risk tier: irreversible). \

@@ -2577,6 +2577,13 @@ pub(crate) async fn persist_pairing_tokens(
 /// Result of a gateway chat turn.
 struct GatewayChatOutcome {
     response: String,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cost_usd: Option<f64>,
+    /// Cerveau (patch 0035): set when this turn's tool call was gated into
+    /// a durable `Pending` approval — see
+    /// `zeroclaw_runtime::agent::tenant::PendingApprovalSummary`.
+    pending_approval: Option<zeroclaw_runtime::agent::tenant::PendingApprovalSummary>,
 }
 
 struct UnconfiguredModelProvider;
@@ -2663,7 +2670,13 @@ pub(crate) async fn run_gateway_chat_with_tools(
             .model_provider
             .chat_with_system(None, message, &state.model, state.temperature)
             .await?;
-        Ok(GatewayChatOutcome { response })
+        Ok(GatewayChatOutcome {
+            response,
+            input_tokens: None,
+            output_tokens: None,
+            cost_usd: None,
+            pending_approval: None,
+        })
     }
 
     #[cfg(not(test))]
@@ -2703,29 +2716,57 @@ pub(crate) async fn run_gateway_chat_with_tools(
             session_id: session_id.map(str::to_owned),
             origin_message: message.to_owned(),
         });
+        // Cerveau (patch 0035): a fresh, empty cell for this turn only — see
+        // `LAST_PENDING_APPROVAL`'s doc for why this needs `Mutex`-wrapped
+        // interior mutability rather than the plain `Option<Arc<T>>` shape
+        // `TENANT_CONTEXT`/`TURN_ORIGIN_CONTEXT` use: those are set once at
+        // scope entry, this one is written to (or not) deep inside the turn
+        // by `approval_gate::gate_tool_approval`.
+        let pending_approval_cell = std::sync::Arc::new(parking_lot::Mutex::new(None));
         // Cerveau: scope the tenant overlay (if any) around the turn using
         // the same task-local pattern as the cost-tracking contexts.
         let response = Box::pin(zeroclaw_runtime::agent::tenant::TENANT_CONTEXT.scope(
             tenant,
             zeroclaw_runtime::agent::tenant::TURN_ORIGIN_CONTEXT.scope(
                 Some(turn_origin),
-                zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
-                    turn_usage.clone(),
-                    zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
-                        cost_tracking_context,
-                        zeroclaw_runtime::agent::process_message(
-                            config,
-                            &agent_alias,
-                            message,
-                            session_id,
-                            zeroclaw_api::ingress::TurnOrigin::Interactive,
+                zeroclaw_runtime::agent::tenant::LAST_PENDING_APPROVAL.scope(
+                    Some(pending_approval_cell.clone()),
+                    zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
+                        turn_usage.clone(),
+                        zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                            cost_tracking_context,
+                            zeroclaw_runtime::agent::process_message(
+                                config,
+                                &agent_alias,
+                                message,
+                                session_id,
+                                zeroclaw_api::ingress::TurnOrigin::Interactive,
+                            ),
                         ),
                     ),
                 ),
             ),
         ))
         .await?;
-        Ok(GatewayChatOutcome { response })
+        let usage = turn_usage
+            .map(|cell| *cell.lock())
+            .filter(|usage| usage.input_tokens > 0 || usage.output_tokens > 0);
+        let (input_tokens, output_tokens, cost_usd) = match usage {
+            Some(usage) => (
+                Some(usage.input_tokens),
+                Some(usage.output_tokens),
+                Some(usage.cost_usd),
+            ),
+            None => (None, None, None),
+        };
+        let pending_approval = pending_approval_cell.lock().take();
+        Ok(GatewayChatOutcome {
+            response,
+            input_tokens,
+            output_tokens,
+            cost_usd,
+            pending_approval,
+        })
     }
 }
 
@@ -3148,13 +3189,28 @@ async fn handle_webhook(
     )
     .await
     {
-        Ok(GatewayChatOutcome { response, .. }) => {
+        Ok(GatewayChatOutcome {
+            response,
+            input_tokens,
+            output_tokens,
+            cost_usd,
+            pending_approval,
+        }) => {
             let duration = started_at.elapsed();
             state.observer.record_metric(
                 &zeroclaw_runtime::observability::traits::ObserverMetric::RequestLatency(duration),
             );
 
-            let body = serde_json::json!({"response": response, "model": model_label});
+            // Cerveau (patch 0035): additive field, `null` on every turn
+            // that didn't hit a Pending approval — every existing caller
+            // (the bridge's pre-Part-B code, any other integration) is
+            // unaffected since it simply never reads a key it doesn't know
+            // about.
+            let body = serde_json::json!({
+                "response": response,
+                "model": model_label,
+                "pending_approval": pending_approval,
+            });
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
