@@ -85,6 +85,24 @@ pub struct TenantContext {
     /// never block memory/persona/native-tool access) but fail-closed on
     /// the grant itself (never over-grant on an inconclusive read).
     pub connected_toolkits: Vec<String>,
+    /// Cerveau (Part C, per-agent tool-scope toggle): Composio toolkit
+    /// slugs this tenant has explicitly *disabled* via the dashboard's
+    /// Tools tab (`avry-backend`'s `product.agent_tool_scope`, `enabled =
+    /// false` rows), resolved by the gateway. Consumed by
+    /// `Config::mcp_servers_for_agent_and_tenant` /
+    /// `apply_toolkit_scope_gate` (`zeroclaw-config`).
+    ///
+    /// **Opposite fail-direction from `connected_toolkits` above**: this
+    /// list is a denylist, not an allowlist — a server is granted UNLESS
+    /// its slug appears here, matching the dashboard's own "default
+    /// enabled" contract. Empty means "the tenant hasn't disabled
+    /// anything" in both the genuine case and the resolution-failed case
+    /// (fail-open on availability, same reasoning as `connected_toolkits`,
+    /// but here fail-open on availability also happens to be fail-open on
+    /// the grant — an inconclusive read here can only ever under-restrict,
+    /// never over-grant beyond what was already unconditionally true
+    /// before this feature existed).
+    pub disabled_toolkits: Vec<String>,
 }
 
 tokio::task_local! {
@@ -200,6 +218,7 @@ mod tests {
             agent_type: "customer_service".to_string(),
             persona: Some("<operator_config>…</operator_config>".to_string()),
             connected_toolkits: Vec::new(),
+            disabled_toolkits: Vec::new(),
         });
         TENANT_CONTEXT
             .scope(Some(ctx.clone()), async {

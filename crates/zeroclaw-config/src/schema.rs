@@ -4356,12 +4356,14 @@ impl Config {
     /// every connection-gated server, matching this function's existing
     /// fail-closed contract for the other two scoping steps.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn mcp_servers_for_agent_and_tenant(
         &self,
         agent_alias: &str,
         tenant_platform_user_id: Option<&str>,
         tenant_agent_type: Option<&str>,
         tenant_connected_toolkits: Option<&[String]>,
+        tenant_disabled_toolkits: Option<&[String]>,
     ) -> Vec<McpServerConfig> {
         let mut granted = self.mcp_servers_for_agent(agent_alias);
         let tenant_bundle_names = self.mcp_bundle_names_for_tenant(tenant_agent_type);
@@ -4375,6 +4377,7 @@ impl Config {
             .filter_map(|server| apply_tenant_entity_scoping(server, tenant_platform_user_id))
             .filter_map(|server| apply_tenant_workspace_scoping(server, tenant_platform_user_id))
             .filter_map(|server| apply_toolkit_connection_gate(server, tenant_connected_toolkits))
+            .filter_map(|server| apply_toolkit_scope_gate(server, tenant_disabled_toolkits))
             .collect()
     }
 
@@ -11853,6 +11856,45 @@ pub fn apply_toolkit_connection_gate(
         Some(server)
     } else {
         None
+    }
+}
+
+/// Cerveau (Part C, per-agent tool-scope toggle): apply a tenant's own
+/// dashboard "Tools" tab toggles (`avry-backend`'s `product.agent_tool_scope`)
+/// to one `[[mcp.servers]]` entry, if it's scoped at all
+/// (`requires_composio_toolkit` set — the same field
+/// [`apply_toolkit_connection_gate`] reads, deliberately not a new one:
+/// native-bridge/OfficeCLI/Lightpanda/pdf-oxide entries never set it, so
+/// they're automatically exempt from this toggle with no exclusion list to
+/// keep in sync).
+///
+/// **Unlike every other tenant-scoping gate in this module**
+/// (`apply_tenant_entity_scoping`, `apply_tenant_workspace_scoping`,
+/// `apply_toolkit_connection_gate` above — all fail-*closed*, "omission is
+/// not a grant"), this one is deliberately fail-*open*: a scoped server is
+/// granted unless the tenant explicitly disabled it. `tenant_disabled_toolkits`
+/// being `None` (unresolved this turn) or simply not containing this
+/// server's slug both pass the server through unchanged. This mirrors the
+/// dashboard route's own "default enabled" contract — a tenant who has
+/// never opened the Tools tab, or a turn where the resolver's Postgres read
+/// hiccups, must see identical behavior to before this feature existed, not
+/// a silent regression to "nothing" because a disabled-set couldn't be
+/// resolved.
+#[must_use]
+pub fn apply_toolkit_scope_gate(
+    server: McpServerConfig,
+    tenant_disabled_toolkits: Option<&[String]>,
+) -> Option<McpServerConfig> {
+    let Some(slug) = server.requires_composio_toolkit.as_deref() else {
+        return Some(server);
+    };
+    let Some(disabled) = tenant_disabled_toolkits else {
+        return Some(server);
+    };
+    if disabled.iter().any(|t| t.eq_ignore_ascii_case(slug)) {
+        None
+    } else {
+        Some(server)
     }
 }
 
@@ -22901,7 +22943,7 @@ untrusted_outbound_redact = false
         // with no entity to scope it to, never fall back to a shared one.
         let config = config_with_tenant_gated_composio_server();
         let granted: Vec<String> = config
-            .mcp_servers_for_agent_and_tenant("aaatools", None, None, None)
+            .mcp_servers_for_agent_and_tenant("aaatools", None, None, None, None)
             .into_iter()
             .map(|s| s.name)
             .collect();
@@ -22915,7 +22957,8 @@ untrusted_outbound_redact = false
     #[test]
     async fn tenant_gated_mcp_server_gets_entity_scoped_url() {
         let config = config_with_tenant_gated_composio_server();
-        let servers = config.mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"), None, None);
+        let servers =
+            config.mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"), None, None, None);
         let composio = servers
             .iter()
             .find(|s| s.name == "composio")
@@ -22925,7 +22968,10 @@ untrusted_outbound_redact = false
             Some("https://mcp.composio.dev/v1?user_id=u_42"),
             "the platform user id is appended as the configured query param"
         );
-        let n8n = servers.iter().find(|s| s.name == "n8n").expect("n8n server retained");
+        let n8n = servers
+            .iter()
+            .find(|s| s.name == "n8n")
+            .expect("n8n server retained");
         assert_eq!(
             n8n.url, None,
             "an ungated server's url is untouched by tenant scoping"
@@ -22937,7 +22983,8 @@ untrusted_outbound_redact = false
         let mut config = config_with_tenant_gated_composio_server();
         config.mcp.servers[0].url = Some("https://mcp.composio.dev/v1?region=us".to_string());
 
-        let servers = config.mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"), None, None);
+        let servers =
+            config.mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"), None, None, None);
         let composio = servers.iter().find(|s| s.name == "composio").unwrap();
         assert_eq!(
             composio.url.as_deref(),
@@ -22952,7 +22999,7 @@ untrusted_outbound_redact = false
         config.mcp.servers[0].url = Some("not a url".to_string());
 
         let granted: Vec<String> = config
-            .mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"), None, None)
+            .mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"), None, None, None)
             .into_iter()
             .map(|s| s.name)
             .collect();
@@ -23048,12 +23095,18 @@ untrusted_outbound_redact = false
         config.agent_type_mcp_bundles.insert(
             "finance_invoice_ops".to_string(),
             TenantMcpBundleConfig {
-                bundles: vec!["finance-invoice-ops-stripe".to_string(), "shared-ops".to_string()],
+                bundles: vec![
+                    "finance-invoice-ops-stripe".to_string(),
+                    "shared-ops".to_string(),
+                ],
             },
         );
         assert_eq!(
             config.mcp_bundle_names_for_tenant(Some("finance_invoice_ops")),
-            vec!["finance-invoice-ops-stripe".to_string(), "shared-ops".to_string()]
+            vec![
+                "finance-invoice-ops-stripe".to_string(),
+                "shared-ops".to_string()
+            ]
         );
     }
 
@@ -23063,7 +23116,10 @@ untrusted_outbound_redact = false
         assert_eq!(config.tool_risk_tier("tool_search"), ToolRiskTier::Safe);
         assert_eq!(config.tool_risk_tier("file_read"), ToolRiskTier::Safe);
         assert_eq!(config.tool_risk_tier("shell"), ToolRiskTier::Reversible);
-        assert_eq!(config.tool_risk_tier("file_write"), ToolRiskTier::Reversible);
+        assert_eq!(
+            config.tool_risk_tier("file_write"),
+            ToolRiskTier::Reversible
+        );
     }
 
     #[test]
@@ -23155,6 +23211,7 @@ untrusted_outbound_redact = false
                 Some("u_42"),
                 Some("finance_invoice_ops"),
                 None,
+                None,
             )
             .into_iter()
             .map(|s| s.name)
@@ -23167,6 +23224,94 @@ untrusted_outbound_redact = false
         );
     }
 
+    // ── apply_toolkit_scope_gate: direct unit tests, since its fail-OPEN
+    //    direction is the one deliberate exception to this module's
+    //    otherwise-universal fail-closed convention. ──
+
+    fn stripe_gated_server() -> McpServerConfig {
+        McpServerConfig {
+            name: "composio-stripe".to_string(),
+            requires_composio_toolkit: Some("stripe".to_string()),
+            ..McpServerConfig::default()
+        }
+    }
+
+    #[test]
+    async fn toolkit_scope_gate_passes_through_ungated_servers_regardless_of_disabled_list() {
+        let server = McpServerConfig {
+            name: "native-bridge".to_string(),
+            ..McpServerConfig::default()
+        };
+        let disabled = vec!["stripe".to_string(), "native-bridge".to_string()];
+        assert!(
+            apply_toolkit_scope_gate(server, Some(&disabled)).is_some(),
+            "a server with no requires_composio_toolkit (native-bridge, OfficeCLI, \
+             Lightpanda, pdf-oxide) is never affected by this toggle at all"
+        );
+    }
+
+    #[test]
+    async fn toolkit_scope_gate_grants_when_disabled_list_is_unresolved() {
+        assert!(
+            apply_toolkit_scope_gate(stripe_gated_server(), None).is_some(),
+            "fail-OPEN: an unresolved (None) disabled-set must not silently revoke a \
+             grant that was unconditional before this feature existed"
+        );
+    }
+
+    #[test]
+    async fn toolkit_scope_gate_grants_when_not_in_the_disabled_list() {
+        let disabled = vec!["zendesk".to_string()];
+        assert!(apply_toolkit_scope_gate(stripe_gated_server(), Some(&disabled)).is_some());
+    }
+
+    #[test]
+    async fn toolkit_scope_gate_drops_when_explicitly_disabled() {
+        let disabled = vec!["stripe".to_string()];
+        assert!(
+            apply_toolkit_scope_gate(stripe_gated_server(), Some(&disabled)).is_none(),
+            "the one case this gate exists for: a tenant's own explicit toggle-off"
+        );
+    }
+
+    #[test]
+    async fn toolkit_scope_gate_match_is_case_insensitive() {
+        let disabled = vec!["STRIPE".to_string()];
+        assert!(apply_toolkit_scope_gate(stripe_gated_server(), Some(&disabled)).is_none());
+    }
+
+    #[test]
+    async fn mcp_servers_for_agent_and_tenant_respects_a_disabled_toolkit() {
+        // Uses config_with_connection_gated_stripe_server() (defined below,
+        // near the connection-gate tests) rather than
+        // config_with_agent_type_gated_stripe_server() — the latter's
+        // server never sets requires_composio_toolkit at all, so it isn't
+        // scope-gate-able in the first place; this one carries both a
+        // Stripe server AND an always-on native-bridge server side by side,
+        // which is exactly the case worth proving: the toggle affects only
+        // the scoped server, never collaterally drops the unconditional one.
+        let config = config_with_connection_gated_stripe_server();
+        let disabled = vec!["stripe".to_string()];
+        let granted: Vec<String> = config
+            .mcp_servers_for_agent_and_tenant(
+                "aaatools",
+                Some("u_42"),
+                Some("finance_invoice_ops"),
+                None,
+                Some(&disabled),
+            )
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            granted,
+            vec!["aivory-native-finance-invoice-ops"],
+            "end-to-end: a tenant who disabled Stripe via the Tools tab gets it excluded \
+             from mcp_servers_for_agent_and_tenant's actual output, while the always-on \
+             native-bridge server (never requires_composio_toolkit-gated) is unaffected"
+        );
+    }
+
     #[test]
     async fn mcp_servers_for_agent_and_tenant_isolates_by_agent_type() {
         let config = config_with_agent_type_gated_stripe_server();
@@ -23174,6 +23319,7 @@ untrusted_outbound_redact = false
             "aaatools",
             Some("u_42"),
             Some("customer_service"),
+            None,
             None,
         );
         assert!(
@@ -23187,7 +23333,7 @@ untrusted_outbound_redact = false
     async fn mcp_servers_for_agent_and_tenant_vanilla_turn_gets_no_agent_type_grant() {
         let config = config_with_agent_type_gated_stripe_server();
         let granted =
-            config.mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"), None, None);
+            config.mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"), None, None, None);
         assert!(
             granted.is_empty(),
             "a turn with no agent_type at all (vanilla or type omitted) gets none of \
@@ -23224,6 +23370,7 @@ untrusted_outbound_redact = false
             "aaatools",
             Some("u_42"),
             Some("finance_invoice_ops"),
+            None,
             None,
         );
         assert_eq!(
@@ -23289,6 +23436,7 @@ untrusted_outbound_redact = false
                 Some("u_42"),
                 Some("finance_invoice_ops"),
                 Some(&[]),
+                None,
             )
             .into_iter()
             .map(|s| s.name)
@@ -23311,6 +23459,7 @@ untrusted_outbound_redact = false
                 Some("u_42"),
                 Some("finance_invoice_ops"),
                 Some(&["stripe".to_string()]),
+                None,
             )
             .into_iter()
             .map(|s| s.name)
@@ -23330,7 +23479,13 @@ untrusted_outbound_redact = false
     async fn connection_gated_server_dropped_on_vanilla_turn() {
         let config = config_with_connection_gated_stripe_server();
         let granted: Vec<String> = config
-            .mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"), Some("finance_invoice_ops"), None)
+            .mcp_servers_for_agent_and_tenant(
+                "aaatools",
+                Some("u_42"),
+                Some("finance_invoice_ops"),
+                None,
+                None,
+            )
             .into_iter()
             .map(|s| s.name)
             .collect();
@@ -23352,6 +23507,7 @@ untrusted_outbound_redact = false
                 Some("u_42"),
                 Some("finance_invoice_ops"),
                 Some(&["STRIPE".to_string()]),
+                None,
             )
             .into_iter()
             .map(|s| s.name)

@@ -3148,10 +3148,15 @@ async fn handle_webhook(
                     // `ToolkitConnectionResolver::resolve`'s doc comment.
                     let connected_toolkits =
                         tenant::ToolkitConnectionResolver::global().resolve(&sel.user_id).await;
+                    // Part C: the dashboard Tools-tab denylist, resolved the
+                    // same non-rejecting way — see
+                    // `AgentToolScopeResolver::resolve`'s doc comment.
+                    let disabled_toolkits = tenant::AgentToolScopeResolver::global().resolve(&sel).await;
                     Some(tenant::build_tenant_context(
                         &sel,
                         persona.as_deref(),
                         connected_toolkits,
+                        disabled_toolkits,
                     ))
                 }
                 Err(e) => {
