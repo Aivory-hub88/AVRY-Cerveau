@@ -275,6 +275,7 @@ impl ScopedToolRegistry {
                 tenant.as_deref().map(|t| t.platform_user_id.as_str()),
                 tenant.as_deref().map(|t| t.agent_type.as_str()),
                 tenant.as_deref().map(|t| t.connected_toolkits.as_slice()),
+                tenant.as_deref().map(|t| t.disabled_toolkits.as_slice()),
             )
         } else {
             Vec::new()

@@ -38,7 +38,10 @@ use zeroclaw_runtime::control_plane::pending_approvals::PendingApproval;
 use zeroclaw_runtime::security::pairing::constant_time_eq;
 
 use crate::AppState;
-use crate::tenant::{TenantResolver, TenantSelector, ToolkitConnectionResolver, build_tenant_context};
+use crate::tenant::{
+    AgentToolScopeResolver, TenantResolver, TenantSelector, ToolkitConnectionResolver,
+    build_tenant_context,
+};
 
 type JsonErr = (StatusCode, Json<serde_json::Value>);
 
@@ -307,7 +310,8 @@ async fn run_continuation(state: &AppState, row: &PendingApproval, prompt: Strin
 
     let persona = TenantResolver::global().resolve(&sel).await?;
     let connected_toolkits = ToolkitConnectionResolver::global().resolve(&sel.user_id).await;
-    let tenant_ctx = build_tenant_context(&sel, persona.as_deref(), connected_toolkits);
+    let disabled_toolkits = AgentToolScopeResolver::global().resolve(&sel).await;
+    let tenant_ctx = build_tenant_context(&sel, persona.as_deref(), connected_toolkits, disabled_toolkits);
 
     let turn_origin = Arc::new(zeroclaw_runtime::agent::tenant::TurnOriginContext {
         session_id: row.session_id.clone(),

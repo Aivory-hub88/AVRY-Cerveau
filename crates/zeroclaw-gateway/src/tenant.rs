@@ -305,10 +305,16 @@ pub fn render_persona_block(persona: &TenantPersona) -> Option<String> {
 /// [`ToolkitConnectionResolver`], or an empty `Vec` (never a hard failure;
 /// see that resolver's doc comment for the fail-open-on-availability /
 /// fail-closed-on-grant rationale).
+///
+/// `disabled_toolkits` — Composio toolkit slugs resolved by
+/// [`AgentToolScopeResolver`], same fail-open-on-availability shape but the
+/// opposite grant direction (a denylist, not an allowlist — see
+/// `TenantContext::disabled_toolkits`'s doc).
 pub fn build_tenant_context(
     sel: &TenantSelector,
     persona: Option<&TenantPersona>,
     connected_toolkits: Vec<String>,
+    disabled_toolkits: Vec<String>,
 ) -> Arc<TenantContext> {
     Arc::new(TenantContext {
         tenant_id: sel.tenant_id(),
@@ -316,6 +322,7 @@ pub fn build_tenant_context(
         agent_type: sel.agent_type.clone(),
         persona: persona.and_then(render_persona_block),
         connected_toolkits,
+        disabled_toolkits,
     })
 }
 
@@ -458,6 +465,136 @@ fn query_connected_toolkits(db_url: &str, user_id: &str) -> anyhow::Result<Vec<S
     Ok(rows.iter().map(|r| r.get(0)).collect())
 }
 
+/// Read-only resolver for which Composio toolkits a tenant has explicitly
+/// *disabled* via the dashboard's per-agent Tools tab
+/// (`avry-backend`'s `product.agent_tool_scope`, `enabled = false` rows).
+/// Same bounded-TTL'd-LRU-over-Postgres shape as [`ToolkitConnectionResolver`]
+/// — including sharing its `CERVEAU_TENANT_DB_URL`/`DATABASE_URL` fallback
+/// and negative-caching a genuinely-empty result the same way — but keyed by
+/// the *tenant id* (`<user_id>.<agent_type>`), not `platform_user_id` alone:
+/// the scope toggle is per-agent-type (a tenant might disable Zendesk for
+/// `customer_service` while never having it in the first place for any
+/// other agent type), unlike a Composio connection which is per-platform-
+/// user and shared across every agent type.
+///
+/// Deliberately does not return `Result`, same reasoning as
+/// `ToolkitConnectionResolver::resolve` — see that doc comment. The
+/// opposite grant-direction of the result (a denylist here, an allowlist
+/// there) makes fail-open-on-availability doubly safe for this resolver
+/// specifically: an inconclusive read can only ever under-restrict back to
+/// "as if the tenant never opened the Tools tab", never over-grant beyond
+/// what was already unconditionally true before this feature existed.
+pub struct AgentToolScopeResolver {
+    db_url: Option<String>,
+    cache: Mutex<LruCache<String, ToolkitCacheEntry>>,
+}
+
+impl AgentToolScopeResolver {
+    fn new() -> Self {
+        let db_url = std::env::var("CERVEAU_TENANT_DB_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        Self {
+            db_url,
+            cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(CACHE_CAP).expect("cache cap is non-zero"),
+            )),
+        }
+    }
+
+    /// Process-wide resolver instance.
+    pub fn global() -> &'static AgentToolScopeResolver {
+        static GLOBAL: OnceLock<AgentToolScopeResolver> = OnceLock::new();
+        GLOBAL.get_or_init(AgentToolScopeResolver::new)
+    }
+
+    /// Resolve the disabled-toolkit slugs for one tenant (`user_id` +
+    /// `agent_type`), consulting the cache first. See the struct doc for
+    /// why this never propagates a hard error.
+    pub async fn resolve(&self, sel: &TenantSelector) -> Vec<String> {
+        let key = sel.tenant_id();
+        {
+            let mut cache = self.cache.lock();
+            match cache.get(&key) {
+                Some(ToolkitCacheEntry::Hit(at, toolkits)) if at.elapsed() < TTL_HIT => {
+                    return (**toolkits).clone();
+                }
+                Some(ToolkitCacheEntry::Miss(at)) if at.elapsed() < TTL_MISS => {
+                    return Vec::new();
+                }
+                _ => {}
+            }
+        }
+
+        let Some(db_url) = self.db_url.clone() else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "agent tool-scope resolution unavailable: CERVEAU_TENANT_DB_URL/DATABASE_URL \
+                 not set — treating as no disabled toolkits for this turn"
+            );
+            let mut cache = self.cache.lock();
+            cache.put(key, ToolkitCacheEntry::Miss(Instant::now()));
+            return Vec::new();
+        };
+        let user_id = sel.user_id.clone();
+        let agent_type = sel.agent_type.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            query_disabled_toolkits(&db_url, &user_id, &agent_type)
+        })
+        .await;
+
+        let toolkits = match result {
+            Ok(Ok(toolkits)) => toolkits,
+            Ok(Err(e)) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{e:#}")})),
+                    "agent tool-scope query failed — treating as no disabled toolkits for this turn"
+                );
+                Vec::new()
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "agent tool-scope resolver task panicked — treating as no disabled toolkits for this turn"
+                );
+                Vec::new()
+            }
+        };
+
+        let mut cache = self.cache.lock();
+        if toolkits.is_empty() {
+            cache.put(key, ToolkitCacheEntry::Miss(Instant::now()));
+        } else {
+            cache.put(
+                key,
+                ToolkitCacheEntry::Hit(Instant::now(), Arc::new(toolkits.clone())),
+            );
+        }
+        toolkits
+    }
+}
+
+fn query_disabled_toolkits(db_url: &str, user_id: &str, agent_type: &str) -> anyhow::Result<Vec<String>> {
+    use postgres::{Client, NoTls};
+    let mut client = Client::connect(db_url, NoTls)?;
+    let rows = client.query(
+        "SELECT toolkit_slug FROM product.agent_tool_scope \
+         WHERE user_id = $1 AND agent_type = $2 AND enabled = false",
+        &[&user_id, &agent_type],
+    )?;
+    Ok(rows.iter().map(|r| r.get(0)).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,7 +671,7 @@ mod tests {
             user_id: "user_d09".to_string(),
             agent_type: "cs".to_string(),
         };
-        let ctx = build_tenant_context(&sel, None, Vec::new());
+        let ctx = build_tenant_context(&sel, None, Vec::new(), Vec::new());
         assert_eq!(ctx.platform_user_id, "user_d09");
         assert_eq!(ctx.tenant_id, "user_d09.cs");
         assert_ne!(ctx.platform_user_id, ctx.tenant_id);
@@ -546,7 +683,7 @@ mod tests {
             user_id: "user_d09".to_string(),
             agent_type: "finance_invoice_ops".to_string(),
         };
-        let ctx = build_tenant_context(&sel, None, Vec::new());
+        let ctx = build_tenant_context(&sel, None, Vec::new(), Vec::new());
         assert_eq!(ctx.agent_type, "finance_invoice_ops");
     }
 
@@ -556,7 +693,7 @@ mod tests {
             user_id: "user_d09".to_string(),
             agent_type: "finance_invoice_ops".to_string(),
         };
-        let ctx = build_tenant_context(&sel, None, vec!["stripe".to_string()]);
+        let ctx = build_tenant_context(&sel, None, vec!["stripe".to_string()], Vec::new());
         assert_eq!(ctx.connected_toolkits, vec!["stripe".to_string()]);
     }
 
@@ -566,11 +703,39 @@ mod tests {
             user_id: "user_d09".to_string(),
             agent_type: "customer_service".to_string(),
         };
-        let ctx = build_tenant_context(&sel, None, Vec::new());
+        let ctx = build_tenant_context(&sel, None, Vec::new(), Vec::new());
         assert!(
             ctx.connected_toolkits.is_empty(),
             "no resolved connections (genuine absence or a fail-open resolution failure) \
              both collapse to empty — never a default/fallback grant"
+        );
+    }
+
+    #[test]
+    fn tenant_context_carries_resolved_disabled_toolkits_through() {
+        let sel = TenantSelector {
+            user_id: "user_d09".to_string(),
+            agent_type: "customer_service".to_string(),
+        };
+        let ctx = build_tenant_context(&sel, None, Vec::new(), vec!["zendesk".to_string()]);
+        assert_eq!(ctx.disabled_toolkits, vec!["zendesk".to_string()]);
+    }
+
+    #[test]
+    fn tenant_context_defaults_to_no_disabled_toolkits() {
+        // Opposite grant direction from connected_toolkits, but the same
+        // "resolution unavailable collapses to empty" contract — here that
+        // means "as if the tenant never opened the Tools tab", i.e. every
+        // scoped server stays granted, not the reverse.
+        let sel = TenantSelector {
+            user_id: "user_d09".to_string(),
+            agent_type: "customer_service".to_string(),
+        };
+        let ctx = build_tenant_context(&sel, None, Vec::new(), Vec::new());
+        assert!(
+            ctx.disabled_toolkits.is_empty(),
+            "no resolved disabled toolkits (genuine absence or a fail-open resolution \
+             failure) both collapse to empty — never disables anything by default"
         );
     }
 }
