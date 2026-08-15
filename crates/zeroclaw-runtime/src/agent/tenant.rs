@@ -145,53 +145,66 @@ pub struct TenantCustomMcpServer {
 
 /// Tool-name prefix a tenant custom MCP server's tools carry, distinct from
 /// any curated (`[[mcp.servers]]`) server name — both the collision-safety
-/// margin `TenantContext::custom_mcp_server_configs` relies on and the
-/// non-bypassable marker `TenantContext::is_tenant_custom_mcp_tool` checks
-/// for. No curated Aivory server uses this prefix.
-const TENANT_CUSTOM_MCP_NAME_PREFIX: &str = "tenant_";
+/// margin `custom_mcp_server_configs` relies on and the non-bypassable
+/// marker `TenantContext::is_tenant_custom_mcp_tool` checks for. No curated
+/// Aivory server uses this prefix.
+pub const TENANT_CUSTOM_MCP_NAME_PREFIX: &str = "tenant_";
+
+/// Synthesizes a real `McpServerConfig` per registered server, always with
+/// `guarded_transport: true` (SSRF-guarded DNS-pinned transport — see
+/// `zeroclaw_tools::guarded_resolve`'s module docs) and a name prefixed with
+/// [`TENANT_CUSTOM_MCP_NAME_PREFIX`] so the resulting `<server>__<tool>`
+/// tool names are both visually unmistakable as tenant-supplied in
+/// logs/traces and structurally distinct from any curated server name —
+/// never set directly from `[[mcp.servers]]`, so no config collision is
+/// possible either.
+///
+/// A free function (not just `TenantContext::custom_mcp_server_configs`,
+/// which delegates here) because `zeroclaw-gateway`'s out-of-band approval
+/// executor (`api_approvals::execute_approved_tool`) needs this exact
+/// conversion too, resolving a *single* server by name from a fresh
+/// `TenantCustomMcpResolver` call rather than from a live `TenantContext` —
+/// there is no task-local tenant scope in that out-of-band code path.
+pub fn tenant_custom_mcp_server_configs(
+    servers: &[TenantCustomMcpServer],
+) -> Vec<zeroclaw_config::schema::McpServerConfig> {
+    use zeroclaw_config::schema::{McpServerConfig, McpTransport};
+
+    servers
+        .iter()
+        .map(|server| {
+            let mut headers = std::collections::HashMap::new();
+            if let (Some(name), Some(value)) = (&server.auth_header_name, &server.auth_header_value)
+            {
+                headers.insert(name.clone(), value.clone());
+            }
+            McpServerConfig {
+                name: format!("{TENANT_CUSTOM_MCP_NAME_PREFIX}{}", server.name),
+                transport: if server.transport == "sse" {
+                    McpTransport::Sse
+                } else {
+                    McpTransport::Http
+                },
+                url: Some(server.url.clone()),
+                headers,
+                // ADR-006 §B4 item 7: bounded per-call runtime, independent
+                // of whatever a curated server's own config allows — a
+                // tenant-supplied tool must not consume the turn's whole
+                // budget. `guarded_resolve::GUARDED_TOTAL_TIMEOUT` (30s)
+                // already enforces this at the transport layer; this is
+                // belt-and-suspenders at the MCP-client-timeout layer too.
+                tool_timeout_secs: Some(30),
+                guarded_transport: true,
+                ..Default::default()
+            }
+        })
+        .collect()
+}
 
 impl TenantContext {
-    /// Synthesizes a real `McpServerConfig` per registered server, always
-    /// with `guarded_transport: true` (SSRF-guarded DNS-pinned transport —
-    /// see `zeroclaw_tools::guarded_resolve`'s module docs) and a name
-    /// prefixed with [`TENANT_CUSTOM_MCP_NAME_PREFIX`] so the resulting
-    /// `<server>__<tool>` tool names are both visually unmistakable as
-    /// tenant-supplied in logs/traces and structurally distinct from any
-    /// curated server name — never set directly from `[[mcp.servers]]`, so
-    /// no config collision is possible either.
+    /// See [`tenant_custom_mcp_server_configs`].
     pub fn custom_mcp_server_configs(&self) -> Vec<zeroclaw_config::schema::McpServerConfig> {
-        use zeroclaw_config::schema::{McpServerConfig, McpTransport};
-
-        self.tenant_custom_mcp_servers
-            .iter()
-            .map(|server| {
-                let mut headers = std::collections::HashMap::new();
-                if let (Some(name), Some(value)) =
-                    (&server.auth_header_name, &server.auth_header_value)
-                {
-                    headers.insert(name.clone(), value.clone());
-                }
-                McpServerConfig {
-                    name: format!("{TENANT_CUSTOM_MCP_NAME_PREFIX}{}", server.name),
-                    transport: if server.transport == "sse" {
-                        McpTransport::Sse
-                    } else {
-                        McpTransport::Http
-                    },
-                    url: Some(server.url.clone()),
-                    headers,
-                    // ADR-006 §B4 item 7: bounded per-call runtime, independent
-                    // of whatever a curated server's own config allows — a
-                    // tenant-supplied tool must not consume the turn's whole
-                    // budget. `guarded_resolve::GUARDED_TOTAL_TIMEOUT` (30s)
-                    // already enforces this at the transport layer; this is
-                    // belt-and-suspenders at the MCP-client-timeout layer too.
-                    tool_timeout_secs: Some(30),
-                    guarded_transport: true,
-                    ..Default::default()
-                }
-            })
-            .collect()
+        tenant_custom_mcp_server_configs(&self.tenant_custom_mcp_servers)
     }
 
     /// True if `tool_name` originates from one of this tenant's own custom

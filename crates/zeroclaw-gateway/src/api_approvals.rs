@@ -42,7 +42,11 @@ fn disabled(reason: &str) -> JsonErr {
 /// duplicates this from `handle_admin_reload` (see that file's own doc
 /// comment); this fork's convention is each admin-style surface stays
 /// self-contained here, not layered through a shared indirection.
-fn authorize(state: &AppState, peer: &SocketAddr, headers: &HeaderMap) -> Result<&'static str, JsonErr> {
+fn authorize(
+    state: &AppState,
+    peer: &SocketAddr,
+    headers: &HeaderMap,
+) -> Result<&'static str, JsonErr> {
     let allow_remote = state.config.read().gateway.allow_remote_admin;
     let require_pairing = state.pairing.require_pairing();
     match admin_reload_gate(peer.ip().is_loopback(), allow_remote, require_pairing) {
@@ -67,7 +71,9 @@ pub struct ListQuery {
     status: Option<String>,
 }
 
-fn pending_approval_json(row: &zeroclaw_runtime::control_plane::pending_approvals::PendingApproval) -> serde_json::Value {
+fn pending_approval_json(
+    row: &zeroclaw_runtime::control_plane::pending_approvals::PendingApproval,
+) -> serde_json::Value {
     serde_json::json!({
         "id": row.id,
         "principal": row.principal,
@@ -198,6 +204,42 @@ pub async fn handle_resolve_approval(
 /// for the loopback-admin and tenant-scoped-resume paths; only what happens
 /// after execution differs (nothing further here vs. a continuation turn
 /// there).
+/// ADR-006 Part B fallback for [`execute_approved_tool`]: re-resolves a
+/// tenant custom MCP server directly from `row.principal`/`row.agent_type`
+/// (the same authenticated source of truth a live turn's tenant scoping
+/// already trusts, never agent/LLM output) when `server_name` isn't a
+/// curated `[[mcp.servers]]` entry. Returns `None` for anything that isn't
+/// even shaped like a tenant custom server name (missing the
+/// `tenant_`-prefix), a row with no `agent_type`/`principal` (can't
+/// meaningfully resolve — pre-dates patch 0028's context columns, or a
+/// loopback/CLI-created row), or a resolver miss (server was deleted,
+/// disabled, or never verified) — all of which fall through to
+/// `execute_approved_tool`'s own "no such server" error.
+async fn resolve_tenant_custom_server_config(
+    row: &zeroclaw_runtime::control_plane::pending_approvals::PendingApproval,
+    server_name: &str,
+) -> Option<zeroclaw_config::schema::McpServerConfig> {
+    let tenant_name =
+        server_name.strip_prefix(zeroclaw_runtime::agent::tenant::TENANT_CUSTOM_MCP_NAME_PREFIX)?;
+    let agent_type = row.agent_type.as_deref()?;
+    if row.principal.is_empty() {
+        return None;
+    }
+    let sel = crate::tenant::TenantSelector {
+        user_id: row.principal.clone(),
+        agent_type: agent_type.to_string(),
+    };
+    let servers = crate::tenant::TenantCustomMcpResolver::global()
+        .resolve(&sel)
+        .await;
+    let matched = servers.into_iter().find(|s| s.name == tenant_name)?;
+    zeroclaw_runtime::agent::tenant::tenant_custom_mcp_server_configs(std::slice::from_ref(
+        &matched,
+    ))
+    .into_iter()
+    .next()
+}
+
 pub(crate) async fn execute_approved_tool(
     state: &AppState,
     row: &zeroclaw_runtime::control_plane::pending_approvals::PendingApproval,
@@ -214,8 +256,23 @@ pub(crate) async fn execute_approved_tool(
     };
 
     let config = state.config.read().clone();
-    let Some(server_config) = config.mcp.servers.iter().find(|s| s.name == server_name).cloned()
-    else {
+    let server_config = match config
+        .mcp
+        .servers
+        .iter()
+        .find(|s| s.name == server_name)
+        .cloned()
+    {
+        Some(s) => Some(s),
+        // ADR-006 Part B: a tenant custom MCP server is never written into
+        // `config.mcp.servers` — it's synthesized fresh per-turn from
+        // `TenantCustomMcpResolver`. This out-of-band executor has no live
+        // `TenantContext` to read from (it runs off a stored row, not a
+        // task-local turn), so on a static-config miss it re-resolves
+        // directly here instead.
+        None => resolve_tenant_custom_server_config(row, server_name).await,
+    };
+    let Some(server_config) = server_config else {
         return serde_json::json!({
             "success": false,
             "error": format!("no [[mcp.servers]] entry named '{server_name}' in current config"),
@@ -230,16 +287,15 @@ pub(crate) async fn execute_approved_tool(
         });
     };
 
-    let arguments: serde_json::Value =
-        match serde_json::from_str(&row.arguments) {
-            Ok(v) => v,
-            Err(e) => {
-                return serde_json::json!({
-                    "success": false,
-                    "error": format!("stored arguments are not valid JSON: {e}"),
-                });
-            }
-        };
+    let arguments: serde_json::Value = match serde_json::from_str(&row.arguments) {
+        Ok(v) => v,
+        Err(e) => {
+            return serde_json::json!({
+                "success": false,
+                "error": format!("stored arguments are not valid JSON: {e}"),
+            });
+        }
+    };
 
     // F-2: claim before executing, same as the live turn path would have —
     // an operator double-clicking "approve" (or a retried POST) must not
@@ -281,17 +337,17 @@ pub(crate) async fn execute_approved_tool(
         }
     }
 
-    let registry = match zeroclaw_tools::mcp_client::McpRegistry::connect_all(&[scoped_server]).await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = ledger.release(&idem_key);
-            return serde_json::json!({
-                "success": false,
-                "error": format!("could not connect to MCP server '{server_name}': {e}"),
-            });
-        }
-    };
+    let registry =
+        match zeroclaw_tools::mcp_client::McpRegistry::connect_all(&[scoped_server]).await {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = ledger.release(&idem_key);
+                return serde_json::json!({
+                    "success": false,
+                    "error": format!("could not connect to MCP server '{server_name}': {e}"),
+                });
+            }
+        };
     match registry.call_tool(&row.tool_name, arguments).await {
         Ok(output) => {
             let _ = ledger.complete(&idem_key, &output);
@@ -301,5 +357,68 @@ pub(crate) async fn execute_approved_tool(
             let _ = ledger.release(&idem_key);
             serde_json::json!({ "success": false, "error": e.to_string() })
         }
+    }
+}
+
+#[cfg(test)]
+mod tenant_custom_fallback_tests {
+    use super::*;
+    use zeroclaw_runtime::control_plane::pending_approvals::PendingApproval;
+
+    fn base_row() -> PendingApproval {
+        PendingApproval {
+            id: "pa_test".to_string(),
+            principal: "u_test".to_string(),
+            tool_name: "tenant_orders__get_current_time".to_string(),
+            arguments: "{}".to_string(),
+            risk_tier: "irreversible".to_string(),
+            requested_at: "2026-08-15T00:00:00Z".to_string(),
+            status: "approved".to_string(),
+            resolved_at: None,
+            resolved_by: None,
+            tenant_id: Some("u_test.customer_service".to_string()),
+            agent_type: Some("customer_service".to_string()),
+            session_id: None,
+            origin_message: None,
+            delivered_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_none_for_non_tenant_prefixed_name() {
+        // A curated server name never carries the tenant_ prefix — this
+        // path must never be reached for one (the caller only falls back
+        // here on a static-config miss, but the guard is here too as
+        // defense-in-depth against a future caller change).
+        let row = base_row();
+        assert!(
+            resolve_tenant_custom_server_config(&row, "composio-zendesk-support")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn returns_none_when_row_has_no_agent_type() {
+        // Predates patch 0028's context columns, or a loopback/CLI-created
+        // row — nothing to resolve a tenant's custom servers against.
+        let mut row = base_row();
+        row.agent_type = None;
+        assert!(
+            resolve_tenant_custom_server_config(&row, "tenant_orders")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn returns_none_when_row_has_empty_principal() {
+        let mut row = base_row();
+        row.principal = String::new();
+        assert!(
+            resolve_tenant_custom_server_config(&row, "tenant_orders")
+                .await
+                .is_none()
+        );
     }
 }
