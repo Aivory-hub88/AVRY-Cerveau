@@ -103,6 +103,107 @@ pub struct TenantContext {
     /// never over-grant beyond what was already unconditionally true
     /// before this feature existed).
     pub disabled_toolkits: Vec<String>,
+    /// ADR-006 Part B: this tenant's own registered MCP servers
+    /// (`avry-backend`'s `product.tenant_custom_mcp_servers`, `status =
+    /// 'verified'` rows only), resolved by the gateway's
+    /// `TenantCustomMcpResolver` over HTTP (not direct SQL — the AES key
+    /// that decrypts `auth_header_value` lives in exactly one process,
+    /// avry-backend). Empty in both the genuine "tenant has none
+    /// registered" case and the resolution-failed case — same fail-open-
+    /// on-availability posture as `connected_toolkits`/`disabled_toolkits`
+    /// above: an unreachable avry-backend must never block memory/persona/
+    /// native-tool access, and can only ever under-grant here (never
+    /// silently add a server that wasn't actually resolved).
+    ///
+    /// Turned into real `McpServerConfig` entries by
+    /// [`Self::custom_mcp_server_configs`] and appended (not gated — these
+    /// bypass the Composio-specific `apply_toolkit_connection_gate`/
+    /// `apply_toolkit_scope_gate` chain entirely, since they're not
+    /// Composio-sourced) in `Config::mcp_servers_for_agent_and_tenant`.
+    pub tenant_custom_mcp_servers: Vec<TenantCustomMcpServer>,
+}
+
+/// One tenant-registered MCP server, already decrypted and verified —
+/// exactly what avry-backend's internal
+/// `GET /api/v1/tenant-mcp-servers/internal/{user_id}/{agent_type}` route
+/// returns per entry. See [`TenantContext::tenant_custom_mcp_servers`].
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct TenantCustomMcpServer {
+    pub name: String,
+    pub url: String,
+    /// `"streamable-http"` or `"sse"` — matches
+    /// `product.tenant_custom_mcp_servers.transport`'s two allowed values.
+    pub transport: String,
+    pub auth_header_name: Option<String>,
+    pub auth_header_value: Option<String>,
+    /// Always `"irreversible"` today (ADR-006 §B5: admin-only override,
+    /// never tenant-set) — carried through rather than hardcoded here so a
+    /// future Aivory-admin override doesn't require a wire-format change,
+    /// though nothing currently sets it to anything else.
+    pub risk_tier: String,
+}
+
+/// Tool-name prefix a tenant custom MCP server's tools carry, distinct from
+/// any curated (`[[mcp.servers]]`) server name — both the collision-safety
+/// margin `TenantContext::custom_mcp_server_configs` relies on and the
+/// non-bypassable marker `TenantContext::is_tenant_custom_mcp_tool` checks
+/// for. No curated Aivory server uses this prefix.
+const TENANT_CUSTOM_MCP_NAME_PREFIX: &str = "tenant_";
+
+impl TenantContext {
+    /// Synthesizes a real `McpServerConfig` per registered server, always
+    /// with `guarded_transport: true` (SSRF-guarded DNS-pinned transport —
+    /// see `zeroclaw_tools::guarded_resolve`'s module docs) and a name
+    /// prefixed with [`TENANT_CUSTOM_MCP_NAME_PREFIX`] so the resulting
+    /// `<server>__<tool>` tool names are both visually unmistakable as
+    /// tenant-supplied in logs/traces and structurally distinct from any
+    /// curated server name — never set directly from `[[mcp.servers]]`, so
+    /// no config collision is possible either.
+    pub fn custom_mcp_server_configs(&self) -> Vec<zeroclaw_config::schema::McpServerConfig> {
+        use zeroclaw_config::schema::{McpServerConfig, McpTransport};
+
+        self.tenant_custom_mcp_servers
+            .iter()
+            .map(|server| {
+                let mut headers = std::collections::HashMap::new();
+                if let (Some(name), Some(value)) =
+                    (&server.auth_header_name, &server.auth_header_value)
+                {
+                    headers.insert(name.clone(), value.clone());
+                }
+                McpServerConfig {
+                    name: format!("{TENANT_CUSTOM_MCP_NAME_PREFIX}{}", server.name),
+                    transport: if server.transport == "sse" {
+                        McpTransport::Sse
+                    } else {
+                        McpTransport::Http
+                    },
+                    url: Some(server.url.clone()),
+                    headers,
+                    // ADR-006 §B4 item 7: bounded per-call runtime, independent
+                    // of whatever a curated server's own config allows — a
+                    // tenant-supplied tool must not consume the turn's whole
+                    // budget. `guarded_resolve::GUARDED_TOTAL_TIMEOUT` (30s)
+                    // already enforces this at the transport layer; this is
+                    // belt-and-suspenders at the MCP-client-timeout layer too.
+                    tool_timeout_secs: Some(30),
+                    guarded_transport: true,
+                    ..Default::default()
+                }
+            })
+            .collect()
+    }
+
+    /// True if `tool_name` originates from one of this tenant's own custom
+    /// MCP servers — the non-bypassable check
+    /// `crate::approval::ApprovalManager::risk_tier` consults *before*
+    /// anything in `[tool_risk_tiers]`, so no config entry can ever
+    /// downgrade a tenant-supplied tool below `Irreversible` (ADR-006 §B5).
+    pub fn is_tenant_custom_mcp_tool(&self, tool_name: &str) -> bool {
+        self.tenant_custom_mcp_servers.iter().any(|server| {
+            tool_name.starts_with(&format!("{TENANT_CUSTOM_MCP_NAME_PREFIX}{}__", server.name))
+        })
+    }
 }
 
 tokio::task_local! {
@@ -116,7 +217,10 @@ tokio::task_local! {
 /// Returns `None` both when running outside a scoped turn (vanilla
 /// single-operator paths) and when the turn was scoped with `None`.
 pub fn current_tenant() -> Option<Arc<TenantContext>> {
-    TENANT_CONTEXT.try_with(std::clone::Clone::clone).ok().flatten()
+    TENANT_CONTEXT
+        .try_with(std::clone::Clone::clone)
+        .ok()
+        .flatten()
 }
 
 /// Cerveau (F-1-for-approvals, patch 0028): what a later, out-of-band
@@ -149,7 +253,10 @@ tokio::task_local! {
 
 /// The turn-origin context for the current task, if any.
 pub fn current_turn_origin() -> Option<Arc<TurnOriginContext>> {
-    TURN_ORIGIN_CONTEXT.try_with(std::clone::Clone::clone).ok().flatten()
+    TURN_ORIGIN_CONTEXT
+        .try_with(std::clone::Clone::clone)
+        .ok()
+        .flatten()
 }
 
 /// Cerveau (patch 0035): a structured, wire-shape-stable summary of the
@@ -219,6 +326,7 @@ mod tests {
             persona: Some("<operator_config>…</operator_config>".to_string()),
             connected_toolkits: Vec::new(),
             disabled_toolkits: Vec::new(),
+            tenant_custom_mcp_servers: Vec::new(),
         });
         TENANT_CONTEXT
             .scope(Some(ctx.clone()), async {
@@ -227,6 +335,105 @@ mod tests {
             })
             .await;
         assert!(current_tenant().is_none());
+    }
+
+    fn sample_custom_server() -> TenantCustomMcpServer {
+        TenantCustomMcpServer {
+            name: "orders".to_string(),
+            url: "https://tenant.example/mcp".to_string(),
+            transport: "streamable-http".to_string(),
+            auth_header_name: Some("X-Api-Key".to_string()),
+            auth_header_value: Some("secret123".to_string()),
+            risk_tier: "irreversible".to_string(),
+        }
+    }
+
+    #[test]
+    fn custom_mcp_server_configs_sets_guarded_transport_and_prefixed_name() {
+        let ctx = TenantContext {
+            tenant_id: "u1:cs".to_string(),
+            platform_user_id: "u1".to_string(),
+            agent_type: "customer_service".to_string(),
+            persona: None,
+            connected_toolkits: Vec::new(),
+            disabled_toolkits: Vec::new(),
+            tenant_custom_mcp_servers: vec![sample_custom_server()],
+        };
+        let configs = ctx.custom_mcp_server_configs();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].name, "tenant_orders");
+        assert!(configs[0].guarded_transport);
+        assert_eq!(
+            configs[0].url.as_deref(),
+            Some("https://tenant.example/mcp")
+        );
+        assert_eq!(
+            configs[0].headers.get("X-Api-Key").map(String::as_str),
+            Some("secret123")
+        );
+    }
+
+    #[test]
+    fn custom_mcp_server_configs_maps_sse_transport() {
+        let mut server = sample_custom_server();
+        server.transport = "sse".to_string();
+        let ctx = TenantContext {
+            tenant_id: "u1:cs".to_string(),
+            platform_user_id: "u1".to_string(),
+            agent_type: "customer_service".to_string(),
+            persona: None,
+            connected_toolkits: Vec::new(),
+            disabled_toolkits: Vec::new(),
+            tenant_custom_mcp_servers: vec![server],
+        };
+        assert_eq!(
+            ctx.custom_mcp_server_configs()[0].transport,
+            zeroclaw_config::schema::McpTransport::Sse
+        );
+    }
+
+    #[test]
+    fn custom_mcp_server_configs_omits_headers_when_no_auth_configured() {
+        let mut server = sample_custom_server();
+        server.auth_header_name = None;
+        server.auth_header_value = None;
+        let ctx = TenantContext {
+            tenant_id: "u1:cs".to_string(),
+            platform_user_id: "u1".to_string(),
+            agent_type: "customer_service".to_string(),
+            persona: None,
+            connected_toolkits: Vec::new(),
+            disabled_toolkits: Vec::new(),
+            tenant_custom_mcp_servers: vec![server],
+        };
+        assert!(ctx.custom_mcp_server_configs()[0].headers.is_empty());
+    }
+
+    #[test]
+    fn is_tenant_custom_mcp_tool_matches_own_prefixed_tools_only() {
+        let ctx = TenantContext {
+            tenant_id: "u1:cs".to_string(),
+            platform_user_id: "u1".to_string(),
+            agent_type: "customer_service".to_string(),
+            persona: None,
+            connected_toolkits: Vec::new(),
+            disabled_toolkits: Vec::new(),
+            tenant_custom_mcp_servers: vec![sample_custom_server()],
+        };
+        assert!(ctx.is_tenant_custom_mcp_tool("tenant_orders__get_order"));
+        assert!(!ctx.is_tenant_custom_mcp_tool("tenant_other__get_order"));
+        assert!(
+            !ctx.is_tenant_custom_mcp_tool(
+                "composio-zendesk-support__ZENDESK_REPLY_ZENDESK_TICKET"
+            )
+        );
+        assert!(!ctx.is_tenant_custom_mcp_tool("shell"));
+        // A tool name that merely starts with the server name but isn't
+        // actually `<prefix><name>__` (no double-underscore boundary) must
+        // not match — guards against a tenant naming their server e.g.
+        // "orders_evil" and colliding with "tenant_orders__..." by prefix
+        // alone.
+        assert!(!ctx.is_tenant_custom_mcp_tool("tenant_orders_evil__whatever"));
     }
 
     #[tokio::test]

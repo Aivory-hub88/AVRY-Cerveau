@@ -4428,6 +4428,7 @@ impl Config {
         tenant_agent_type: Option<&str>,
         tenant_connected_toolkits: Option<&[String]>,
         tenant_disabled_toolkits: Option<&[String]>,
+        tenant_custom_mcp_servers: Option<&[McpServerConfig]>,
     ) -> Vec<McpServerConfig> {
         let mut granted = self.mcp_servers_for_agent(agent_alias);
         let tenant_bundle_names = self.mcp_bundle_names_for_tenant(tenant_agent_type);
@@ -4436,13 +4437,29 @@ impl Config {
                 granted.push(server);
             }
         }
-        granted
+        let mut resolved: Vec<McpServerConfig> = granted
             .into_iter()
             .filter_map(|server| apply_tenant_entity_scoping(server, tenant_platform_user_id))
             .filter_map(|server| apply_tenant_workspace_scoping(server, tenant_platform_user_id))
             .filter_map(|server| apply_toolkit_connection_gate(server, tenant_connected_toolkits))
             .filter_map(|server| apply_toolkit_scope_gate(server, tenant_disabled_toolkits))
-            .collect()
+            .collect();
+        // ADR-006 Part B: a tenant's own registered MCP servers are
+        // appended after the gate chain above, not filtered through it —
+        // those four gates are all Composio-connection/entity-scoping
+        // machinery that doesn't apply to a tenant-owned server. Already
+        // built with `guarded_transport: true` and a name-collision-safe
+        // prefix by `TenantContext::custom_mcp_server_configs`
+        // (zeroclaw-runtime) before reaching here; still deduped by name
+        // as a second, defense-in-depth layer.
+        if let Some(custom) = tenant_custom_mcp_servers {
+            for server in custom {
+                if !resolved.iter().any(|g| g.name == server.name) {
+                    resolved.push(server.clone());
+                }
+            }
+        }
+        resolved
     }
 
     /// Cerveau (Phase 4.1 follow-on, patch 0012): `[mcp_bundles.<alias>]`
@@ -5213,6 +5230,19 @@ pub struct McpServerConfig {
     /// tenant of that agent type.
     #[serde(default)]
     pub requires_composio_toolkit: Option<String>,
+    /// ADR-006 Part B (tenant custom MCP servers): set only by
+    /// `TenantCustomMcpResolver` when this entry was synthesized from a
+    /// tenant's own registered server (`product.tenant_custom_mcp_servers`),
+    /// never from `[[mcp.servers]]` config — same "config declares intent,
+    /// the tenant-scoping step fills in the real value" pattern as
+    /// `tenant_workspace_dir` above. When true, `zeroclaw-tools`'
+    /// `HttpTransport`/`SseTransport` build their `reqwest::Client` via
+    /// `guarded_resolve::build_guarded_client` (SSRF-guarded DNS pinning,
+    /// no auto-redirect) instead of a bare client — a curated,
+    /// Aivory-authored server is a known quantity and never needs this; a
+    /// tenant-supplied URL always does.
+    #[serde(default, skip_serializing)]
+    pub guarded_transport: bool,
 }
 
 /// External MCP client configuration (`[mcp]` section).
@@ -24453,7 +24483,7 @@ untrusted_outbound_redact = false
         // with no entity to scope it to, never fall back to a shared one.
         let config = config_with_tenant_gated_composio_server();
         let granted: Vec<String> = config
-            .mcp_servers_for_agent_and_tenant("aaatools", None, None, None, None)
+            .mcp_servers_for_agent_and_tenant("aaatools", None, None, None, None, None)
             .into_iter()
             .map(|s| s.name)
             .collect();
@@ -24467,8 +24497,14 @@ untrusted_outbound_redact = false
     #[test]
     async fn tenant_gated_mcp_server_gets_entity_scoped_url() {
         let config = config_with_tenant_gated_composio_server();
-        let servers =
-            config.mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"), None, None, None);
+        let servers = config.mcp_servers_for_agent_and_tenant(
+            "aaatools",
+            Some("u_42"),
+            None,
+            None,
+            None,
+            None,
+        );
         let composio = servers
             .iter()
             .find(|s| s.name == "composio")
@@ -24493,8 +24529,14 @@ untrusted_outbound_redact = false
         let mut config = config_with_tenant_gated_composio_server();
         config.mcp.servers[0].url = Some("https://mcp.composio.dev/v1?region=us".to_string());
 
-        let servers =
-            config.mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"), None, None, None);
+        let servers = config.mcp_servers_for_agent_and_tenant(
+            "aaatools",
+            Some("u_42"),
+            None,
+            None,
+            None,
+            None,
+        );
         let composio = servers.iter().find(|s| s.name == "composio").unwrap();
         assert_eq!(
             composio.url.as_deref(),
@@ -24509,7 +24551,7 @@ untrusted_outbound_redact = false
         config.mcp.servers[0].url = Some("not a url".to_string());
 
         let granted: Vec<String> = config
-            .mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"), None, None, None)
+            .mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"), None, None, None, None)
             .into_iter()
             .map(|s| s.name)
             .collect();
@@ -24722,6 +24764,7 @@ untrusted_outbound_redact = false
                 Some("finance_invoice_ops"),
                 None,
                 None,
+                None,
             )
             .into_iter()
             .map(|s| s.name)
@@ -24809,6 +24852,7 @@ untrusted_outbound_redact = false
                 Some("finance_invoice_ops"),
                 None,
                 Some(&disabled),
+                None,
             )
             .into_iter()
             .map(|s| s.name)
@@ -24822,6 +24866,94 @@ untrusted_outbound_redact = false
         );
     }
 
+    #[tokio::test]
+    async fn mcp_servers_for_agent_and_tenant_appends_tenant_custom_servers_ungated() {
+        // ADR-006 Part B: a tenant custom MCP server must be appended
+        // regardless of connected/disabled toolkit state — it bypasses the
+        // Composio-specific gate chain entirely, since it isn't
+        // Composio-sourced.
+        let config = config_with_connection_gated_stripe_server();
+        let custom = vec![McpServerConfig {
+            name: "tenant_orders".to_string(),
+            transport: McpTransport::Http,
+            url: Some("https://tenant.example/mcp".to_string()),
+            guarded_transport: true,
+            ..Default::default()
+        }];
+        let granted: Vec<String> = config
+            .mcp_servers_for_agent_and_tenant(
+                "aaatools",
+                Some("u_42"),
+                Some("finance_invoice_ops"),
+                None,
+                None,
+                Some(&custom),
+            )
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(granted.contains(&"tenant_orders".to_string()));
+        assert!(granted.contains(&"aivory-native-finance-invoice-ops".to_string()));
+    }
+
+    #[tokio::test]
+    async fn mcp_servers_for_agent_and_tenant_dedupes_tenant_custom_server_name_collision() {
+        let config = config_with_connection_gated_stripe_server();
+        let custom = vec![McpServerConfig {
+            name: "aivory-native-finance-invoice-ops".to_string(),
+            transport: McpTransport::Http,
+            url: Some("https://tenant.example/mcp".to_string()),
+            guarded_transport: true,
+            ..Default::default()
+        }];
+        let granted = config.mcp_servers_for_agent_and_tenant(
+            "aaatools",
+            Some("u_42"),
+            Some("finance_invoice_ops"),
+            None,
+            None,
+            Some(&custom),
+        );
+        let matching: Vec<_> = granted
+            .iter()
+            .filter(|s| s.name == "aivory-native-finance-invoice-ops")
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "a name collision must not duplicate the curated server"
+        );
+        assert!(
+            !matching[0].guarded_transport,
+            "the curated server must win the collision, not the tenant-supplied one"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_servers_for_agent_and_tenant_none_custom_servers_is_a_pure_noop() {
+        let config = config_with_connection_gated_stripe_server();
+        let with_none = config.mcp_servers_for_agent_and_tenant(
+            "aaatools",
+            Some("u_42"),
+            Some("finance_invoice_ops"),
+            None,
+            None,
+            None,
+        );
+        let with_empty_some = config.mcp_servers_for_agent_and_tenant(
+            "aaatools",
+            Some("u_42"),
+            Some("finance_invoice_ops"),
+            None,
+            None,
+            Some(&[]),
+        );
+        assert_eq!(
+            with_none.iter().map(|s| &s.name).collect::<Vec<_>>(),
+            with_empty_some.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     async fn mcp_servers_for_agent_and_tenant_isolates_by_agent_type() {
         let config = config_with_agent_type_gated_stripe_server();
@@ -24829,6 +24961,7 @@ untrusted_outbound_redact = false
             "aaatools",
             Some("u_42"),
             Some("customer_service"),
+            None,
             None,
             None,
         );
@@ -24842,8 +24975,14 @@ untrusted_outbound_redact = false
     #[test]
     async fn mcp_servers_for_agent_and_tenant_vanilla_turn_gets_no_agent_type_grant() {
         let config = config_with_agent_type_gated_stripe_server();
-        let granted =
-            config.mcp_servers_for_agent_and_tenant("aaatools", Some("u_42"), None, None, None);
+        let granted = config.mcp_servers_for_agent_and_tenant(
+            "aaatools",
+            Some("u_42"),
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(
             granted.is_empty(),
             "a turn with no agent_type at all (vanilla or type omitted) gets none of \
@@ -24880,6 +25019,7 @@ untrusted_outbound_redact = false
             "aaatools",
             Some("u_42"),
             Some("finance_invoice_ops"),
+            None,
             None,
             None,
         );
@@ -24947,6 +25087,7 @@ untrusted_outbound_redact = false
                 Some("finance_invoice_ops"),
                 Some(&[]),
                 None,
+                None,
             )
             .into_iter()
             .map(|s| s.name)
@@ -24969,6 +25110,7 @@ untrusted_outbound_redact = false
                 Some("u_42"),
                 Some("finance_invoice_ops"),
                 Some(&["stripe".to_string()]),
+                None,
                 None,
             )
             .into_iter()
@@ -24995,6 +25137,7 @@ untrusted_outbound_redact = false
                 Some("finance_invoice_ops"),
                 None,
                 None,
+                None,
             )
             .into_iter()
             .map(|s| s.name)
@@ -25017,6 +25160,7 @@ untrusted_outbound_redact = false
                 Some("u_42"),
                 Some("finance_invoice_ops"),
                 Some(&["STRIPE".to_string()]),
+                None,
                 None,
             )
             .into_iter()

@@ -270,12 +270,18 @@ impl ScopedToolRegistry {
             // a tenant-scoped turn, so vanilla installs resolve identically
             // to `mcp_servers_for_agent`.
             let tenant = crate::agent::tenant::current_tenant();
+            // ADR-006 Part B: the tenant's own custom MCP servers, already
+            // built as real `McpServerConfig` entries (guarded_transport,
+            // name prefix) by `custom_mcp_server_configs` — bound to a local
+            // so the `Option<&[_]>` below can borrow from it.
+            let tenant_custom_servers = tenant.as_deref().map(|t| t.custom_mcp_server_configs());
             config.mcp_servers_for_agent_and_tenant(
                 agent_alias,
                 tenant.as_deref().map(|t| t.platform_user_id.as_str()),
                 tenant.as_deref().map(|t| t.agent_type.as_str()),
                 tenant.as_deref().map(|t| t.connected_toolkits.as_slice()),
                 tenant.as_deref().map(|t| t.disabled_toolkits.as_slice()),
+                tenant_custom_servers.as_deref(),
             )
         } else {
             Vec::new()

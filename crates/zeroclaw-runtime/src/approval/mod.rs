@@ -227,6 +227,18 @@ impl ApprovalManager {
     /// with no `Safe` fast-path and no `Irreversible` hard floor.
     #[must_use]
     pub fn risk_tier(&self, tool_name: &str) -> ToolRiskTier {
+        // ADR-006 Part B (§B5): a tool from a tenant's own custom MCP
+        // server is always Irreversible, non-overridable by the tenant or
+        // by any `[tool_risk_tiers]` entry — checked FIRST, before
+        // consulting `self.risk_tiers` at all, so no config can ever
+        // downgrade it. The server is a black box Aivory never reviewed,
+        // and its tool `description`s are untrusted tenant-authored text
+        // flowing straight into LLM-visible tool metadata.
+        if let Some(tenant) = crate::agent::tenant::current_tenant()
+            && tenant.is_tenant_custom_mcp_tool(tool_name)
+        {
+            return ToolRiskTier::Irreversible;
+        }
         match &self.risk_tiers {
             Some(tiers) => zeroclaw_config::schema::resolve_tool_risk_tier(tiers, tool_name),
             None => ToolRiskTier::Reversible,
@@ -565,14 +577,47 @@ mod tests {
         assert_eq!(mgr.risk_tier("finalize_invoice"), ToolRiskTier::Reversible);
     }
 
+    #[tokio::test]
+    async fn tenant_custom_mcp_tool_is_irreversible_even_with_no_risk_taxonomy_opt_in() {
+        // ADR-006 §B5: this must win even for a manager that never called
+        // with_risk_taxonomy at all — a tenant custom MCP tool is never
+        // merely "Reversible by default", it's Irreversible unconditionally.
+        let mgr = ApprovalManager::for_non_interactive(&supervised_config());
+        let ctx = std::sync::Arc::new(crate::agent::tenant::TenantContext {
+            tenant_id: "u1:cs".to_string(),
+            platform_user_id: "u1".to_string(),
+            agent_type: "customer_service".to_string(),
+            persona: None,
+            connected_toolkits: Vec::new(),
+            disabled_toolkits: Vec::new(),
+            tenant_custom_mcp_servers: vec![crate::agent::tenant::TenantCustomMcpServer {
+                name: "orders".to_string(),
+                url: "https://tenant.example/mcp".to_string(),
+                transport: "streamable-http".to_string(),
+                auth_header_name: None,
+                auth_header_value: None,
+                risk_tier: "irreversible".to_string(),
+            }],
+        });
+        crate::agent::tenant::TENANT_CONTEXT
+            .scope(Some(ctx), async {
+                assert_eq!(
+                    mgr.risk_tier("tenant_orders__refund"),
+                    ToolRiskTier::Irreversible
+                );
+                // A tool that merely happens to share a substring is unaffected.
+                assert_eq!(mgr.risk_tier("some_other_tool"), ToolRiskTier::Reversible);
+            })
+            .await;
+    }
+
     #[test]
     fn safe_tier_never_requires_approval_even_without_auto_approve() {
-        let mgr = ApprovalManager::for_non_interactive(&supervised_config())
-            .with_risk_taxonomy(
-                zeroclaw_config::schema::ToolRiskTiersConfig::default(),
-                None,
-                None,
-            );
+        let mgr = ApprovalManager::for_non_interactive(&supervised_config()).with_risk_taxonomy(
+            zeroclaw_config::schema::ToolRiskTiersConfig::default(),
+            None,
+            None,
+        );
         // tool_search is Safe by the built-in default and is NOT in this
         // profile's auto_approve list — must still resolve NotRequired.
         assert_eq!(
@@ -586,8 +631,11 @@ mod tests {
         let mut profile = supervised_config();
         // Explicitly (mis)configured into auto_approve — must NOT win.
         profile.auto_approve.push("finalize_invoice".to_string());
-        let mgr = ApprovalManager::for_non_interactive(&profile)
-            .with_risk_taxonomy(irreversible_tiers(), None, None);
+        let mgr = ApprovalManager::for_non_interactive(&profile).with_risk_taxonomy(
+            irreversible_tiers(),
+            None,
+            None,
+        );
         assert_eq!(
             mgr.approval_requirement("finalize_invoice"),
             ApprovalRequirement::Pending,
@@ -598,8 +646,11 @@ mod tests {
 
     #[test]
     fn irreversible_tier_beats_full_autonomy_on_non_interactive() {
-        let mgr = ApprovalManager::for_non_interactive(&full_config())
-            .with_risk_taxonomy(irreversible_tiers(), None, None);
+        let mgr = ApprovalManager::for_non_interactive(&full_config()).with_risk_taxonomy(
+            irreversible_tiers(),
+            None,
+            None,
+        );
         assert_eq!(
             mgr.approval_requirement("finalize_invoice"),
             ApprovalRequirement::Pending,
@@ -617,8 +668,11 @@ mod tests {
         // CLI (interactive) managers are explicitly unaffected — a present
         // operator already gets prompted; Pending is only for the
         // non-interactive gap this round closes.
-        let mgr = ApprovalManager::from_risk_profile(&supervised_config())
-            .with_risk_taxonomy(irreversible_tiers(), None, None);
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config()).with_risk_taxonomy(
+            irreversible_tiers(),
+            None,
+            None,
+        );
         assert_eq!(
             mgr.approval_requirement("finalize_invoice"),
             ApprovalRequirement::Prompt

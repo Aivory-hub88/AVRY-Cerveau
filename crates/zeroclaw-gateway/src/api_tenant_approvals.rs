@@ -39,8 +39,8 @@ use zeroclaw_runtime::security::pairing::constant_time_eq;
 
 use crate::AppState;
 use crate::tenant::{
-    AgentToolScopeResolver, TenantResolver, TenantSelector, ToolkitConnectionResolver,
-    build_tenant_context,
+    AgentToolScopeResolver, TenantCustomMcpResolver, TenantResolver, TenantSelector,
+    ToolkitConnectionResolver, build_tenant_context,
 };
 
 type JsonErr = (StatusCode, Json<serde_json::Value>);
@@ -90,10 +90,16 @@ pub async fn handle_webhook_approval_resolve(
         )
     }
     fn unauthorized(msg: &str) -> JsonErr {
-        (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": msg })))
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": msg })),
+        )
     }
     fn unavailable(msg: String) -> JsonErr {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": msg })))
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": msg })),
+        )
     }
 
     // ── Layer 1: prove this is really the bridge ──
@@ -125,8 +131,10 @@ pub async fn handle_webhook_approval_resolve(
     };
 
     let data_dir = state.config.read().data_dir.clone();
-    let store = zeroclaw_runtime::control_plane::pending_approvals::PendingApprovalsStore::shared(&data_dir)
-        .map_err(|e| unavailable(format!("pending-approval store unavailable: {e}")))?;
+    let store = zeroclaw_runtime::control_plane::pending_approvals::PendingApprovalsStore::shared(
+        &data_dir,
+    )
+    .map_err(|e| unavailable(format!("pending-approval store unavailable: {e}")))?;
     let row = store
         .get(&id)
         .map_err(|e| unavailable(format!("lookup failed: {e}")))?
@@ -138,7 +146,8 @@ pub async fn handle_webhook_approval_resolve(
         return Err(not_found(&id));
     }
 
-    match resolve_and_continue_tenant_approval(&state, &row, &body.decision, "tenant-webhook").await {
+    match resolve_and_continue_tenant_approval(&state, &row, &body.decision, "tenant-webhook").await
+    {
         Ok(outcome) => Ok((
             StatusCode::OK,
             Json(serde_json::json!({
@@ -169,8 +178,9 @@ pub(crate) async fn resolve_and_continue_tenant_approval(
     resolved_by: &str,
 ) -> anyhow::Result<TenantResolveOutcome> {
     let data_dir = state.config.read().data_dir.clone();
-    let store =
-        zeroclaw_runtime::control_plane::pending_approvals::PendingApprovalsStore::shared(&data_dir)?;
+    let store = zeroclaw_runtime::control_plane::pending_approvals::PendingApprovalsStore::shared(
+        &data_dir,
+    )?;
 
     let (status, verb) = match decision {
         "approve" => ("approved", "approved"),
@@ -298,20 +308,36 @@ fn tenant_selector_for_resume(row: &PendingApproval) -> anyhow::Result<TenantSel
              or was created by a non-tenant/loopback caller)"
         )
     })?;
-    anyhow::ensure!(!row.principal.is_empty(), "row has no principal — cannot resume");
+    anyhow::ensure!(
+        !row.principal.is_empty(),
+        "row has no principal — cannot resume"
+    );
     Ok(TenantSelector {
         user_id: row.principal.clone(),
         agent_type: agent_type.to_string(),
     })
 }
 
-async fn run_continuation(state: &AppState, row: &PendingApproval, prompt: String) -> anyhow::Result<String> {
+async fn run_continuation(
+    state: &AppState,
+    row: &PendingApproval,
+    prompt: String,
+) -> anyhow::Result<String> {
     let sel = tenant_selector_for_resume(row)?;
 
     let persona = TenantResolver::global().resolve(&sel).await?;
-    let connected_toolkits = ToolkitConnectionResolver::global().resolve(&sel.user_id).await;
+    let connected_toolkits = ToolkitConnectionResolver::global()
+        .resolve(&sel.user_id)
+        .await;
     let disabled_toolkits = AgentToolScopeResolver::global().resolve(&sel).await;
-    let tenant_ctx = build_tenant_context(&sel, persona.as_deref(), connected_toolkits, disabled_toolkits);
+    let tenant_custom_mcp_servers = TenantCustomMcpResolver::global().resolve(&sel).await;
+    let tenant_ctx = build_tenant_context(
+        &sel,
+        persona.as_deref(),
+        connected_toolkits,
+        disabled_toolkits,
+        tenant_custom_mcp_servers,
+    );
 
     let turn_origin = Arc::new(zeroclaw_runtime::agent::tenant::TurnOriginContext {
         session_id: row.session_id.clone(),
@@ -336,8 +362,11 @@ async fn run_continuation(state: &AppState, row: &PendingApproval, prompt: Strin
 
     let cost_tracking_context = state.cost_tracker.as_ref().map(|tracker| {
         let pricing = zeroclaw_runtime::agent::cost::build_model_provider_pricing(&config);
-        zeroclaw_runtime::agent::cost::ToolLoopCostTrackingContext::new(tracker.clone(), Arc::new(pricing))
-            .with_agent_alias(&agent_alias)
+        zeroclaw_runtime::agent::cost::ToolLoopCostTrackingContext::new(
+            tracker.clone(),
+            Arc::new(pricing),
+        )
+        .with_agent_alias(&agent_alias)
     });
 
     Box::pin(zeroclaw_runtime::agent::tenant::TENANT_CONTEXT.scope(
@@ -432,15 +461,16 @@ const REDELIVERY_MIN_AGE: chrono::Duration = chrono::Duration::minutes(2);
 /// stops the rest, and nothing here is a fatal error.
 pub(crate) async fn sweep_undelivered_approvals(state: &AppState) {
     let data_dir = state.config.read().data_dir.clone();
-    let store = match zeroclaw_runtime::control_plane::pending_approvals::PendingApprovalsStore::shared(
-        &data_dir,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            log_sweep_note("n/a", "open_store_failed", &format!("{e:#}"));
-            return;
-        }
-    };
+    let store =
+        match zeroclaw_runtime::control_plane::pending_approvals::PendingApprovalsStore::shared(
+            &data_dir,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                log_sweep_note("n/a", "open_store_failed", &format!("{e:#}"));
+                return;
+            }
+        };
     let candidates = match store.list_undelivered_resolved() {
         Ok(rows) => rows,
         Err(e) => {
@@ -455,7 +485,9 @@ pub(crate) async fn sweep_undelivered_approvals(state: &AppState) {
             .resolved_at
             .as_deref()
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .is_some_and(|resolved_at| now.signed_duration_since(resolved_at) >= REDELIVERY_MIN_AGE);
+            .is_some_and(|resolved_at| {
+                now.signed_duration_since(resolved_at) >= REDELIVERY_MIN_AGE
+            });
         if !old_enough {
             continue;
         }
@@ -498,7 +530,11 @@ async fn redeliver_one_candidate(
         None
     };
 
-    let decision = if row.status == "approved" { "approve" } else { "deny" };
+    let decision = if row.status == "approved" {
+        "approve"
+    } else {
+        "deny"
+    };
     let prompt = continuation_prompt(row, decision, tool_result.as_ref());
     let reply_text = match run_continuation(state, row, prompt).await {
         Ok(text) => text,
@@ -526,7 +562,10 @@ async fn redeliver_one_candidate(
 /// no attempt was ever recorded; `Ok(Some(_))` always carries a result
 /// (an `InFlight` status is treated the same as "not safely reusable" —
 /// see the call site).
-fn cached_tool_result(state: &AppState, row: &PendingApproval) -> anyhow::Result<Option<serde_json::Value>> {
+fn cached_tool_result(
+    state: &AppState,
+    row: &PendingApproval,
+) -> anyhow::Result<Option<serde_json::Value>> {
     let config = state.config.read();
     let principal = (!row.principal.is_empty()).then_some(row.principal.as_str());
     let idem_key = zeroclaw_runtime::control_plane::tool_idem::derive_key(
@@ -536,7 +575,8 @@ fn cached_tool_result(state: &AppState, row: &PendingApproval) -> anyhow::Result
         &row.tool_name,
         &row.arguments,
     );
-    let ledger = zeroclaw_runtime::control_plane::tool_idem::ToolIdemLedger::shared(&config.data_dir)?;
+    let ledger =
+        zeroclaw_runtime::control_plane::tool_idem::ToolIdemLedger::shared(&config.data_dir)?;
     Ok(match ledger.status(&idem_key)? {
         Some(zeroclaw_runtime::control_plane::tool_idem::Claim::AlreadyDone(output)) => {
             Some(serde_json::json!({ "success": true, "output": output }))
