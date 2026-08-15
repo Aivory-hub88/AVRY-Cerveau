@@ -15,8 +15,10 @@
 #[cfg(feature = "a2a")]
 pub mod a2a;
 pub mod acp;
+pub mod admission_queue;
 pub mod agent_owned_state;
 pub mod api;
+pub mod api_approvals;
 pub mod api_browse;
 pub mod api_config;
 pub mod api_logs;
@@ -27,10 +29,9 @@ pub mod api_plugins;
 pub mod api_quickstart;
 pub mod api_sections;
 pub mod api_skills;
-pub mod api_approvals;
-pub mod api_tenant_approvals;
 pub mod api_sop;
 pub mod api_sop_author;
+pub mod api_tenant_approvals;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
 #[cfg(any(
@@ -40,19 +41,18 @@ pub mod api_webauthn;
     feature = "channel-whatsapp-cloud"
 ))]
 pub mod api_webhook;
-pub mod admission_queue;
 pub mod auth_rate_limit;
-pub mod redis_rate_limiter;
-pub mod tenant;
 pub mod canvas;
 pub mod hardware_context;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
+pub mod redis_rate_limiter;
 pub mod security_headers;
 pub mod session_queue;
 pub mod sse;
 pub mod static_files;
+pub mod tenant;
 pub mod tls;
 #[cfg(feature = "gateway-voice-duplex")]
 pub mod voice_duplex;
@@ -1456,17 +1456,23 @@ pub async fn run_gateway(
                     Ok(()) => {
                         ::zeroclaw_log::record!(
                             INFO,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Success),
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success),
                             "gateway rate limiter: connected to Redis, counters now shared across instances"
                         );
                     }
                     Err(e) => {
                         ::zeroclaw_log::record!(
                             WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{e}")})),
                             "gateway rate limiter: Redis connection failed, falling back to in-process (per-instance) limiting"
                         );
                     }
@@ -3146,17 +3152,26 @@ async fn handle_webhook(
                     // alongside persona, same DB round-trip shape, but
                     // never rejects the request on its own — see
                     // `ToolkitConnectionResolver::resolve`'s doc comment.
-                    let connected_toolkits =
-                        tenant::ToolkitConnectionResolver::global().resolve(&sel.user_id).await;
+                    let connected_toolkits = tenant::ToolkitConnectionResolver::global()
+                        .resolve(&sel.user_id)
+                        .await;
                     // Part C: the dashboard Tools-tab denylist, resolved the
                     // same non-rejecting way — see
                     // `AgentToolScopeResolver::resolve`'s doc comment.
-                    let disabled_toolkits = tenant::AgentToolScopeResolver::global().resolve(&sel).await;
+                    let disabled_toolkits =
+                        tenant::AgentToolScopeResolver::global().resolve(&sel).await;
+                    // ADR-006 Part B: this tenant's own registered MCP
+                    // servers, resolved the same non-rejecting way — see
+                    // `TenantCustomMcpResolver::resolve`'s doc comment.
+                    let tenant_custom_mcp_servers = tenant::TenantCustomMcpResolver::global()
+                        .resolve(&sel)
+                        .await;
                     Some(tenant::build_tenant_context(
                         &sel,
                         persona.as_deref(),
                         connected_toolkits,
                         disabled_toolkits,
+                        tenant_custom_mcp_servers,
                     ))
                 }
                 Err(e) => {

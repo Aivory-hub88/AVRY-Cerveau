@@ -38,6 +38,7 @@ pub mod git_forge;
 pub mod git_operations;
 pub mod glob_search;
 pub mod google_workspace;
+pub mod guarded_resolve;
 pub mod hardware_board_info;
 pub mod hardware_memory_map;
 pub mod hardware_memory_read;

@@ -152,7 +152,10 @@ impl TenantResolver {
     /// `Ok(None)` = tenant has no persona row (valid; defaults apply).
     /// `Err(_)` = resolution infrastructure failed (no DSN, DB down) — the
     /// caller must reject the request rather than proceed unscoped.
-    pub async fn resolve(&self, sel: &TenantSelector) -> anyhow::Result<Option<Arc<TenantPersona>>> {
+    pub async fn resolve(
+        &self,
+        sel: &TenantSelector,
+    ) -> anyhow::Result<Option<Arc<TenantPersona>>> {
         let key = sel.tenant_id();
         {
             let mut cache = self.cache.lock();
@@ -175,9 +178,10 @@ impl TenantResolver {
         };
         let user_id = sel.user_id.clone();
         let agent_type = sel.agent_type.clone();
-        let row = tokio::task::spawn_blocking(move || query_persona(&db_url, &user_id, &agent_type))
-            .await
-            .map_err(|e| anyhow::anyhow!("tenant resolver task panicked: {e}"))??;
+        let row =
+            tokio::task::spawn_blocking(move || query_persona(&db_url, &user_id, &agent_type))
+                .await
+                .map_err(|e| anyhow::anyhow!("tenant resolver task panicked: {e}"))??;
 
         let mut cache = self.cache.lock();
         match row {
@@ -315,6 +319,7 @@ pub fn build_tenant_context(
     persona: Option<&TenantPersona>,
     connected_toolkits: Vec<String>,
     disabled_toolkits: Vec<String>,
+    tenant_custom_mcp_servers: Vec<zeroclaw_runtime::agent::tenant::TenantCustomMcpServer>,
 ) -> Arc<TenantContext> {
     Arc::new(TenantContext {
         tenant_id: sel.tenant_id(),
@@ -323,6 +328,7 @@ pub fn build_tenant_context(
         persona: persona.and_then(render_persona_block),
         connected_toolkits,
         disabled_toolkits,
+        tenant_custom_mcp_servers,
     })
 }
 
@@ -414,8 +420,7 @@ impl ToolkitConnectionResolver {
         };
         let user_id = platform_user_id.to_string();
         let result =
-            tokio::task::spawn_blocking(move || query_connected_toolkits(&db_url, &user_id))
-                .await;
+            tokio::task::spawn_blocking(move || query_connected_toolkits(&db_url, &user_id)).await;
 
         let toolkits = match result {
             Ok(Ok(toolkits)) => toolkits,
@@ -584,7 +589,11 @@ impl AgentToolScopeResolver {
     }
 }
 
-fn query_disabled_toolkits(db_url: &str, user_id: &str, agent_type: &str) -> anyhow::Result<Vec<String>> {
+fn query_disabled_toolkits(
+    db_url: &str,
+    user_id: &str,
+    agent_type: &str,
+) -> anyhow::Result<Vec<String>> {
     use postgres::{Client, NoTls};
     let mut client = Client::connect(db_url, NoTls)?;
     let rows = client.query(
@@ -593,6 +602,178 @@ fn query_disabled_toolkits(db_url: &str, user_id: &str, agent_type: &str) -> any
         &[&user_id, &agent_type],
     )?;
     Ok(rows.iter().map(|r| r.get(0)).collect())
+}
+
+/// ADR-006 Part B: read-only resolver for a tenant's own registered custom
+/// MCP servers (`avry-backend`'s `product.tenant_custom_mcp_servers`,
+/// `status = 'verified'` rows). **Unlike every other resolver in this
+/// file, this one goes over HTTP to avry-backend rather than direct SQL** —
+/// deliberate (ADR-006 §B3): `auth_header_value` is encrypted at rest with
+/// an AES key that must live in exactly one process (avry-backend, where
+/// `mcp_server_encryption.py`'s pattern already lives), not duplicated into
+/// Rust. Same bounded-TTL'd-LRU shape as [`ToolkitConnectionResolver`]/
+/// [`AgentToolScopeResolver`] otherwise, including the fail-open-on-
+/// availability posture — see those structs' doc comments for the full
+/// reasoning, which applies identically here: an unreachable avry-backend
+/// degrades this turn to "no custom servers", never blocks memory/persona/
+/// native-tool access, and can only ever under-grant (never fabricate a
+/// server that wasn't actually resolved and verified).
+///
+/// Configured via `AVRY_BACKEND_INTERNAL_URL` (avry-backend's own base URL,
+/// e.g. `http://127.0.0.1:8081`) and `AVRY_BACKEND_INTERNAL_TOKEN` (must
+/// equal avry-backend's own `TELEGRAM_GATEWAY_TOKEN` env var — the same
+/// shared `X-Internal-Token` secret every other internal machine-to-machine
+/// route in that service already trusts, per `require_internal_token`).
+/// Either unset ⇒ resolution unavailable, logged once per negative-cache
+/// window, never a hard failure.
+pub struct TenantCustomMcpResolver {
+    backend_url: Option<String>,
+    internal_token: Option<String>,
+    client: reqwest::Client,
+    cache: Mutex<LruCache<String, CustomMcpCacheEntry>>,
+}
+
+enum CustomMcpCacheEntry {
+    Hit(
+        Instant,
+        Arc<Vec<zeroclaw_runtime::agent::tenant::TenantCustomMcpServer>>,
+    ),
+    Miss(Instant),
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct InternalCustomMcpServersResponse {
+    servers: Vec<zeroclaw_runtime::agent::tenant::TenantCustomMcpServer>,
+}
+
+impl TenantCustomMcpResolver {
+    fn new() -> Self {
+        let backend_url = std::env::var("AVRY_BACKEND_INTERNAL_URL")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty());
+        let internal_token = std::env::var("AVRY_BACKEND_INTERNAL_TOKEN")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            backend_url,
+            internal_token,
+            client,
+            cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(CACHE_CAP).expect("cache cap is non-zero"),
+            )),
+        }
+    }
+
+    /// Process-wide resolver instance.
+    pub fn global() -> &'static TenantCustomMcpResolver {
+        static GLOBAL: OnceLock<TenantCustomMcpResolver> = OnceLock::new();
+        GLOBAL.get_or_init(TenantCustomMcpResolver::new)
+    }
+
+    /// Resolve this tenant's verified custom MCP servers, consulting the
+    /// cache first. See the struct doc for why this never propagates a
+    /// hard error to the caller.
+    pub async fn resolve(
+        &self,
+        sel: &TenantSelector,
+    ) -> Vec<zeroclaw_runtime::agent::tenant::TenantCustomMcpServer> {
+        let key = sel.tenant_id();
+        {
+            let mut cache = self.cache.lock();
+            match cache.get(&key) {
+                Some(CustomMcpCacheEntry::Hit(at, servers)) if at.elapsed() < TTL_HIT => {
+                    return (**servers).clone();
+                }
+                Some(CustomMcpCacheEntry::Miss(at)) if at.elapsed() < TTL_MISS => {
+                    return Vec::new();
+                }
+                _ => {}
+            }
+        }
+
+        let (Some(backend_url), Some(internal_token)) = (&self.backend_url, &self.internal_token)
+        else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "tenant custom MCP server resolution unavailable: \
+                 AVRY_BACKEND_INTERNAL_URL/AVRY_BACKEND_INTERNAL_TOKEN not set — \
+                 treating as no custom servers for this turn"
+            );
+            let mut cache = self.cache.lock();
+            cache.put(key, CustomMcpCacheEntry::Miss(Instant::now()));
+            return Vec::new();
+        };
+
+        let url = format!(
+            "{backend_url}/api/v1/tenant-mcp-servers/internal/{}/{}",
+            sel.user_id, sel.agent_type
+        );
+        let servers = match self
+            .client
+            .get(&url)
+            .header("X-Internal-Token", internal_token)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<InternalCustomMcpServersResponse>().await {
+                    Ok(body) => body.servers,
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                            "tenant custom MCP server response malformed — treating as none for this turn"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+            Ok(resp) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"status": resp.status().as_u16()})),
+                    "tenant custom MCP server lookup returned non-success — treating as none for this turn"
+                );
+                Vec::new()
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "tenant custom MCP server lookup failed — treating as none for this turn"
+                );
+                Vec::new()
+            }
+        };
+
+        let mut cache = self.cache.lock();
+        if servers.is_empty() {
+            cache.put(key, CustomMcpCacheEntry::Miss(Instant::now()));
+        } else {
+            cache.put(
+                key,
+                CustomMcpCacheEntry::Hit(Instant::now(), Arc::new(servers.clone())),
+            );
+        }
+        servers
+    }
 }
 
 #[cfg(test)]
@@ -671,7 +852,7 @@ mod tests {
             user_id: "user_d09".to_string(),
             agent_type: "cs".to_string(),
         };
-        let ctx = build_tenant_context(&sel, None, Vec::new(), Vec::new());
+        let ctx = build_tenant_context(&sel, None, Vec::new(), Vec::new(), Vec::new());
         assert_eq!(ctx.platform_user_id, "user_d09");
         assert_eq!(ctx.tenant_id, "user_d09.cs");
         assert_ne!(ctx.platform_user_id, ctx.tenant_id);
@@ -683,7 +864,7 @@ mod tests {
             user_id: "user_d09".to_string(),
             agent_type: "finance_invoice_ops".to_string(),
         };
-        let ctx = build_tenant_context(&sel, None, Vec::new(), Vec::new());
+        let ctx = build_tenant_context(&sel, None, Vec::new(), Vec::new(), Vec::new());
         assert_eq!(ctx.agent_type, "finance_invoice_ops");
     }
 
@@ -693,7 +874,13 @@ mod tests {
             user_id: "user_d09".to_string(),
             agent_type: "finance_invoice_ops".to_string(),
         };
-        let ctx = build_tenant_context(&sel, None, vec!["stripe".to_string()], Vec::new());
+        let ctx = build_tenant_context(
+            &sel,
+            None,
+            vec!["stripe".to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
         assert_eq!(ctx.connected_toolkits, vec!["stripe".to_string()]);
     }
 
@@ -703,7 +890,7 @@ mod tests {
             user_id: "user_d09".to_string(),
             agent_type: "customer_service".to_string(),
         };
-        let ctx = build_tenant_context(&sel, None, Vec::new(), Vec::new());
+        let ctx = build_tenant_context(&sel, None, Vec::new(), Vec::new(), Vec::new());
         assert!(
             ctx.connected_toolkits.is_empty(),
             "no resolved connections (genuine absence or a fail-open resolution failure) \
@@ -717,7 +904,13 @@ mod tests {
             user_id: "user_d09".to_string(),
             agent_type: "customer_service".to_string(),
         };
-        let ctx = build_tenant_context(&sel, None, Vec::new(), vec!["zendesk".to_string()]);
+        let ctx = build_tenant_context(
+            &sel,
+            None,
+            Vec::new(),
+            vec!["zendesk".to_string()],
+            Vec::new(),
+        );
         assert_eq!(ctx.disabled_toolkits, vec!["zendesk".to_string()]);
     }
 
@@ -731,11 +924,132 @@ mod tests {
             user_id: "user_d09".to_string(),
             agent_type: "customer_service".to_string(),
         };
-        let ctx = build_tenant_context(&sel, None, Vec::new(), Vec::new());
+        let ctx = build_tenant_context(&sel, None, Vec::new(), Vec::new(), Vec::new());
         assert!(
             ctx.disabled_toolkits.is_empty(),
             "no resolved disabled toolkits (genuine absence or a fail-open resolution \
              failure) both collapse to empty — never disables anything by default"
         );
+    }
+
+    // ── TenantCustomMcpResolver — direct construction (bypasses `new()`'s
+    // env parsing, avoiding any env-var mutation races between tests) ────
+
+    fn resolver_for(backend_url: &str, internal_token: &str) -> TenantCustomMcpResolver {
+        TenantCustomMcpResolver {
+            backend_url: Some(backend_url.to_string()),
+            internal_token: Some(internal_token.to_string()),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .expect("build test client"),
+            cache: Mutex::new(LruCache::new(NonZeroUsize::new(16).unwrap())),
+        }
+    }
+
+    fn sel() -> TenantSelector {
+        TenantSelector {
+            user_id: "user_d09".to_string(),
+            agent_type: "customer_service".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_mcp_resolver_unconfigured_env_resolves_empty() {
+        let resolver = TenantCustomMcpResolver {
+            backend_url: None,
+            internal_token: None,
+            client: reqwest::Client::new(),
+            cache: Mutex::new(LruCache::new(NonZeroUsize::new(16).unwrap())),
+        };
+        assert!(resolver.resolve(&sel()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn custom_mcp_resolver_parses_verified_servers_from_internal_route() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/tenant-mcp-servers/internal/user_d09/customer_service"))
+            .and(header("X-Internal-Token", "secret-tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "servers": [{
+                    "name": "orders",
+                    "url": "https://tenant.example/mcp",
+                    "transport": "streamable-http",
+                    "auth_header_name": "X-Api-Key",
+                    "auth_header_value": "shh",
+                    "risk_tier": "irreversible"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let resolver = resolver_for(&server.uri(), "secret-tok");
+        let servers = resolver.resolve(&sel()).await;
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "orders");
+        assert_eq!(servers[0].url, "https://tenant.example/mcp");
+        assert_eq!(servers[0].auth_header_value.as_deref(), Some("shh"));
+    }
+
+    #[tokio::test]
+    async fn custom_mcp_resolver_fails_open_on_non_success_status() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let resolver = resolver_for(&server.uri(), "secret-tok");
+        assert!(resolver.resolve(&sel()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn custom_mcp_resolver_fails_open_on_malformed_body() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+
+        let resolver = resolver_for(&server.uri(), "secret-tok");
+        assert!(resolver.resolve(&sel()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn custom_mcp_resolver_caches_hit_and_avoids_second_http_call() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "servers": [{
+                    "name": "orders",
+                    "url": "https://tenant.example/mcp",
+                    "transport": "streamable-http",
+                    "auth_header_name": null,
+                    "auth_header_value": null,
+                    "risk_tier": "irreversible"
+                }]
+            })))
+            .expect(1) // a second resolve() within TTL must be served from cache
+            .mount(&server)
+            .await;
+
+        let resolver = resolver_for(&server.uri(), "secret-tok");
+        let first = resolver.resolve(&sel()).await;
+        let second = resolver.resolve(&sel()).await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
     }
 }

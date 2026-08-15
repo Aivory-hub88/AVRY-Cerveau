@@ -113,8 +113,7 @@ pub trait McpTransportConn: Send + Sync {
 /// `zeroclaw-runtime`). Takes the workspace directory to confine the
 /// command to, since that's the only case this hook is invoked for (see
 /// [`StdioTransport::new`]).
-pub type SandboxWrapFn =
-    fn(&mut std::process::Command, &std::path::Path) -> std::io::Result<()>;
+pub type SandboxWrapFn = fn(&mut std::process::Command, &std::path::Path) -> std::io::Result<()>;
 
 static SANDBOX_WRAP: std::sync::OnceLock<SandboxWrapFn> = std::sync::OnceLock::new();
 
@@ -157,9 +156,8 @@ impl StdioTransport {
             // server's own default behavior agree with that boundary.
             raw_cmd.current_dir(workspace);
             match SANDBOX_WRAP.get() {
-                Some(wrap) => wrap(&mut raw_cmd, workspace).with_context(|| {
-                    format!("failed to sandbox MCP server `{}`", config.name)
-                })?,
+                Some(wrap) => wrap(&mut raw_cmd, workspace)
+                    .with_context(|| format!("failed to sandbox MCP server `{}`", config.name))?,
                 None => {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -290,6 +288,32 @@ impl McpTransportConn for StdioTransport {
     }
 }
 
+/// ADR-006 Part B: connect/total-timeout bound applied to every runtime call
+/// against a tenant-supplied custom MCP server — independent of whatever
+/// `tool_timeout_secs` a curated server's config allows, since tenant input
+/// gets its own hard ceiling regardless (§B4 item 7, "bounded per-call
+/// runtime ~20-30s — one custom tool must not consume Cerveau's whole
+/// ~180s turn budget").
+const GUARDED_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const GUARDED_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Builds the `reqwest::Client` an HTTP/SSE MCP transport uses. Curated
+/// (Aivory-authored) servers get a bare client, unchanged from before this
+/// existed. A server synthesized from a tenant's own registration
+/// (`config.guarded_transport`, set only by `TenantCustomMcpResolver` —
+/// never by `[[mcp.servers]]` config) gets the SSRF-guarded client instead:
+/// DNS-pinned connect, no auto-redirect. See `guarded_resolve` module docs.
+fn build_transport_client(config: &McpServerConfig) -> Result<reqwest::Client> {
+    if config.guarded_transport {
+        crate::guarded_resolve::build_guarded_client(GUARDED_CONNECT_TIMEOUT, GUARDED_TOTAL_TIMEOUT)
+            .context("failed to build guarded HTTP client for tenant custom MCP server")
+    } else {
+        reqwest::Client::builder()
+            .build()
+            .context("failed to build HTTP client")
+    }
+}
+
 // ── HTTP Transport ───────────────────────────────────────────────────────
 
 /// HTTP-based transport (POST requests).
@@ -325,9 +349,7 @@ impl HttpTransport {
             })?
             .clone();
 
-        let client = reqwest::Client::builder()
-            .build()
-            .context("failed to build HTTP client")?;
+        let client = build_transport_client(config)?;
 
         Ok(Self {
             url,
@@ -507,9 +529,7 @@ impl SseTransport {
             })?
             .clone();
 
-        let client = reqwest::Client::builder()
-            .build()
-            .context("failed to build HTTP client")?;
+        let client = build_transport_client(config)?;
 
         Ok(Self {
             sse_url,
@@ -1520,7 +1540,10 @@ mod tests {
     static SPY_WRAP_CALLS: std::sync::Mutex<Vec<std::path::PathBuf>> =
         std::sync::Mutex::new(Vec::new());
 
-    fn spy_wrap(cmd: &mut std::process::Command, workspace: &std::path::Path) -> std::io::Result<()> {
+    fn spy_wrap(
+        cmd: &mut std::process::Command,
+        workspace: &std::path::Path,
+    ) -> std::io::Result<()> {
         SPY_WRAP_CALLS.lock().unwrap().push(workspace.to_path_buf());
         // The real Landlock wrapper carries `current_dir` through its
         // rewrite; assert it's already set to `workspace` by the time the
