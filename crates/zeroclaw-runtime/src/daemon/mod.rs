@@ -5197,12 +5197,10 @@ mod tests {
             url: None,
             headers: std::collections::HashMap::new(),
             pinned_resources: vec![],
-            tls_ca_cert_path: None,
-            tenant_entity_query_param: None,
-            tenant_workspace_root: None,
-            tenant_workspace_dir: None,
-            requires_composio_toolkit: None,
-            max_response_bytes: None,
+            // Spread the rest: this fork adds fields to McpServerConfig
+            // (tenant scoping, toolkit gating, guarded transport) that this
+            // upstream fixture has no opinion on.
+            ..McpServerConfig::default()
         });
         let agent_alias = "ops".to_string();
         config.mcp_bundles.insert(

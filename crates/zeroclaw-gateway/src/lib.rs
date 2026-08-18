@@ -2608,8 +2608,22 @@ pub(crate) async fn persist_pairing_tokens(
 /// Result of a gateway chat turn.
 struct GatewayChatOutcome {
     response: String,
+    // Cerveau (patch 0021, tenant-attributed cost tracking): still populated
+    // per turn, but currently READ BY NOBODY — upstream v0.8.4 removed this
+    // crate's own `LlmResponse`/`AgentEnd` emission (one webhook prompt was
+    // getting two unrelated turn IDs) and made `process_message`'s runtime
+    // turn guard the sole emitter. Retained deliberately rather than deleted
+    // during the v0.8.4 rebase: the plumbing is the obvious seam for
+    // surfacing per-turn cost on the webhook response (a real want for a
+    // multi-tenant billing product), and removing it is a product call, not
+    // a mechanical rebase step. Cost itself is unaffected either way — the
+    // cost-tracking scope inside `run_gateway_chat_with_tools` persists it to
+    // `/api/cost` and `costs.jsonl` independently of these fields.
+    #[allow(dead_code)]
     input_tokens: Option<u64>,
+    #[allow(dead_code)]
     output_tokens: Option<u64>,
+    #[allow(dead_code)]
     cost_usd: Option<f64>,
     /// Cerveau (patch 0035): set when this turn's tool call was gated into
     /// a durable `Pending` approval — see
@@ -3511,12 +3525,20 @@ async fn handle_webhook(
     )
     .await
     {
+        // `input_tokens`/`output_tokens`/`cost_usd` are still populated on the
+        // outcome but deliberately NOT read here: upstream v0.8.4 made
+        // `process_message`'s runtime turn guard the sole emitter of
+        // lifecycle/LLM observability events (see the comment above the
+        // admission queue) — this site used to emit its own `LlmResponse`/
+        // `AgentEnd` bracket, which gave one webhook prompt two unrelated
+        // turn IDs. Per-turn cost is still persisted to `/api/cost` and
+        // `costs.jsonl` by the cost-tracking scope inside
+        // `run_gateway_chat_with_tools`, so nothing is lost by not reading
+        // them here.
         Ok(GatewayChatOutcome {
             response,
-            input_tokens,
-            output_tokens,
-            cost_usd,
             pending_approval,
+            ..
         }) => {
             let duration = started_at.elapsed();
             state.observer.record_metric(
@@ -6566,6 +6588,10 @@ path = "{trigger_path}"
         ));
 
         let state = AppState {
+            // Upstream v0.8.4 added this to AppState. Informational-only
+            // LAN peer hints that never authorize or connect a peer, so a
+            // default (empty) registry is correct for this test.
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
@@ -6609,7 +6635,6 @@ path = "{trigger_path}"
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
-            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
