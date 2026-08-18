@@ -191,6 +191,23 @@ impl ApprovalManager {
             non_interactive_shell_requires_approval: self.non_interactive_shell_requires_approval,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
+            // Cerveau: the risk taxonomy, F-2 ledger, and pending-approval
+            // store are DEPLOYMENT-level infrastructure, not per-agent
+            // policy — they carry over to the delegate exactly like
+            // `non_interactive` above, and unlike the policy sets/allowlist
+            // that intentionally start fresh. Dropping them to `None` here
+            // would silently disable tiered approval for every delegated
+            // execution: a tool the deployment classified `Irreversible`
+            // via `[tool_risk_tiers]` would degrade to `Reversible`, F-2
+            // double-execution protection would vanish, and no durable
+            // pending-approval record would be written — i.e. an SOP step
+            // naming another agent would become a bypass for the whole
+            // mechanism. (`risk_tier`'s tenant-custom-MCP hard floor is
+            // checked before this config and would survive either way, but
+            // nothing else here would.)
+            risk_tiers: self.risk_tiers.clone(),
+            idem_ledger: self.idem_ledger.clone(),
+            pending_store: self.pending_store.clone(),
         }
     }
 
