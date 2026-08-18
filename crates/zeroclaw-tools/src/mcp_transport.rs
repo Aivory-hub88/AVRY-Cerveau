@@ -357,6 +357,8 @@ impl Drop for StdioConn {
 struct StdioState {
     conn: Option<StdioConn>,
     closed: bool,
+}
+
 /// Process-wide hook for applying OS-level sandboxing (e.g. Landlock) to a
 /// stdio MCP server's spawned command. `zeroclaw-tools` sits *below*
 /// `zeroclaw-runtime` in the crate graph (the reverse dependency would be

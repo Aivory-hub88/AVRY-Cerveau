@@ -3411,6 +3411,8 @@ fn main() -> Result<()> {
     }
 
     async_main(command)
+}
+
 /// Find the exec target's own (operator-installed, non-tenant) install
 /// root, so a Landlock-sandboxed stdio MCP server can still read its own
 /// code and dependencies. For an npm-installed tool laid out as
