@@ -2023,7 +2023,18 @@ pub async fn run(
             }
 
             // After successful multi-step execution, attempt autonomous skill creation.
-            if config.skills.skill_creation.enabled {
+            // Cerveau (patch 0039): skip on tenant-scoped turns entirely.
+            // Auto-created skills are written to the host workspace
+            // (`config.data_dir`), which every tenant turn's skill resolution
+            // also loads (`load_skills_for_agent_and_tenant_audited` starts
+            // from the host alias's workspace before layering agent-type
+            // bundles) — so a skill synthesized from one tenant's execution
+            // (task description + final answer can carry business context)
+            // would become visible to all other tenants. Learning is a
+            // host/internal-turn capability until per-tenant skill stores exist.
+            if config.skills.skill_creation.enabled
+                && crate::agent::tenant::current_tenant().is_none()
+            {
                 let tool_calls = crate::skills::creator::extract_tool_calls_from_history(&history);
                 if tool_calls.len() >= 2 {
                     let creator = crate::skills::creator::SkillCreator::new(
@@ -2098,7 +2109,13 @@ pub async fn run(
             }
             observer.record_event(&ObserverEvent::TurnComplete);
 
-            if config.skills.skill_improvement.enabled {
+            // Cerveau (patch 0039): same tenant guard as skill creation —
+            // the review fork patches host-workspace skills from conversation
+            // content, so a tenant turn must never feed it (cross-tenant
+            // leakage through the shared workspace) nor pay its LLM cost.
+            if config.skills.skill_improvement.enabled
+                && crate::agent::tenant::current_tenant().is_none()
+            {
                 let review_workspace = config.agent_workspace_dir(agent_alias);
                 let review_config = config.skills.skill_improvement.clone();
                 let failed_slugs: Vec<String> =
