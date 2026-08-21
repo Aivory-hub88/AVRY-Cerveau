@@ -4,7 +4,9 @@
 (Apache-2.0), product name **Aivory Cerveau** — the multi-tenant deployable-agent engine behind
 the Aivory user dashboard (Telegram/Slack/WhatsApp/Office Assistant agents).
 
-**Base:** upstream tag `v0.8.3`. (Originally bootstrapped on `v0.8.1` for prod parity, re-based same day: the durable run/task **control plane only exists from v0.8.2**, and v0.8.3 carries a wave of security hardening — SSRF fixes, constant-time token comparison, RUSTSEC bumps. The Aivory production vanilla instance still runs v0.8.1; the webhook contract is unchanged.)
+**Base:** upstream tag `v0.8.4` (rebased from the v0.8.3 series on 2026-08-18; see git log for the rebase-fix commits — the hardest splice was Landlock, where upstream independently rewrote the same child-vs-daemon restriction bug via a different mechanism; Cerveau kept its proven self-re-exec mechanism under upstream's richer ruleset table). Originally bootstrapped on `v0.8.1` for prod parity, moved to `v0.8.2`/`v0.8.3` same day: the durable run/task **control plane only exists from v0.8.2**, and v0.8.3 carries a wave of security hardening — SSRF fixes, constant-time token comparison, RUSTSEC bumps.
+
+**Runtime config vs this repo:** ERP toolkit wiring (Composio-hosted `aivory-erpnext-erp` MCP server, risk tiers, agent-type bundles — docs/CERVEAU-ERP-INTEGRATION-PLAN.md in the AVRY-V2-Main monorepo) is live `config.toml` on the deployment hosts, deliberately not a source patch: it changes tool *policy*, not engine code.
 **Branch model:** `cerveau-main` = upstream base + the patch series below, kept **rebase-friendly**:
 every Cerveau change is a focused commit on top of upstream, documented here. Where a change is
 generic (not Aivory-specific), we attempt to upstream it and drop it from this series.
