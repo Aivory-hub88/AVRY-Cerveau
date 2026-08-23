@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
@@ -38,6 +38,7 @@ use zeroclaw_runtime::control_plane::pending_approvals::PendingApproval;
 use zeroclaw_runtime::security::pairing::constant_time_eq;
 
 use crate::AppState;
+use crate::api_approvals::{ListQuery, pending_approval_json};
 use crate::tenant::{
     AgentToolScopeResolver, TenantCustomMcpResolver, TenantResolver, TenantSelector,
     ToolkitConnectionResolver, build_tenant_context,
@@ -161,6 +162,84 @@ pub async fn handle_webhook_approval_resolve(
             Json(serde_json::json!({ "error": e.to_string() })),
         )),
     }
+}
+
+/// `GET /webhook/approvals` — tenant-scoped list, mirrors
+/// [`handle_webhook_approval_resolve`]'s auth exactly (same two layers,
+/// same file, same `X-Webhook-Secret` + tenant-header contract) rather than
+/// introducing a new auth mechanism. Added 2026-08-23 so a dashboard/n8n
+/// consumer can discover a tenant's own pending approvals without needing
+/// `admin_reload_gate`'s pairing flow, which also gates remote config
+/// reload — a blast radius this endpoint has no reason to inherit.
+///
+/// Row filtering (`row.tenant_id == Some(sel.tenant_id())`) is the real
+/// authorization boundary, identical in spirit to the resolve handler's own
+/// ownership check — a valid `X-Webhook-Secret` proves only "this is a
+/// legitimate caller of this API," never "this caller may see every
+/// tenant's rows."
+pub async fn handle_webhook_approval_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ListQuery>,
+) -> Result<impl IntoResponse, JsonErr> {
+    fn unauthorized(msg: &str) -> JsonErr {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": msg })),
+        )
+    }
+    fn unavailable(msg: String) -> JsonErr {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": msg })),
+        )
+    }
+
+    let Some(ref secret_hash) = state.webhook_secret_hash else {
+        return Err(unauthorized(
+            "tenant-scoped approval listing requires X-Webhook-Secret auth on this deployment",
+        ));
+    };
+    let header_hash = headers
+        .get("X-Webhook-Secret")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(crate::hash_webhook_secret);
+    match header_hash {
+        Some(val) if constant_time_eq(&val, secret_hash.as_ref()) => {}
+        _ => return Err(unauthorized("invalid or missing X-Webhook-Secret header")),
+    }
+
+    let sel = match crate::tenant::TenantSelector::from_headers(&headers) {
+        Ok(Some(sel)) => sel,
+        Ok(None) => {
+            return Err(unauthorized(
+                "X-Tenant-Id and X-Agent-Type are required to list pending approvals",
+            ));
+        }
+        Err(reason) => return Err(unauthorized(reason)),
+    };
+
+    let data_dir = state.config.read().data_dir.clone();
+    let store = zeroclaw_runtime::control_plane::pending_approvals::PendingApprovalsStore::shared(
+        &data_dir,
+    )
+    .map_err(|e| unavailable(format!("pending-approval store unavailable: {e}")))?;
+    let tenant_id = sel.tenant_id();
+    let rows = store
+        .list(query.status.as_deref())
+        .map_err(|e| unavailable(format!("list failed: {e}")))?
+        .into_iter()
+        .filter(|row| row.tenant_id.as_deref() == Some(tenant_id.as_str()))
+        .collect::<Vec<_>>();
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "approvals": rows.iter().map(pending_approval_json).collect::<Vec<_>>()
+        })),
+    ))
 }
 
 /// Resolve a tenant-scoped pending approval and, unless it was already
