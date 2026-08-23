@@ -272,6 +272,17 @@ impl LandlockSandbox {
         // Allow the exec target's own (operator-installed, non-tenant)
         // install root, if the caller resolved one — same trust tier as
         // the /usr and /bin entries in the table above.
+        //
+        // Bug fix: this rule granted only ReadFile|ReadDir, never Execute,
+        // despite the comment's own stated intent ("same trust tier as
+        // /usr and /bin", which both include Execute). Found live: every
+        // officecli/lightpanda/pdf-oxide spawn under office_assistant
+        // failed with `Permission denied (os error 13)` after applying
+        // Landlock — none of those three tools' install roots
+        // (`mcp-tools/<tool>/...`) fall under any of the other explicitly
+        // granted paths (workspace, /tmp, /usr, /bin, /lib, /etc, /proc,
+        // /sys, /dev), so Execute was never available anywhere for the
+        // actual binary being exec'd.
         if let Some(extra_root) = extra_readable_root
             && extra_root.exists()
         {
@@ -280,7 +291,7 @@ impl LandlockSandbox {
             ruleset = ruleset
                 .add_rule(PathBeneath::new(
                     extra_fd,
-                    AccessFs::ReadFile | AccessFs::ReadDir,
+                    AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir,
                 ))
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
