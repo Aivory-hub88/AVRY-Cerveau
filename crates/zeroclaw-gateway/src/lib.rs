@@ -1799,6 +1799,10 @@ pub async fn run_gateway(
         .route("/webhook", post(handle_webhook))
         .merge(sop_webhook_routes())
         .route(
+            "/webhook/approvals",
+            get(api_tenant_approvals::handle_webhook_approval_list),
+        )
+        .route(
             "/webhook/approvals/{id}/resolve",
             post(api_tenant_approvals::handle_webhook_approval_resolve),
         )

@@ -68,10 +68,10 @@ fn authorize(
 
 #[derive(Deserialize)]
 pub struct ListQuery {
-    status: Option<String>,
+    pub(crate) status: Option<String>,
 }
 
-fn pending_approval_json(
+pub(crate) fn pending_approval_json(
     row: &zeroclaw_runtime::control_plane::pending_approvals::PendingApproval,
 ) -> serde_json::Value {
     serde_json::json!({
