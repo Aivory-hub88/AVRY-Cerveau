@@ -539,6 +539,7 @@ fn landlock_with_roots_grants_extra_allowed_root_access() {
         vec![extra_rw.clone()],
         vec![extra_ro.clone()],
         Vec::new(),
+        Vec::new(),
     )
     .expect("landlock should succeed on linux with feature enabled");
 
@@ -649,6 +650,7 @@ fn landlock_write_only_root_allows_delivery_without_read() {
         Vec::new(),
         Vec::new(),
         vec![extra_wo.clone()],
+        Vec::new(),
     )
     .expect("landlock should succeed on linux with feature enabled");
 
@@ -709,6 +711,7 @@ fn landlock_absent_extra_root_does_not_disable_sandbox() {
         Some(workspace.path().to_path_buf()),
         Vec::new(),
         vec![absent],
+        Vec::new(),
         Vec::new(),
     )
     .expect("an absent policy-generated root must not make Landlock unavailable");
@@ -784,6 +787,7 @@ fn landlock_tier_root_beneath_generic_rule_is_not_installed() {
         Vec::new(),
         vec![overlapping_ro.clone(), enforceable_ro.clone()],
         vec![overlapping_wo.clone(), enforceable_wo.clone()],
+        Vec::new(),
     )
     .expect("an unenforceable root must not make Landlock unavailable");
 
@@ -881,6 +885,7 @@ fn landlock_tier_root_inside_workspace_composes_with_workspace_grant() {
         Vec::new(),
         vec![nested_ro.clone()],
         Vec::new(),
+        Vec::new(),
     )
     .expect("an unenforceable root must not make Landlock unavailable");
 
@@ -947,6 +952,7 @@ fn landlock_read_only_parent_with_write_only_child_composes() {
         Vec::new(),
         vec![parent.clone()],
         vec![child.clone()],
+        Vec::new(),
     )
     .expect("landlock should succeed on linux with feature enabled");
 
@@ -1018,6 +1024,7 @@ fn landlock_write_only_parent_with_read_only_child_composes() {
         Vec::new(),
         vec![child.clone()],
         vec![parent.clone()],
+        Vec::new(),
     )
     .expect("landlock should succeed on linux with feature enabled");
 
@@ -1071,6 +1078,7 @@ fn landlock_root_in_both_restrictive_tiers_composes() {
         Vec::new(),
         vec![root.clone()],
         vec![root.clone()],
+        Vec::new(),
     )
     .expect("landlock should succeed on linux with feature enabled");
 
@@ -1124,6 +1132,7 @@ fn landlock_unopenable_extra_root_does_not_disable_sandbox() {
         Vec::new(),
         vec![invalid.clone()],
         vec![invalid],
+        Vec::new(),
     )
     .expect("an unopenable extra root must not make Landlock unavailable");
 

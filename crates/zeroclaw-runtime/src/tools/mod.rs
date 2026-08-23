@@ -661,6 +661,7 @@ fn runtime_shell_assembly(
         read_write: security.allowed_roots.clone(),
         read_only: security.allowed_roots_read_only.clone(),
         write_only: security.allowed_roots_write_only.clone(),
+        read_execute: Vec::new(),
     };
     let sandbox = create_sandbox(
         &sandbox_cfg,

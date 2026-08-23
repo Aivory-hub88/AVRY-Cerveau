@@ -15,6 +15,14 @@ pub struct SandboxExtraRoots {
     pub read_write: Vec<PathBuf>,
     pub read_only: Vec<PathBuf>,
     pub write_only: Vec<PathBuf>,
+    /// Extra roots the child may read AND execute but NOT write — the
+    /// `/usr`-tier for operator-installed tool code (Cerveau: a
+    /// Landlock-sandboxed MCP server's own install root must be executable
+    /// or every spawn fails EACCES, but must never be writable by the
+    /// sandboxed child). Neither `read_only` (no Execute) nor `read_write`
+    /// (grants Write) expresses this; see `read_execute_access` on the
+    /// Landlock side.
+    pub read_execute: Vec<PathBuf>,
 }
 
 const NOOP_DESCRIPTION: &str = "No sandboxing (application-layer security only)";
@@ -316,6 +324,7 @@ fn landlock_available(workspace_dir: Option<&Path>, extra_roots: &SandboxExtraRo
         extra_roots.read_write.clone(),
         extra_roots.read_only.clone(),
         extra_roots.write_only.clone(),
+        extra_roots.read_execute.clone(),
     )
     .is_ok()
 }
@@ -412,6 +421,7 @@ fn create_selected_sandbox(
                     extra_roots.read_write.clone(),
                     extra_roots.read_only.clone(),
                     extra_roots.write_only.clone(),
+                    extra_roots.read_execute.clone(),
                 )
                 .map(|sandbox| Arc::new(sandbox) as Arc<dyn Sandbox>)
                 .ok()
@@ -649,16 +659,16 @@ fn wrap_mcp_stdio_command(
         enabled: Some(true),
         firejail_args: Vec::new(),
     };
-    // Cerveau (0016): the confined server must still read its own
-    // (operator-installed, non-tenant) code — e.g. officecli's npm tree
-    // under `~/.zeroclaw-cerveau/mcp-tools/`, outside the workspace and
-    // the static allowlist. Granted read-only via `SandboxExtraRoots`
-    // (same tier as `/usr`/`/bin`), and only when the derived root
-    // actually exists — a bare filename or relative program has no
-    // trustworthy root to grant.
+    // Cerveau (0016 + Execute fix): the confined server must still read
+    // (and execute) its own (operator-installed, non-tenant) code — e.g.
+    // officecli's npm tree under `~/.zeroclaw-cerveau/mcp-tools/`, outside
+    // the workspace and the static allowlist. Granted via the read-execute
+    // tier (same rights as `/usr`/`/bin`: execute + read, never write),
+    // and only when the derived root actually exists — a bare filename or
+    // relative program has no trustworthy root to grant.
     let tool_root = mcp_tool_install_root(std::path::Path::new(cmd.get_program()));
     let extra_roots = SandboxExtraRoots {
-        read_only: if tool_root.exists() {
+        read_execute: if tool_root.exists() {
             vec![tool_root]
         } else {
             Vec::new()

@@ -76,6 +76,7 @@ pub fn build_report(config: &Config, agent_alias: &str) -> Result<SecurityStatus
         read_write: resolved.policy.allowed_roots.clone(),
         read_only: resolved.policy.allowed_roots_read_only.clone(),
         write_only: resolved.policy.allowed_roots_write_only.clone(),
+        read_execute: Vec::new(),
     };
     let sandbox = zeroclaw_runtime::security::sandbox_posture(
         &sandbox_config,

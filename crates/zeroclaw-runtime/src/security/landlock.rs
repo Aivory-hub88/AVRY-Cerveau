@@ -25,6 +25,10 @@ pub struct LandlockSandbox {
     /// Extra roots the agent may read but NOT write, mirroring
     /// `SecurityPolicy::allowed_roots_read_only`.
     allowed_roots_read_only: Vec<std::path::PathBuf>,
+    /// Extra roots the agent may read AND execute but NOT write (Cerveau:
+    /// an MCP server's own operator-installed install root — it must be
+    /// executable or the spawn fails EACCES, but writable never).
+    allowed_roots_read_execute: Vec<std::path::PathBuf>,
     /// Extra roots the agent may write but NOT read, mirroring
     /// `SecurityPolicy::allowed_roots_write_only`.
     allowed_roots_write_only: Vec<std::path::PathBuf>,
@@ -76,6 +80,14 @@ fn read_write_access() -> BitFlags<AccessFs> {
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
 fn read_only_access() -> BitFlags<AccessFs> {
     AccessFs::ReadFile | AccessFs::ReadDir
+}
+
+/// Rights granted to the read-execute tier (Cerveau: operator-installed
+/// MCP tool install roots): the `/usr` trust tier — read, readdir, and
+/// execute, but never write.
+#[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+fn read_execute_access() -> BitFlags<AccessFs> {
+    AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir
 }
 
 /// Rights granted to `SecurityPolicy::allowed_roots_write_only`.
@@ -314,7 +326,7 @@ impl LandlockSandbox {
 
     /// Create a Landlock sandbox with a specific workspace directory
     pub fn with_workspace(workspace_dir: Option<std::path::PathBuf>) -> std::io::Result<Self> {
-        Self::with_roots(workspace_dir, Vec::new(), Vec::new(), Vec::new())
+        Self::with_roots(workspace_dir, Vec::new(), Vec::new(), Vec::new(), Vec::new())
     }
 
     /// Create a Landlock sandbox with a workspace directory plus the extra
@@ -327,12 +339,14 @@ impl LandlockSandbox {
         allowed_roots: Vec<std::path::PathBuf>,
         allowed_roots_read_only: Vec<std::path::PathBuf>,
         allowed_roots_write_only: Vec<std::path::PathBuf>,
+        allowed_roots_read_execute: Vec<std::path::PathBuf>,
     ) -> std::io::Result<Self> {
         let sandbox = Self {
             workspace_dir,
             allowed_roots,
             allowed_roots_read_only,
             allowed_roots_write_only,
+            allowed_roots_read_execute,
         };
 
         // Validate by building the ruleset the child will actually receive,
@@ -389,7 +403,7 @@ impl LandlockSandbox {
         // The extra `SecurityPolicy` root tiers (cross-agent grants,
         // `[autonomy].allowed_roots`, etc.), paired with the rights that give
         // each tier its meaning.
-        let tiers: [(&'static str, &Vec<PathBuf>, BitFlags<AccessFs>); 3] = [
+        let tiers: [(&'static str, &Vec<PathBuf>, BitFlags<AccessFs>); 4] = [
             ("allowed_roots", &self.allowed_roots, read_write_access()),
             (
                 "allowed_roots_read_only",
@@ -400,6 +414,11 @@ impl LandlockSandbox {
                 "allowed_roots_write_only",
                 &self.allowed_roots_write_only,
                 write_only_access(),
+            ),
+            (
+                "allowed_roots_read_execute",
+                &self.allowed_roots_read_execute,
+                read_execute_access(),
             ),
         ];
 
