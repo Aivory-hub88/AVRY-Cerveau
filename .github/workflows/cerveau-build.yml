@@ -7,18 +7,45 @@ name: cerveau-build
 on:
   push:
     branches: [cerveau-main]
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+      - "docs/*.md"
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
 
 jobs:
-  build-x86_64-linux:
+  # ── Fast gate (no DB) — also covered by cerveau-quick on PRs, but kept
+  # here so the release gate is self-contained and its artifact is green
+  # only when isolation actually passes.
+  tenant-isolation:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: cerveau-tenant-isolation
+      - name: Tenant identity & isolation tests
+        run: |
+          cargo test --locked -p zeroclaw-memory --test tenant_isolation
+          cargo test --locked -p zeroclaw-runtime tenant
+          cargo test --locked -p zeroclaw-gateway tenant::
+
+  # ── Postgres-dependent tests (ADR-004, capability graph)
+  postgres-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     services:
-      # Postgres for the tenant-memory lifecycle integration tests (ADR-004).
-      # pgvector image so vector columns are available if a test needs them.
       postgres:
         image: pgvector/pgvector:pg16
         env:
@@ -32,9 +59,35 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
-      # Redis for the shared cross-instance rate limiter tests (ADR-005).
-      # No auth needed here — CI's redis is throwaway per-run, unlike
-      # tencent-vps's `--requirepass`'d instance.
+    env:
+      CERVEAU_TEST_PG_URL: "host=127.0.0.1 port=5432 user=cerveau password=cerveau dbname=cerveau_test"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: cerveau-postgres-tests
+      - name: Memory lifecycle (Postgres) tests
+        run: |
+          cargo test --locked -p zeroclaw-memory --features memory-postgres --test pg_lifecycle
+          cargo test --locked -p zeroclaw-runtime control_plane::tool_idem
+      - name: Postgres memory embedding + hybrid recall tests
+        run: |
+          cargo test --locked -p zeroclaw-memory --features memory-postgres --test pg_embedding_recall
+      - name: Capability graph (Postgres) tests
+        env:
+          RUST_BACKTRACE: full
+        run: |
+          cargo test --locked -p zeroclaw-memory --features memory-postgres --test pg_capability_graph -- --test-threads=1
+          cargo test --locked -p zeroclaw-memory --features memory-postgres capability_graph::
+
+  # ── Redis-dependent tests (ADR-005)
+  redis-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
       redis:
         image: redis:7-alpine
         ports:
@@ -45,8 +98,31 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      CERVEAU_TEST_PG_URL: "host=127.0.0.1 port=5432 user=cerveau password=cerveau dbname=cerveau_test"
       CERVEAU_TEST_REDIS_URL: "redis://127.0.0.1:6379"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: cerveau-redis-tests
+      - name: Webhook rate-limit dimension tests
+        run: |
+          cargo test --locked -p zeroclaw-gateway --lib per_ip_limit
+          cargo test --locked -p zeroclaw-gateway --lib gateway_rate_limiter_tenant_limits_are_isolated_per_tenant
+      - name: Shared rate limiter + admission queue tests (ADR-005)
+        run: |
+          cargo test --locked -p zeroclaw-gateway --lib redis_rate_limiter::
+          cargo test --locked -p zeroclaw-gateway --lib gateway_rate_limiter_upgrade_to_redis
+          cargo test --locked -p zeroclaw-gateway --lib admission_queue::
+          cargo test --locked -p zeroclaw-gateway --lib webhook_returns_503_when_admission_queue_is_saturated
+
+  # ── Release build — only after all gates are green
+  build-release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    needs: [tenant-isolation, postgres-tests, redis-tests]
     steps:
       - uses: actions/checkout@v4
 
@@ -65,98 +141,13 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
-      # Cerveau gate: multi-tenant identity + adversarial isolation tests.
-      # A red isolation test means a cross-tenant leak — never ship that
-      # artifact.
-      - name: Tenant identity & isolation tests
-        run: |
-          cargo test --locked -p zeroclaw-memory --test tenant_isolation
-          cargo test --locked -p zeroclaw-runtime tenant
-          cargo test --locked -p zeroclaw-gateway tenant::
-
-      # Memory lifecycle against a real Postgres (ADR-004): retention prune,
-      # per-tenant budget, per-tier quota override. Uses CERVEAU_TEST_PG_URL.
-      - name: Memory lifecycle (Postgres) tests
-        run: |
-          cargo test --locked -p zeroclaw-memory --features memory-postgres --test pg_lifecycle
-          cargo test --locked -p zeroclaw-runtime control_plane::tool_idem
-
-      # Postgres memory backend embedding wiring: found missing entirely
-      # while verifying vector_enabled=true in production (the `embedding`
-      # column existed via pgvector, but nothing ever computed or read a
-      # value from it). Proves real store-time embedding + hybrid recall —
-      # including the WHERE-clause widening needed so a zero-keyword-
-      # overlap semantic match isn't filtered out before scoring — with a
-      # deterministic fake embedder, not an LLM-dependent one.
-      - name: Postgres memory embedding + hybrid recall tests
-        run: |
-          cargo test --locked -p zeroclaw-memory --features memory-postgres --test pg_embedding_recall
-
-      # Phase 4.2: per-tenant capability graph (learned "commonly used
-      # together" tool edges, used to rerank tool_search's keyword-match
-      # results). Pure ranking-logic unit tests run unconditionally as part
-      # of the crate's normal `cargo test`; this step covers the Postgres
-      # read/write path and the tenant-isolation guarantee specifically.
-      - name: Capability graph (Postgres) tests
-        env:
-          RUST_BACKTRACE: full
-        run: |
-          cargo test --locked -p zeroclaw-memory --features memory-postgres --test pg_capability_graph -- --test-threads=1
-          cargo test --locked -p zeroclaw-memory --features memory-postgres capability_graph::
-
-      # Phase 5 follow-up (Finding 1): bridge-authenticated tenant traffic
-      # must bypass the coarse per-IP webhook limiter and be charged to its
-      # own tenant bucket instead, while unauthenticated/non-tenant traffic
-      # stays bound by the per-IP limiter exactly as before. These live in
-      # zeroclaw-gateway's crate-root `tests` module (not `tenant::`), so
-      # they need their own explicit filter — the `tenant::` filter above
-      # only covers tenant.rs's own submodule tests.
-      - name: Webhook rate-limit dimension tests
-        run: |
-          cargo test --locked -p zeroclaw-gateway --lib per_ip_limit
-          cargo test --locked -p zeroclaw-gateway --lib gateway_rate_limiter_tenant_limits_are_isolated_per_tenant
-
-      # ADR-005 (horizontal scaling): the shared Redis-backed rate limiter's
-      # one genuinely new correctness property — a tenant's limit binds on
-      # its *aggregate* traffic across two independently-connected limiter
-      # instances (standing in for two Cerveau instances behind a load
-      # balancer), not once per instance. Also covers fail-open behavior on
-      # a bad/unreachable redis_url (no CERVEAU_TEST_REDIS_URL needed for
-      # that half) and the per-instance admission-queue backpressure that
-      # replaces Phase 5 Finding 4's bare 500s with a clean 503.
-      - name: Shared rate limiter + admission queue tests (ADR-005)
-        run: |
-          cargo test --locked -p zeroclaw-gateway --lib redis_rate_limiter::
-          cargo test --locked -p zeroclaw-gateway --lib gateway_rate_limiter_upgrade_to_redis
-          cargo test --locked -p zeroclaw-gateway --lib admission_queue::
-          cargo test --locked -p zeroclaw-gateway --lib webhook_returns_503_when_admission_queue_is_saturated
-
-      # xtask wrapper: renders the gateway OpenAPI spec, generates
-      # web/src/lib/api-generated.ts, then npm ci + vite build.
-      # The gateway embeds web/dist/ into the binary.
       - name: Build web dashboard
         run: cargo web build
 
-      # Feature set resolved from upstream's canonical registry — the same
-      # single source of truth install.sh and packaging use ("dist" = the
-      # lean standard distribution set).
       - name: Build release binary
         run: |
           FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection dist --target x86_64-unknown-linux-gnu)"
-          # Cerveau: the dist selection does NOT include the Postgres memory
-          # backend — without it the binary ships a stub that errors at
-          # runtime ("compiled without memory-postgres"). Tenant memory lives
-          # in Postgres (ADR-002 D5 / ADR-004), so append it explicitly.
           FEATURES="$FEATURES,memory-postgres"
-          # Cerveau (enterprise-hardening: OfficeCLI/MCP-stdio per-tenant
-          # workspace isolation): the dist selection also omits every
-          # sandbox-* feature, so LandlockSandbox was never compiled into
-          # any production binary — the shell tool's own sandboxing has
-          # silently been NoopSandbox in prod this whole time, independent
-          # of anything tenant-isolation-related. No external binary needed
-          # (unlike firejail/bubblewrap/docker, none of which are installed
-          # on tencent-vps) — Landlock is a pure in-kernel LSM reachable via
-          # syscalls the `landlock` crate wraps.
           FEATURES="$FEATURES,sandbox-landlock"
           echo "Resolved features: $FEATURES"
           cargo build --release --locked --no-default-features \
@@ -179,14 +170,6 @@ jobs:
             zeroclaw-x86_64-unknown-linux-gnu.tar.gz.sha256
           retention-days: 30
 
-      # Actions artifacts (above) always require an authenticated API call
-      # to download, even on a public repo — every VPS deploy this whole
-      # patch series needed a personal token pasted by hand just to fetch
-      # the build. A GitHub Release's assets are plain public HTTPS URLs on
-      # a public repo, so publish the same two files there too, using the
-      # workflow's own auto-issued token (no PAT needed by anyone). This is
-      # a rolling release (one moving tag, replaced every build) — it's a
-      # deploy artifact, not a versioned release.
       - name: Publish rolling release (public, token-free download for VPS deploy)
         env:
           GH_TOKEN: ${{ github.token }}
