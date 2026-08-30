@@ -934,9 +934,46 @@ async fn resolve_memory_handle(
     state: &AppState,
     agent_alias: Option<&str>,
 ) -> Result<std::sync::Arc<dyn zeroclaw_memory::Memory>, (StatusCode, Json<serde_json::Value>)> {
+    resolve_memory_handle_scoped(state, agent_alias, None).await
+}
+
+/// Cerveau: the tenant-aware form of [`resolve_memory_handle`].
+///
+/// With no tenant selector this is bit-for-bit the vanilla path. With one, the
+/// handle is built by `create_memory_for_tenant`, which binds the agent-id
+/// dimension to `t_<user_id>.<agent_type>` and passes an empty cross-agent
+/// allowlist -- the same structural jail a tenant-scoped turn runs under, so a
+/// document written here is visible to exactly the agent that will retrieve it
+/// and to nothing else.
+///
+/// `agent_alias` still has to name a configured agent even in the tenant case:
+/// it is the *host* whose memory backend and model provider the tenant overlay
+/// borrows, exactly as `agent/loop_.rs` uses it for a tenant turn. It is
+/// required rather than defaulted, because silently picking a host would make
+/// which backend a tenant's data lands in an invisible decision.
+async fn resolve_memory_handle_scoped(
+    state: &AppState,
+    agent_alias: Option<&str>,
+    tenant: Option<&crate::tenant::TenantSelector>,
+) -> Result<std::sync::Arc<dyn zeroclaw_memory::Memory>, (StatusCode, Json<serde_json::Value>)> {
     let alias = match agent_alias.map(str::trim).filter(|s| !s.is_empty()) {
         Some(a) => a,
-        None => return Ok(state.mem.clone()),
+        None => {
+            if tenant.is_some() {
+                // Never fall through to `state.mem` here: that is the
+                // install-wide memory, and pooling a tenant's writes into it
+                // is precisely the leak this function exists to prevent.
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":
+                        "A tenant-scoped memory request must name a host agent \
+                         (`agent`), which supplies the memory backend the tenant \
+                         overlay borrows"
+                    })),
+                ));
+            }
+            return Ok(state.mem.clone());
+        }
     };
     let config = state.config.read().clone();
     if config.agent(alias).is_none() {
@@ -950,16 +987,54 @@ async fn resolve_memory_handle(
     let api_key = config
         .resolved_model_provider_for_agent(alias)
         .and_then(|(_, _, cfg)| cfg.api_key.clone());
-    zeroclaw_memory::create_memory_for_agent(&config, alias, api_key.as_deref())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    serde_json::json!({"error": format!("Failed to build per-agent memory: {e:#}")}),
-                ),
+
+    match tenant {
+        Some(sel) => {
+            zeroclaw_memory::create_memory_for_tenant(
+                &config,
+                alias,
+                &sel.tenant_id(),
+                api_key.as_deref(),
             )
-        })
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!(
+                        "Failed to build tenant-scoped memory: {e:#}"
+                    )})),
+                )
+            })
+        }
+        None => zeroclaw_memory::create_memory_for_agent(&config, alias, api_key.as_deref())
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("Failed to build per-agent memory: {e:#}")
+                    })),
+                )
+            }),
+    }
+}
+
+/// Cerveau: read the tenant selector off a request, rejecting a malformed or
+/// half-specified one rather than letting it fall through as vanilla.
+///
+/// `TenantSelector::from_headers` already distinguishes "no tenant headers at
+/// all" from "tenant headers present but wrong"; this keeps that distinction
+/// instead of collapsing both to `None`, which would turn a typo in
+/// `X-Agent-Type` into a silent write to unscoped memory.
+fn tenant_from_headers_or_400(
+    headers: &HeaderMap,
+) -> Result<Option<crate::tenant::TenantSelector>, (StatusCode, Json<serde_json::Value>)> {
+    crate::tenant::TenantSelector::from_headers(headers).map_err(|reason| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Invalid tenant headers: {reason}")})),
+        )
+    })
 }
 
 /// GET /api/memory — list or search memory entries
@@ -1072,7 +1147,13 @@ pub async fn handle_api_memory_store(
         })
         .unwrap_or(zeroclaw_memory::MemoryCategory::Core);
 
-    let mem = match resolve_memory_handle(&state, body.agent.as_deref()).await {
+    let tenant = match tenant_from_headers_or_400(&headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
+    let mem = match resolve_memory_handle_scoped(&state, body.agent.as_deref(), tenant.as_ref())
+        .await
+    {
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
@@ -5107,5 +5188,71 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(status_of(router, req).await, StatusCode::OK);
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tenant_memory_gate_tests {
+    use super::*;
+    use axum::http::{HeaderName, HeaderValue};
+
+    // HeaderMap::insert takes `impl IntoHeaderName`, which for a plain &str
+    // means &'static str; building the name explicitly keeps these helpers
+    // usable with ordinary borrowed test data.
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    /// No tenant headers at all is the vanilla path, not an error: every
+    /// pre-existing caller of /api/memory sends none.
+    #[test]
+    fn absent_tenant_headers_are_not_an_error() {
+        let got = tenant_from_headers_or_400(&headers(&[])).expect("should be Ok");
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn complete_tenant_headers_compose_user_dot_agent_type() {
+        let got = tenant_from_headers_or_400(&headers(&[
+            ("X-Tenant-Id", "user_abc"),
+            ("X-Agent-Type", "leads_qualifier"),
+        ]))
+        .expect("should be Ok")
+        .expect("should be Some");
+        assert_eq!(got.tenant_id(), "user_abc.leads_qualifier");
+    }
+
+    /// The one that matters. A half-specified tenant must NOT degrade to the
+    /// vanilla path -- that path writes to the install-wide memory, so a typo
+    /// in X-Agent-Type would silently pool one tenant's documents into a store
+    /// every other tenant can read.
+    #[test]
+    fn half_specified_tenant_is_rejected_not_ignored() {
+        let (status, _) = tenant_from_headers_or_400(&headers(&[("X-Tenant-Id", "user_abc")]))
+            .expect_err("a lone X-Tenant-Id must be rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _) =
+            tenant_from_headers_or_400(&headers(&[("X-Agent-Type", "leads_qualifier")]))
+                .expect_err("a lone X-Agent-Type must be rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn malformed_tenant_value_is_rejected() {
+        let (status, _) = tenant_from_headers_or_400(&headers(&[
+            ("X-Tenant-Id", "user abc"),
+            ("X-Agent-Type", "leads_qualifier"),
+        ]))
+        .expect_err("a value outside [A-Za-z0-9._-] must be rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }
