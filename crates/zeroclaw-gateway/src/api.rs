@@ -5195,12 +5195,18 @@ pub(crate) mod tests {
 #[cfg(test)]
 mod tenant_memory_gate_tests {
     use super::*;
-    use axum::http::HeaderValue;
+    use axum::http::{HeaderName, HeaderValue};
 
+    // HeaderMap::insert takes `impl IntoHeaderName`, which for a plain &str
+    // means &'static str; building the name explicitly keeps these helpers
+    // usable with ordinary borrowed test data.
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
         for (k, v) in pairs {
-            h.insert(*k, HeaderValue::from_str(v).unwrap());
+            h.insert(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
         }
         h
     }
