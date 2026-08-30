@@ -1,0 +1,32 @@
+name: cerveau-quick
+
+# Fast gate for every push/PR — tenant isolation only, no Postgres/Redis,
+# finishes in ~3 min vs 29 min for the full cerveau-build.
+# Use this for quick feedback; cerveau-build remains the release gate.
+
+on:
+  push:
+    branches: [cerveau-main, "fix/**", "feature/**", "chore/**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tenant-isolation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: cerveau-quick
+
+      - name: Tenant identity & isolation tests (fast, no DB)
+        run: |
+          cargo test --locked -p zeroclaw-memory --test tenant_isolation
+          cargo test --locked -p zeroclaw-runtime tenant
+          cargo test --locked -p zeroclaw-gateway tenant::
