@@ -106,8 +106,6 @@ impl Tool for GraphRememberTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let (tenant_id, agent_type) = (self.tenant_id.as_str(), self.agent_type.as_str());
-
         let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
         if text.is_empty() {
             return Ok(ToolResult {
@@ -117,92 +115,79 @@ impl Tool for GraphRememberTool {
             });
         }
 
-        let client = client();
-        let base = self.cfg.base_url.trim_end_matches('/');
-
-        let part = match reqwest::multipart::Part::bytes(text.as_bytes().to_vec())
-            .file_name("fact.txt")
-            .mime_str("text/plain")
-        {
-            Ok(p) => p,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!("failed to build request: {e}")),
-                });
-            }
-        };
-        let form = reqwest::multipart::Form::new()
-            .part("data", part)
-            .text("datasetName", DATASET_NAME);
-
-        let add_req = apply_tenant_headers(
-            client.post(format!("{base}/api/v1/add")),
-            &self.cfg,
-            tenant_id,
-            agent_type,
-        )
-        .multipart(form);
-
-        let add_resp = match add_req.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!("graph memory unavailable: {e}")),
-                });
-            }
-        };
-        if !add_resp.status().is_success() {
-            let status = add_resp.status();
-            let body = add_resp.text().await.unwrap_or_default();
-            return Ok(ToolResult {
+        match remember(&self.cfg, &self.tenant_id, &self.agent_type, text).await {
+            Ok(()) => Ok(ToolResult {
+                success: true,
+                output: ToolOutput::text("Stored and extracted into the knowledge graph."),
+                error: None,
+            }),
+            Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!("graph_remember: add failed ({status}): {body}")),
-            });
+                error: Some(e.to_string()),
+            }),
         }
-
-        let cognify_req = apply_tenant_headers(
-            client.post(format!("{base}/api/v1/cognify")),
-            &self.cfg,
-            tenant_id,
-            agent_type,
-        )
-        .json(&json!({"datasets": [DATASET_NAME], "runInBackground": false}));
-
-        let cognify_resp = match cognify_req.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!(
-                        "graph_remember: stored but graph extraction request failed: {e}"
-                    )),
-                });
-            }
-        };
-        if !cognify_resp.status().is_success() {
-            let status = cognify_resp.status();
-            let body = cognify_resp.text().await.unwrap_or_default();
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!(
-                    "graph_remember: stored but graph extraction failed ({status}): {body}"
-                )),
-            });
-        }
-
-        Ok(ToolResult {
-            success: true,
-            output: ToolOutput::text("Stored and extracted into the knowledge graph."),
-            error: None,
-        })
     }
+}
+
+/// Store `text` in a tenant's knowledge graph: `add` then `cognify`. Shared
+/// by `GraphRememberTool::execute` and any other caller that wants to enrich
+/// the graph outside a normal tool call (e.g. `skills::review`'s
+/// post-improvement hook — see that module for why skill improvements get
+/// logged here, not just to disk).
+pub async fn remember(
+    cfg: &CogneeConfig,
+    tenant_id: &str,
+    agent_type: &str,
+    text: &str,
+) -> anyhow::Result<()> {
+    let client = client();
+    let base = cfg.base_url.trim_end_matches('/');
+
+    let part = reqwest::multipart::Part::bytes(text.as_bytes().to_vec())
+        .file_name("fact.txt")
+        .mime_str("text/plain")
+        .map_err(|e| anyhow::anyhow!("failed to build request: {e}"))?;
+    let form = reqwest::multipart::Form::new()
+        .part("data", part)
+        .text("datasetName", DATASET_NAME);
+
+    let add_req = apply_tenant_headers(
+        client.post(format!("{base}/api/v1/add")),
+        cfg,
+        tenant_id,
+        agent_type,
+    )
+    .multipart(form);
+
+    let add_resp = add_req
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("graph memory unavailable: {e}"))?;
+    if !add_resp.status().is_success() {
+        let status = add_resp.status();
+        let body = add_resp.text().await.unwrap_or_default();
+        anyhow::bail!("graph_remember: add failed ({status}): {body}");
+    }
+
+    let cognify_req = apply_tenant_headers(
+        client.post(format!("{base}/api/v1/cognify")),
+        cfg,
+        tenant_id,
+        agent_type,
+    )
+    .json(&json!({"datasets": [DATASET_NAME], "runInBackground": false}));
+
+    let cognify_resp = cognify_req.send().await.map_err(|e| {
+        anyhow::anyhow!("graph_remember: stored but graph extraction request failed: {e}")
+    })?;
+    if !cognify_resp.status().is_success() {
+        let status = cognify_resp.status();
+        let body = cognify_resp.text().await.unwrap_or_default();
+        anyhow::bail!("graph_remember: stored but graph extraction failed ({status}): {body}");
+    }
+
+    Ok(())
 }
 
 /// Query the tenant's knowledge graph. Use for relationship questions

@@ -66,8 +66,25 @@ pub async fn maybe_run_skill_review(
         return;
     }
 
-    let tools: Vec<Box<dyn Tool>> =
-        build_review_tools(workspace_dir.clone(), config.clone(), allow_scripts);
+    // Aivory Cerveau: log successful skill improvements to the tenant's
+    // knowledge graph. Runs via `.scope()`, not `spawn`, so this task-local
+    // read sees whatever tenant context the calling turn set — same
+    // reachability `all_tools_with_runtime` relies on for graph_remember/
+    // graph_recall. `None` on any non-tenant path (vanilla zeroclaw today,
+    // a configless test, cognee disabled): graph logging is enrichment, the
+    // skill patch itself works identically either way.
+    let graph_logging = match full_config.filter(|c| c.cognee.enabled) {
+        Some(cfg) => crate::agent::tenant::current_tenant()
+            .map(|t| (cfg.cognee.clone(), t.platform_user_id.clone(), t.agent_type.clone())),
+        None => None,
+    };
+
+    let tools: Vec<Box<dyn Tool>> = build_review_tools(
+        workspace_dir.clone(),
+        config.clone(),
+        allow_scripts,
+        graph_logging,
+    );
     let review_input = build_review_input(&failed_slugs);
 
     let mut review_history = history;
@@ -170,12 +187,17 @@ fn build_review_tools(
     workspace_dir: PathBuf,
     config: SkillImprovementConfig,
     allow_scripts: bool,
+    graph_logging: Option<(zeroclaw_config::schema::CogneeConfig, String, String)>,
 ) -> Vec<Box<dyn Tool>> {
     let wd = Arc::new(workspace_dir);
+    let mut manage_tool = SkillManageTool::new((*wd).clone(), config, allow_scripts);
+    if let Some((cognee_cfg, tenant_id, agent_type)) = graph_logging {
+        manage_tool = manage_tool.with_graph_logging(cognee_cfg, tenant_id, agent_type);
+    }
     vec![
         Box::new(SkillsListTool::new((*wd).clone())),
         Box::new(SkillViewTool::new((*wd).clone())),
-        Box::new(SkillManageTool::new((*wd).clone(), config, allow_scripts)),
+        Box::new(manage_tool),
     ]
 }
 
