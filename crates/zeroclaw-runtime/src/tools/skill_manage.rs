@@ -277,6 +277,12 @@ pub struct SkillManageTool {
     /// Mirrors `config.skills.allow_scripts` so post-mutation audit applies
     /// the same script policy that the loader/installer enforces.
     allow_scripts: bool,
+    /// Aivory Cerveau: when set (cognee enabled + a tenant context existed
+    /// when this tool was built — see `skills::review::maybe_run_skill_review`),
+    /// a successful `patch` also logs the improvement into the tenant's
+    /// knowledge graph. `None` on any non-tenant/non-cognee path — logging
+    /// is enrichment, never required for the patch itself to succeed.
+    cognee: Option<(zeroclaw_config::schema::CogneeConfig, String, String)>,
 }
 
 impl SkillManageTool {
@@ -289,7 +295,22 @@ impl SkillManageTool {
             workspace_dir,
             config,
             allow_scripts,
+            cognee: None,
         }
+    }
+
+    /// Opt into logging successful skill improvements to the graph. See the
+    /// `cognee` field doc for why this is a separate step rather than a
+    /// `new()` parameter — most `SkillManageTool` construction sites (tests,
+    /// non-tenant runs) have nothing to pass here.
+    pub fn with_graph_logging(
+        mut self,
+        cognee: zeroclaw_config::schema::CogneeConfig,
+        tenant_id: String,
+        agent_type: String,
+    ) -> Self {
+        self.cognee = Some((cognee, tenant_id, agent_type));
+        self
     }
 }
 
@@ -501,6 +522,34 @@ impl SkillManageTool {
                         error: Some(err),
                     });
                 }
+
+                // Aivory Cerveau: best-effort graph log of *why* this skill
+                // changed. Never fails the patch itself -- the disk write
+                // already succeeded and passed audit; this is institutional
+                // history for later multi-hop queries ("which skills changed
+                // because of a Stripe rate-limit issue"), not a requirement
+                // for the improvement to count.
+                if let Some((cognee_cfg, tenant_id, agent_type)) = &self.cognee {
+                    let text =
+                        format!("Skill '{slug}' was improved. Reason: {reason}");
+                    if let Err(e) = zeroclaw_tools::graph_memory::remember(
+                        cognee_cfg, tenant_id, agent_type, &text,
+                    )
+                    .await
+                    {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "slug": slug,
+                                    "error": e.to_string(),
+                                })),
+                            "skill improvement graph-log failed (non-fatal)"
+                        );
+                    }
+                }
+
                 Ok(ToolResult {
                     success: true,
                     output: format!("Patched skill '{slug}'.").into(),
