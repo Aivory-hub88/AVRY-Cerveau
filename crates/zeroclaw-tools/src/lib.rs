@@ -64,6 +64,7 @@ pub mod mcp_transport;
 pub mod memory_export;
 pub mod memory_forget;
 pub mod memory_purge;
+pub mod graph_memory;
 pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;

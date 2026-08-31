@@ -326,6 +326,12 @@ pub struct Config {
     #[group = "Integrations"]
     pub composio: ComposioConfig,
 
+    /// Aivory Cerveau: cognee-rs graph/long-term-memory sidecar (`[cognee]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Integrations"]
+    pub cognee: CogneeConfig,
+
     /// Microsoft 365 Graph API integration (`[microsoft365]`).
     #[serde(default)]
     #[nested]
@@ -7586,6 +7592,53 @@ impl Default for NodeTransportConfig {
             tls_key_path: None,
             mutual_tls: false,
             connection_pool_size: default_connection_pool_size(),
+        }
+    }
+}
+
+// ── Cerveau: cognee-rs graph memory sidecar ──────────────────────
+
+/// Aivory Cerveau's cognee-rs graph/long-term-memory sidecar (`[cognee]`
+/// section). See docs/ADR-007-CERVEAU-COGNEE-INTEGRATION.md in AVRY-V2-Main.
+///
+/// This is a companion to `zeroclaw-memory`'s own pgvector recall, not a
+/// replacement: it answers multi-hop relationship questions
+/// ("who is connected to X through Y") that a ranked list of similar chunks
+/// structurally can't. Only reachable on a tenant turn -- the sidecar's own
+/// `cerveau-server` binary enforces isolation by deriving a UUID from
+/// `X-Tenant-Id`/`X-Agent-Type`, so there is no meaningful "shared graph" to
+/// fall back to outside a tenant context.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "cognee"]
+pub struct CogneeConfig {
+    /// Wire the graph_remember/graph_recall tools for tenant turns.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base URL of the cerveau-server sidecar, e.g. `http://127.0.0.1:3200`.
+    #[serde(default = "default_cognee_base_url")]
+    pub base_url: String,
+    /// Shared secret sent as `X-Cerveau-Internal-Secret` -- must match the
+    /// sidecar's own `CERVEAU_INTERNAL_SECRET`. Without it every call gets a
+    /// real 401 (the sidecar's `TenantHeaderResolver` refuses to trust
+    /// X-Tenant-Id/X-Agent-Type on their own).
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub internal_secret: Option<String>,
+}
+
+fn default_cognee_base_url() -> String {
+    "http://127.0.0.1:3200".into()
+}
+
+impl Default for CogneeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: default_cognee_base_url(),
+            internal_secret: None,
         }
     }
 }
@@ -18421,6 +18474,7 @@ impl Default for Config {
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
             composio: ComposioConfig::default(),
+            cognee: CogneeConfig::default(),
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
@@ -26983,6 +27037,7 @@ auto_save = true
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
             composio: ComposioConfig::default(),
+            cognee: CogneeConfig::default(),
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
@@ -27858,6 +27913,7 @@ default_temperature = 0.7
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
             composio: ComposioConfig::default(),
+            cognee: CogneeConfig::default(),
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),

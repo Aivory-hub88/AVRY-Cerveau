@@ -66,6 +66,7 @@ pub use zeroclaw_tools::git_forge::GitForgeTool;
 pub use zeroclaw_tools::git_operations::GitOperationsTool;
 pub use zeroclaw_tools::glob_search::GlobSearchTool;
 pub use zeroclaw_tools::google_workspace::GoogleWorkspaceTool;
+pub use zeroclaw_tools::graph_memory::{GraphRecallTool, GraphRememberTool};
 pub use zeroclaw_tools::hardware_board_info::HardwareBoardInfoTool;
 pub use zeroclaw_tools::hardware_memory_map::HardwareMemoryMapTool;
 pub use zeroclaw_tools::hardware_memory_read::HardwareMemoryReadTool;
@@ -671,6 +672,31 @@ pub fn all_tools_with_runtime(
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
         Arc::new(TodoWriteTool::new()),
     ];
+
+    // Aivory Cerveau: graph_remember/graph_recall onto the cognee-rs sidecar
+    // (see docs/ADR-007-CERVEAU-COGNEE-INTEGRATION.md in AVRY-V2-Main).
+    // Gated on BOTH `[cognee] enabled = true` AND a live tenant context —
+    // the sidecar's own isolation is keyed off X-Tenant-Id/X-Agent-Type
+    // (§9 of the ADR), so outside a tenant turn there is no identity to
+    // scope a graph write/read to. `current_tenant()` is read here, not
+    // inside the tool: `zeroclaw-tools` cannot depend on `zeroclaw-runtime`
+    // (the dependency runs the other way), so this is the only place that
+    // can actually resolve it — see the module doc on graph_memory.rs.
+    if root_config.cognee.enabled
+        && let Some(tenant) = crate::agent::tenant::current_tenant()
+    {
+        let cognee_cfg = root_config.cognee.clone();
+        tool_arcs.push(Arc::new(GraphRememberTool::new(
+            cognee_cfg.clone(),
+            tenant.platform_user_id.clone(),
+            tenant.agent_type.clone(),
+        )));
+        tool_arcs.push(Arc::new(GraphRecallTool::new(
+            cognee_cfg,
+            tenant.platform_user_id.clone(),
+            tenant.agent_type.clone(),
+        )));
+    }
 
     // A SubAgent runs as an ephemeral clone of its parent and inherits the
     // parent's model verbatim; it must not be able to switch the active
