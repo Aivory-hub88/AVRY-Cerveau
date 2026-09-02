@@ -930,16 +930,13 @@ pub async fn handle_api_doctor(
     .into_response()
 }
 
-async fn resolve_memory_handle(
-    state: &AppState,
-    agent_alias: Option<&str>,
-) -> Result<std::sync::Arc<dyn zeroclaw_memory::Memory>, (StatusCode, Json<serde_json::Value>)> {
-    resolve_memory_handle_scoped(state, agent_alias, None).await
-}
-
-/// Cerveau: the tenant-aware form of [`resolve_memory_handle`].
+/// Cerveau: resolve a `Memory` handle, optionally scoped to a tenant.
 ///
-/// With no tenant selector this is bit-for-bit the vanilla path. With one, the
+/// With no tenant selector this is bit-for-bit the vanilla path (equivalent
+/// to the old, now-removed `resolve_memory_handle` — every `/api/memory` and
+/// `/webhook/memory/*` handler goes through this one resolver now, so there
+/// is exactly one place that decides vanilla-vs-tenant memory routing). With
+/// a tenant selector, the
 /// handle is built by `create_memory_for_tenant`, which binds the agent-id
 /// dimension to `t_<user_id>.<agent_type>` and passes an empty cross-agent
 /// allowlist -- the same structural jail a tenant-scoped turn runs under, so a
@@ -951,7 +948,7 @@ async fn resolve_memory_handle(
 /// borrows, exactly as `agent/loop_.rs` uses it for a tenant turn. It is
 /// required rather than defaulted, because silently picking a host would make
 /// which backend a tenant's data lands in an invisible decision.
-async fn resolve_memory_handle_scoped(
+pub(crate) async fn resolve_memory_handle_scoped(
     state: &AppState,
     agent_alias: Option<&str>,
     tenant: Option<&crate::tenant::TenantSelector>,
@@ -1038,6 +1035,23 @@ fn tenant_from_headers_or_400(
 }
 
 /// GET /api/memory — list or search memory entries
+///
+/// Cerveau: routed through [`resolve_memory_handle_scoped`], the same
+/// tenant-aware resolver `handle_api_memory_store` already used — this
+/// handler and [`handle_api_memory_delete`] previously called it with a
+/// hardcoded `None` tenant instead, meaning a caller sending
+/// `X-Tenant-Id`/`X-Agent-Type` alongside a paired bearer token
+/// could store into a tenant's own memory but only ever list/delete from
+/// the install-wide or per-agent-alias backend — a real gap independently
+/// flagged in `docs/CERVEAU-STATUS.md` and
+/// `docs/CERVEAU-TECHNICAL-REFERENCE.md`. Fixed here to match `store`'s
+/// already-correct pattern exactly. `require_auth`'s PairingGuard bearer
+/// token is unrelated to tenant identity (it just proves "a human paired
+/// this dashboard/CLI session"), so this fix is orthogonal to but
+/// consistent with `/webhook/memory/*`'s webhook-secret-authenticated
+/// routes ([`crate::api_tenant_memory`]) added alongside it for callers
+/// (like avry-backend) that hold a webhook secret instead of a pairing
+/// token.
 pub async fn handle_api_memory_list(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1047,7 +1061,13 @@ pub async fn handle_api_memory_list(
         return e.into_response();
     }
 
-    let mem = match resolve_memory_handle(&state, params.agent.as_deref()).await {
+    let tenant = match tenant_from_headers_or_400(&headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
+    let mem = match resolve_memory_handle_scoped(&state, params.agent.as_deref(), tenant.as_ref())
+        .await
+    {
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
@@ -1100,7 +1120,7 @@ pub async fn handle_api_memory_list(
     }
 }
 
-fn sanitize_memory_entries_for_api(entries: Vec<MemoryEntry>) -> Vec<MemoryEntry> {
+pub(crate) fn sanitize_memory_entries_for_api(entries: Vec<MemoryEntry>) -> Vec<MemoryEntry> {
     entries
         .into_iter()
         .map(|mut entry| {
@@ -1169,6 +1189,12 @@ pub async fn handle_api_memory_store(
 }
 
 /// DELETE /api/memory/:key — delete a memory entry
+///
+/// Cerveau: same fix as [`handle_api_memory_list`] — the tenant selector is
+/// now threaded into [`resolve_memory_handle_scoped`] instead of being
+/// dropped, so a tenant-scoped delete actually deletes from the tenant's own
+/// jailed memory instead of the install-wide/per-agent-alias one. See that
+/// handler's doc for the full context.
 pub async fn handle_api_memory_delete(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1179,7 +1205,13 @@ pub async fn handle_api_memory_delete(
         return e.into_response();
     }
 
-    let mem = match resolve_memory_handle(&state, query.agent.as_deref()).await {
+    let tenant = match tenant_from_headers_or_400(&headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
+    let mem = match resolve_memory_handle_scoped(&state, query.agent.as_deref(), tenant.as_ref())
+        .await
+    {
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
