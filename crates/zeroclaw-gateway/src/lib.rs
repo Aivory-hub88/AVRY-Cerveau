@@ -25,6 +25,7 @@ pub mod api_sop;
 pub mod api_sop_author;
 mod api_sop_webhook;
 pub mod api_tenant_approvals;
+pub mod api_tenant_memory;
 pub mod api_upload;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
@@ -1805,6 +1806,17 @@ pub async fn run_gateway(
         .route(
             "/webhook/approvals/{id}/resolve",
             post(api_tenant_approvals::handle_webhook_approval_resolve),
+        )
+        // ── Tenant-scoped White-Box Memory (webhook-secret authenticated,
+        // same two-layer contract as /webhook/approvals above) ──
+        .route(
+            "/webhook/memory",
+            get(api_tenant_memory::handle_webhook_memory_list),
+        )
+        .route(
+            "/webhook/memory/{key}",
+            put(api_tenant_memory::handle_webhook_memory_edit)
+                .delete(api_tenant_memory::handle_webhook_memory_delete),
         )
         .merge(optional_channel_routes())
         // ── Claude Code runner hooks ──
