@@ -302,6 +302,39 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         session_id: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>>;
 
+    /// Same as [`list`](Self::list), restricted to rows attributed to one of
+    /// `agent_ids`. An empty slice matches nothing.
+    ///
+    /// The default implementation composes [`list`](Self::list) with an
+    /// in-process filter, which is *correct* everywhere but reads every
+    /// tenant's rows out of storage to discard almost all of them — on a
+    /// busy multi-tenant install that is the whole table per call. Backends
+    /// that can push the predicate into the query (SQL `= ANY`, Qdrant
+    /// filters) override this; see `PostgresMemory`'s override.
+    ///
+    /// Callers that are already agent-scoped (`AgentScopedMemory`) must use
+    /// this rather than filtering `list` themselves, so the pushdown is
+    /// actually reachable.
+    async fn list_for_agents(
+        &self,
+        agent_ids: &[String],
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        if agent_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let entries = self.list(category, session_id).await?;
+        Ok(entries
+            .into_iter()
+            .filter(|e| {
+                e.agent_id
+                    .as_deref()
+                    .is_some_and(|aid| agent_ids.iter().any(|allowed| allowed == aid))
+            })
+            .collect())
+    }
+
     /// Remove a memory by key. Deletes every row matching `key`, regardless
     /// of agent attribution. Agent-scoped callers (the `AgentScopedMemory`
     /// wrapper) use [`forget_for_agent`](Self::forget_for_agent) instead.

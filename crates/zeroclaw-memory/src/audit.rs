@@ -315,6 +315,21 @@ impl<M: Memory> Memory for AuditedMemory<M> {
         self.inner.list(category, session_id).await
     }
 
+    /// Forwarded, not left to the trait default — the default would call
+    /// this decorator's own unscoped `list`, losing the backend's predicate
+    /// pushdown (and double-logging the audit line).
+    async fn list_for_agents(
+        &self,
+        agent_ids: &[String],
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.log_audit(AuditOp::List, None, None, session_id, None);
+        self.inner
+            .list_for_agents(agent_ids, category, session_id)
+            .await
+    }
+
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
         self.log_audit(AuditOp::Forget, Some(key), None, None, None);
         self.inner.forget(key).await

@@ -269,15 +269,16 @@ impl Memory for AgentScopedMemory {
         category: Option<&MemoryCategory>,
         session_id: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        let entries = self.inner.list(category, session_id).await?;
-        Ok(entries
-            .into_iter()
-            .filter(|e| {
-                e.agent_id
-                    .as_deref()
-                    .is_some_and(|aid| self.allowed_agent_ids.contains(aid))
-            })
-            .collect())
+        // Delegates rather than filtering an unscoped `list` in Rust: the
+        // filter is identical either way, but this lets a backend push the
+        // predicate into its own query (Postgres does) instead of reading
+        // every tenant's rows out of storage to discard almost all of them.
+        // `allowed_agent_ids` always contains `agent_id` itself — see
+        // `AgentScopedMemory::new`.
+        let allowed: Vec<String> = self.allowed_agent_ids.iter().cloned().collect();
+        self.inner
+            .list_for_agents(&allowed, category, session_id)
+            .await
     }
 
     async fn forget(&self, key: &str) -> Result<bool> {
@@ -934,6 +935,79 @@ mod tests {
             !entries.iter().any(|e| e.key == "rogue-row"),
             "list must drop rows attributed to non-allowlisted agents"
         );
+    }
+
+    /// The scoped wrapper must route through `list_for_agents`, not filter an
+    /// unscoped `list` itself — that delegation is the only thing that makes a
+    /// backend's predicate pushdown (Postgres' `= ANY`) reachable at all. This
+    /// asserts the results are identical to the equivalent direct call, so a
+    /// revert to in-Rust filtering shows up as a behavioural diff here rather
+    /// than as a silent full-table read in production.
+    #[tokio::test]
+    async fn list_delegates_to_list_for_agents() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta", "rogue"]).await;
+        let (alpha_uuid, beta_uuid, rogue_uuid) = (&uuids[0], &uuids[1], &uuids[2]);
+
+        for (key, owner) in [
+            ("alpha-row", alpha_uuid),
+            ("beta-row", beta_uuid),
+            ("rogue-row", rogue_uuid),
+        ] {
+            inner
+                .store_with_agent(key, "v", MemoryCategory::Core, None, None, None, Some(owner))
+                .await
+                .unwrap();
+        }
+
+        let shared = as_dyn(inner);
+        let wrapper =
+            AgentScopedMemory::new(shared.clone(), alpha_uuid, vec![beta_uuid.clone()]);
+
+        let mut via_wrapper: Vec<String> = wrapper
+            .list(None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        let mut direct: Vec<String> = shared
+            .list_for_agents(&[alpha_uuid.clone(), beta_uuid.clone()], None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        via_wrapper.sort();
+        direct.sort();
+
+        assert_eq!(via_wrapper, direct);
+        assert_eq!(via_wrapper, vec!["alpha-row".to_string(), "beta-row".to_string()]);
+        assert!(!via_wrapper.iter().any(|k| k == "rogue-row"));
+    }
+
+    /// Empty allowlist matches nothing — never "everything". `AgentScopedMemory`
+    /// can't produce this (its constructor always inserts the bound agent), so
+    /// this pins the trait default's own guard for direct callers.
+    #[tokio::test]
+    async fn list_for_agents_with_no_agents_returns_empty() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha"]).await;
+        inner
+            .store_with_agent(
+                "alpha-row",
+                "v",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&uuids[0]),
+            )
+            .await
+            .unwrap();
+
+        let entries = as_dyn(inner).list_for_agents(&[], None, None).await.unwrap();
+        assert!(entries.is_empty(), "empty allowlist must match nothing");
     }
 
     #[tokio::test]
