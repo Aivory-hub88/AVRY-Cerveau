@@ -362,8 +362,19 @@ impl McpServer {
                 config.name
             ))
         })?;
-        let tool_list: McpToolsListResult = serde_json::from_value(result)
+        let mut tool_list: McpToolsListResult = serde_json::from_value(result)
             .with_context(|| format!("failed to parse tools/list from `{}`", config.name))?;
+
+        // `McpServerConfig::disabled_tools` — filtered here, before a single
+        // `McpToolDef` reaches `McpServerInner.tools`, so a disabled tool is
+        // invisible to every downstream consumer (eager registration,
+        // `mcp_deferred`'s stubs, `tool_search`) rather than merely refused
+        // if the model happens to call it anyway.
+        if !config.disabled_tools.is_empty() {
+            tool_list
+                .tools
+                .retain(|t| !config.disabled_tools.iter().any(|d| d == &t.name));
+        }
 
         let tool_count = tool_list.tools.len();
 
@@ -1577,6 +1588,47 @@ mod tests {
         let all = registry.list_all_prompts().await;
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].1.name, "remote__summarize");
+    }
+
+    #[tokio::test]
+    async fn connect_filters_out_disabled_tools() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc":"2.0","id":1,"result":{"capabilities":{}}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method":"notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method":"tools/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc":"2.0","id":2,"result":{"tools":[
+                    {"name":"get_orders","description":"List orders","inputSchema":{}},
+                    {"name":"refund","description":"Issue a refund","inputSchema":{}}
+                ]}
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = http_server_config(server.uri());
+        config.disabled_tools = vec!["refund".to_string()];
+        let connected = McpServer::connect(config)
+            .await
+            .expect("connect should succeed");
+        let tools = connected.tools().await;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "get_orders");
     }
 
     #[tokio::test]

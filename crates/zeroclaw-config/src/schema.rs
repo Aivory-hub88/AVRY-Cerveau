@@ -5249,6 +5249,20 @@ pub struct McpServerConfig {
     /// tenant-supplied URL always does.
     #[serde(default, skip_serializing)]
     pub guarded_transport: bool,
+    /// Tool names on this server to exclude from what's exposed to the
+    /// model — never advertised, not even as a deferred `tool_search`
+    /// stub. Works for both a curated `[[mcp.servers]]` entry (an ops call
+    /// to hide one noisy/dangerous tool from an otherwise-useful server)
+    /// and a tenant custom MCP server (ADR-006 §B8's per-tool checklist,
+    /// synthesized by `tenant_custom_mcp_server_configs` from `product.
+    /// tenant_custom_mcp_servers.disabled_tools`). Applied once, at
+    /// `McpConnection::connect` (`zeroclaw-tools::mcp_client`), by
+    /// filtering the server's own `tools/list` response before it's
+    /// stored — so a disabled tool never reaches `tool_search`, deferred
+    /// stubs, or the eagerly-loaded tool list, not merely refused at call
+    /// time.
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
 }
 
 /// External MCP client configuration (`[mcp]` section).

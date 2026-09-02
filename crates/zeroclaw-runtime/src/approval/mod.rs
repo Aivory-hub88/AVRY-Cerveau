@@ -614,6 +614,7 @@ mod tests {
                 auth_header_name: None,
                 auth_header_value: None,
                 risk_tier: "irreversible".to_string(),
+                disabled_tools: Vec::new(),
             }],
         });
         crate::agent::tenant::TENANT_CONTEXT
