@@ -141,6 +141,23 @@ pub struct TenantCustomMcpServer {
     /// future Aivory-admin override doesn't require a wire-format change,
     /// though nothing currently sets it to anything else.
     pub risk_tier: String,
+    /// ADR-006 §B8: tool names on *this* server the tenant has turned off
+    /// from the dashboard's per-tool checklist (`product.
+    /// tenant_custom_mcp_servers.disabled_tools`) — a denylist against the
+    /// server's own last-verified tool list, same fail-direction as
+    /// `TenantContext::disabled_toolkits` one level up. Applied by
+    /// [`tenant_custom_mcp_server_configs`] via `McpServerConfig::
+    /// disabled_tools`, which filters at `McpConnection::connect` time
+    /// (`zeroclaw-tools`) — a disabled tool is never advertised to the
+    /// model (not even as a deferred stub), never merely refused at call
+    /// time. Empty in both the genuine "nothing disabled" case and any
+    /// resolution-failure case — same fail-open-on-availability posture as
+    /// every other field here: an inconclusive read can only under-
+    /// restrict (grant a tool the tenant meant to hide), never silently
+    /// grant a tool that wasn't already unconditionally exposed before
+    /// this feature existed.
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
 }
 
 /// Tool-name prefix a tenant custom MCP server's tools carry, distinct from
@@ -195,6 +212,7 @@ pub fn tenant_custom_mcp_server_configs(
                 // belt-and-suspenders at the MCP-client-timeout layer too.
                 tool_timeout_secs: Some(30),
                 guarded_transport: true,
+                disabled_tools: server.disabled_tools.clone(),
                 ..Default::default()
             }
         })
@@ -358,6 +376,7 @@ mod tests {
             auth_header_name: Some("X-Api-Key".to_string()),
             auth_header_value: Some("secret123".to_string()),
             risk_tier: "irreversible".to_string(),
+            disabled_tools: Vec::new(),
         }
     }
 
@@ -384,6 +403,14 @@ mod tests {
             configs[0].headers.get("X-Api-Key").map(String::as_str),
             Some("secret123")
         );
+    }
+
+    #[test]
+    fn custom_mcp_server_configs_carries_disabled_tools_through() {
+        let mut server = sample_custom_server();
+        server.disabled_tools = vec!["refund".to_string()];
+        let configs = tenant_custom_mcp_server_configs(&[server]);
+        assert_eq!(configs[0].disabled_tools, vec!["refund".to_string()]);
     }
 
     #[test]
