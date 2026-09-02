@@ -371,6 +371,22 @@ impl<M: Memory> Memory for ScannedMemory<M> {
         self.filter_recalled(entries)
     }
 
+    /// Forwarded, not left to the trait default — the default would call
+    /// this decorator's own unscoped `list`, losing the backend's predicate
+    /// pushdown. The content scan still runs on whatever comes back.
+    async fn list_for_agents(
+        &self,
+        agent_ids: &[String],
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let entries = self
+            .inner
+            .list_for_agents(agent_ids, category, session_id)
+            .await?;
+        self.filter_recalled(entries)
+    }
+
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
         self.inner.forget(key).await
     }

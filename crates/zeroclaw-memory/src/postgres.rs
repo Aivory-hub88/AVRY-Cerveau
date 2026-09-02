@@ -721,6 +721,51 @@ impl Memory for PostgresMemory {
         .await
     }
 
+    /// Pushdown override of the trait default, which would otherwise pull
+    /// every tenant's rows across the wire and drop them in Rust — the whole
+    /// table per call on a busy multi-tenant install. The predicate is a
+    /// bound `= ANY($3)` parameter, never string-interpolated, so an agent
+    /// id can't reshape the query.
+    async fn list_for_agents(
+        &self,
+        agent_ids: &[String],
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        if agent_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client = self.client.get().clone();
+        let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let category = category.map(Self::category_to_str);
+        let sid = session_id.map(str::to_string);
+        let agents = agent_ids.to_vec();
+
+        run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
+            let mut client = client.lock();
+            let stmt = format!(
+                "
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id
+                FROM {qualified_table} m
+                LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                WHERE ($1::TEXT IS NULL OR m.category = $1)
+                  AND ($2::TEXT IS NULL OR m.session_id = $2)
+                  AND m.agent_id = ANY($3)
+                ORDER BY m.updated_at DESC
+                "
+            );
+
+            let category_ref = category.as_deref();
+            let session_ref = sid.as_deref();
+            let rows = client.query(&stmt, &[&category_ref, &session_ref, &agents])?;
+            rows.iter()
+                .map(Self::row_to_entry)
+                .collect::<Result<Vec<MemoryEntry>>>()
+        })
+        .await
+    }
+
     async fn forget(&self, key: &str) -> Result<bool> {
         let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();

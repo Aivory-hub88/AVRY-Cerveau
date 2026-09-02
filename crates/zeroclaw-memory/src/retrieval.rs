@@ -354,6 +354,20 @@ impl Memory for RetrievalPipeline {
         self.memory.list(category, session_id).await
     }
 
+    /// Forwarded, not left to the trait default — the default would call
+    /// this decorator's own unscoped `list`, losing the backend's predicate
+    /// pushdown.
+    async fn list_for_agents(
+        &self,
+        agent_ids: &[String],
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.memory
+            .list_for_agents(agent_ids, category, session_id)
+            .await
+    }
+
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
         let result = self.memory.forget(key).await;
         // Invalidate unless the backend confirmed a no-op; a backend error
