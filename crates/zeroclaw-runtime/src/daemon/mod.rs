@@ -427,8 +427,7 @@ pub async fn run(
             let drive_config = config.clone();
             zeroclaw_spawn::spawn!(async move {
                 let outcome = crate::control_plane::drive_resumable_goals(
-                    crate::control_plane::control_plane()
-                        .expect("just installed above"),
+                    crate::control_plane::control_plane().expect("just installed above"),
                     &drive_config,
                 )
                 .await;
@@ -444,6 +443,32 @@ pub async fn run(
                     "F-1: boot-time goal auto-resume drive finished"
                 );
             });
+        }
+    }
+
+    // ADR-008 §Phase-3: verifier sweep — periodic second-opinion pass over
+    // pending Irreversible approvals. `sweep_loop` no-ops immediately if
+    // `verifier_brain` isn't configured, so this is a harmless no-op spawn
+    // on any install that doesn't use the feature. Spawned every run
+    // iteration, same discipline as the reaper above, and torn down by the
+    // same `channels_cancel` on reload/shutdown.
+    match crate::control_plane::pending_approvals::PendingApprovalsStore::shared(&config.data_dir) {
+        Ok(store) => {
+            let sweep_config = config.clone();
+            let sweep_cancel = channels_cancel.clone();
+            zeroclaw_spawn::spawn!(async move {
+                crate::control_plane::verifier_sweep::sweep_loop(store, sweep_config, sweep_cancel)
+                    .await;
+            });
+        }
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({ "error": format!("{e:#}") })),
+                "verifier sweep: pending_approvals store unavailable; verifier_brain findings disabled for this run"
+            );
         }
     }
 

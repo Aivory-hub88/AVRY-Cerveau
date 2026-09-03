@@ -75,6 +75,16 @@ pub struct PendingApproval {
     /// that `None` state is exactly what makes a row a reaper candidate;
     /// see [`Self::list_undelivered_resolved`].
     pub delivered_at: Option<String>,
+    /// ADR-008 §Phase-3: a structured assessment (`{"verdict":"ok"|"flag"|
+    /// "error", "reasoning": "...", "confidence": 0.0-1.0}`, stored verbatim
+    /// as the JSON text the verifier turn returned) attached by the
+    /// out-of-band `verifier_sweep` module — never written from inside the
+    /// turn loop that created this row. `None` until a sweep tick picks the
+    /// row up; permanently `None` on an install with no `verifier_brain`
+    /// agent configured, which is the sweep's own no-op gate. The verifier
+    /// agent has no tool that could resolve this row itself — it can only
+    /// ever produce a finding for a human to read, never a decision.
+    pub verifier_finding: Option<String>,
 }
 
 /// SQLite-backed store for pending-approval records.
@@ -127,9 +137,18 @@ impl PendingApprovalsStore {
         // existed) and a pre-0028 DB (columns genuinely added for the
         // first time).
         for (column, ddl) in [
-            ("tenant_id", "ALTER TABLE pending_approvals ADD COLUMN tenant_id TEXT"),
-            ("agent_type", "ALTER TABLE pending_approvals ADD COLUMN agent_type TEXT"),
-            ("session_id", "ALTER TABLE pending_approvals ADD COLUMN session_id TEXT"),
+            (
+                "tenant_id",
+                "ALTER TABLE pending_approvals ADD COLUMN tenant_id TEXT",
+            ),
+            (
+                "agent_type",
+                "ALTER TABLE pending_approvals ADD COLUMN agent_type TEXT",
+            ),
+            (
+                "session_id",
+                "ALTER TABLE pending_approvals ADD COLUMN session_id TEXT",
+            ),
             (
                 "origin_message",
                 "ALTER TABLE pending_approvals ADD COLUMN origin_message TEXT",
@@ -138,11 +157,16 @@ impl PendingApprovalsStore {
                 "delivered_at",
                 "ALTER TABLE pending_approvals ADD COLUMN delivered_at TEXT",
             ),
+            (
+                "verifier_finding",
+                "ALTER TABLE pending_approvals ADD COLUMN verifier_finding TEXT",
+            ),
         ] {
             if let Err(e) = conn.execute(ddl, []) {
                 let msg = e.to_string();
                 if !msg.contains("duplicate column name") {
-                    return Err(e).with_context(|| format!("add pending_approvals.{column} column"));
+                    return Err(e)
+                        .with_context(|| format!("add pending_approvals.{column} column"));
                 }
             }
         }
@@ -162,7 +186,9 @@ impl PendingApprovalsStore {
         arguments: &str,
         risk_tier: &str,
     ) -> Result<String> {
-        self.insert_with_context(principal, tool_name, arguments, risk_tier, None, None, None, None)
+        self.insert_with_context(
+            principal, tool_name, arguments, risk_tier, None, None, None, None,
+        )
     }
 
     /// Insert a new pending row carrying enough context
@@ -215,7 +241,8 @@ impl PendingApprovalsStore {
         conn.query_row(
             "SELECT id, principal, tool_name, arguments, risk_tier, requested_at,
                     status, resolved_at, resolved_by,
-                    tenant_id, agent_type, session_id, origin_message, delivered_at
+                    tenant_id, agent_type, session_id, origin_message, delivered_at,
+                    verifier_finding
                FROM pending_approvals WHERE id = ?1",
             params![id],
             Self::row_to_pending_approval,
@@ -232,14 +259,16 @@ impl PendingApprovalsStore {
             conn.prepare(
                 "SELECT id, principal, tool_name, arguments, risk_tier, requested_at,
                         status, resolved_at, resolved_by,
-                        tenant_id, agent_type, session_id, origin_message, delivered_at
+                        tenant_id, agent_type, session_id, origin_message, delivered_at,
+                    verifier_finding
                    FROM pending_approvals WHERE status = ?1 ORDER BY requested_at DESC",
             )?
         } else {
             conn.prepare(
                 "SELECT id, principal, tool_name, arguments, risk_tier, requested_at,
                         status, resolved_at, resolved_by,
-                        tenant_id, agent_type, session_id, origin_message, delivered_at
+                        tenant_id, agent_type, session_id, origin_message, delivered_at,
+                    verifier_finding
                    FROM pending_approvals ORDER BY requested_at DESC",
             )?
         };
@@ -284,7 +313,47 @@ impl PendingApprovalsStore {
             session_id: r.get(11)?,
             origin_message: r.get(12)?,
             delivered_at: r.get(13)?,
+            verifier_finding: r.get(14)?,
         })
+    }
+
+    /// ADR-008 §Phase-3 candidates: still-`pending` rows the verifier sweep
+    /// hasn't produced a finding for yet. Scoped to `status = 'pending'`
+    /// only — a row that resolved before the sweep got to it doesn't need
+    /// one anymore (the human already decided without it), so this never
+    /// races `resolve` to attach a now-pointless finding.
+    pub fn list_unverified_pending(&self) -> Result<Vec<PendingApproval>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, principal, tool_name, arguments, risk_tier, requested_at,
+                    status, resolved_at, resolved_by,
+                    tenant_id, agent_type, session_id, origin_message, delivered_at,
+                    verifier_finding
+               FROM pending_approvals
+              WHERE status = 'pending' AND verifier_finding IS NULL
+              ORDER BY requested_at ASC",
+        )?;
+        stmt.query_map(params![], Self::row_to_pending_approval)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("list unverified pending_approvals")
+    }
+
+    /// Record the verifier sweep's finding for one row. `finding_json` is
+    /// stored verbatim — callers own producing valid JSON (or a
+    /// deliberately-non-JSON error string; this store doesn't validate the
+    /// shape, it's a text column). Scoped to `status = 'pending'` for the
+    /// same reason as `list_unverified_pending`: a finding for a row that
+    /// resolved in the meantime would never be seen by anyone and would
+    /// just be dead weight in the row. Idempotent-safe to call twice (e.g.
+    /// a sweep tick that raced its own timeout): the second call simply
+    /// overwrites with the same or a newer finding, never errors.
+    pub fn attach_verifier_finding(&self, id: &str, finding_json: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE pending_approvals SET verifier_finding = ?2 WHERE id = ?1 AND status = 'pending'",
+            params![id, finding_json],
+        )?;
+        Ok(updated == 1)
     }
 
     /// Mark a resolved row's reply as delivered. Returns `true` if a row
@@ -318,7 +387,8 @@ impl PendingApprovalsStore {
         let mut stmt = conn.prepare(
             "SELECT id, principal, tool_name, arguments, risk_tier, requested_at,
                     status, resolved_at, resolved_by,
-                    tenant_id, agent_type, session_id, origin_message, delivered_at
+                    tenant_id, agent_type, session_id, origin_message, delivered_at,
+                    verifier_finding
                FROM pending_approvals
               WHERE status IN ('approved', 'denied')
                 AND delivered_at IS NULL
@@ -436,7 +506,11 @@ mod tests {
     #[test]
     fn resolve_unknown_id_returns_false_not_error() {
         let store = PendingApprovalsStore::new_in_memory().unwrap();
-        assert!(!store.resolve("pa_does-not-exist", "approved", "ops").unwrap());
+        assert!(
+            !store
+                .resolve("pa_does-not-exist", "approved", "ops")
+                .unwrap()
+        );
     }
 
     #[test]
@@ -476,7 +550,10 @@ mod tests {
         // A second mark is a no-op, not an overwrite — proves the reaper
         // can safely race a synchronous resolve that delivers first.
         assert!(!store.mark_delivered(&id).unwrap());
-        assert_eq!(store.get(&id).unwrap().unwrap().delivered_at, row.delivered_at);
+        assert_eq!(
+            store.get(&id).unwrap().unwrap().delivered_at,
+            row.delivered_at
+        );
     }
 
     #[test]
@@ -496,7 +573,9 @@ mod tests {
                 Some("hi"),
             )
             .unwrap();
-        store.resolve(&candidate, "approved", "tenant-webhook").unwrap();
+        store
+            .resolve(&candidate, "approved", "tenant-webhook")
+            .unwrap();
 
         // Not a candidate: still pending.
         store
@@ -525,13 +604,17 @@ mod tests {
                 None,
             )
             .unwrap();
-        store.resolve(&delivered, "approved", "tenant-webhook").unwrap();
+        store
+            .resolve(&delivered, "approved", "tenant-webhook")
+            .unwrap();
         store.mark_delivered(&delivered).unwrap();
 
         // Not a candidate: resolved but no tenant context (loopback/admin
         // path — no continuation/reply concept to redeliver).
         let no_tenant = store.insert("u1", "tool_d", "{}", "irreversible").unwrap();
-        store.resolve(&no_tenant, "approved", "loopback-cli").unwrap();
+        store
+            .resolve(&no_tenant, "approved", "loopback-cli")
+            .unwrap();
 
         let candidates = store.list_undelivered_resolved().unwrap();
         assert_eq!(candidates.len(), 1);

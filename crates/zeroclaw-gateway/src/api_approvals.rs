@@ -85,6 +85,14 @@ pub(crate) fn pending_approval_json(
         "status": row.status,
         "resolved_at": row.resolved_at,
         "resolved_by": row.resolved_by,
+        // ADR-008 §Phase-3: parsed so a consumer gets a real object, not a
+        // string-of-JSON to decode twice. `None` (sweep hasn't reached this
+        // row yet, or no verifier_brain configured) and "stored but somehow
+        // not valid JSON" both surface as `null` — a caller has no
+        // legitimate reason to distinguish "no finding yet" from "a finding
+        // that failed to parse," it can only ever mean "nothing to show."
+        "verifier_finding": row.verifier_finding.as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
     })
 }
 
@@ -381,6 +389,7 @@ mod tenant_custom_fallback_tests {
             session_id: None,
             origin_message: None,
             delivered_at: None,
+            verifier_finding: None,
         }
     }
 

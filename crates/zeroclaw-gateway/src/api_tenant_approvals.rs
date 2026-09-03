@@ -714,6 +714,7 @@ mod tests {
             session_id: Some("sess-1".into()),
             origin_message: Some("please reply to ticket 42".into()),
             delivered_at: None,
+            verifier_finding: None,
         };
         let result = serde_json::json!({"success": true, "output": "ok"});
         let prompt = continuation_prompt(&row, "approve", Some(&result));
@@ -740,6 +741,7 @@ mod tests {
             session_id: None,
             origin_message: None,
             delivered_at: None,
+            verifier_finding: None,
         };
         let prompt = continuation_prompt(&row, "deny", None);
         assert!(prompt.contains("declined to approve"));
@@ -767,6 +769,7 @@ mod tests {
             session_id: None,
             origin_message: None,
             delivered_at: None,
+            verifier_finding: None,
         };
         let err = tenant_selector_for_resume(&row).unwrap_err();
         assert!(err.to_string().contains("no agent_type"));
@@ -789,6 +792,7 @@ mod tests {
             session_id: None,
             origin_message: None,
             delivered_at: None,
+            verifier_finding: None,
         };
         let err = tenant_selector_for_resume(&row).unwrap_err();
         assert!(err.to_string().contains("no principal"));
@@ -811,6 +815,7 @@ mod tests {
             session_id: Some("sess-1".into()),
             origin_message: Some("hi".into()),
             delivered_at: None,
+            verifier_finding: None,
         };
         let sel = tenant_selector_for_resume(&row).unwrap();
         assert_eq!(sel.user_id, "u1");

@@ -11,10 +11,11 @@ pub mod reaper;
 pub mod task_registry;
 pub mod task_store_sqlite;
 pub mod tool_idem;
+pub mod verifier_sweep;
 
 pub use authority::is_authoritative;
 pub use boot::ControlPlaneHandle;
-pub use continuation_drive::{drive_resumable_goals, DriveOutcome};
+pub use continuation_drive::{DriveOutcome, drive_resumable_goals};
 pub use global::{control_plane, init_control_plane};
 pub use goal_task::{
     GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState, GoalTaskRecord,
