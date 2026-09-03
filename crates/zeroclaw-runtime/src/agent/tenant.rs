@@ -339,6 +339,67 @@ pub fn take_pending_approval() -> Option<PendingApprovalSummary> {
         .flatten()
 }
 
+/// ADR-009 Phase 1: fire-time tenant resolution for non-HTTP entry points
+/// (today: `cron::scheduler::run_agent_job`; any future non-webhook
+/// caller — a channel, a delegated sub-turn — can reuse the same
+/// registration rather than growing its own).
+///
+/// `zeroclaw-runtime` cannot depend on `zeroclaw-gateway` (the dependency
+/// runs the other way), and the actual resolvers — `TenantResolver`,
+/// `ToolkitConnectionResolver`, `AgentToolScopeResolver`,
+/// `TenantCustomMcpResolver` — live there, each backed by a bounded-TTL'd
+/// LRU over Postgres or (for tenant custom MCP servers) an HTTP call to
+/// avry-backend. Rather than moving that machinery down a layer, this
+/// follows the exact precedent already established for cron delivery
+/// (`cron::scheduler::{DeliveryFn, register_delivery_fn}`): a
+/// process-wide `OnceLock` the binary crate populates once at startup
+/// with a closure that calls the same resolve-and-build sequence
+/// `api_tenant_approvals::run_continuation` already uses for a live
+/// `/webhook`-equivalent resolution, and every caller in this crate reads
+/// it through [`resolve_tenant_context`] without ever knowing what's on
+/// the other side of the closure.
+///
+/// Returns a boxed future (not `async fn` in the trait/type position)
+/// because a `Fn` producing a named `async` block isn't expressible
+/// without unstable syntax; same shape as `DeliveryFn`.
+pub type TenantResolveFn = Box<
+    dyn Fn(
+            String,
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Arc<TenantContext>>> + Send>>
+        + Send
+        + Sync,
+>;
+
+static TENANT_RESOLVE_FN: std::sync::OnceLock<TenantResolveFn> = std::sync::OnceLock::new();
+
+/// Register the tenant-resolution function. Called once at startup by the
+/// binary crate (mirrors `cron::scheduler::register_delivery_fn`).
+pub fn register_tenant_resolve_fn(f: TenantResolveFn) {
+    let _ = TENANT_RESOLVE_FN.set(f);
+}
+
+/// Resolve a live `TenantContext` for `(tenant_id, agent_type)` at the
+/// current moment — never cached by this function itself (each registered
+/// resolver has its own TTL'd cache; calling this again a schedule
+/// interval later is exactly how Decision 3 in ADR-009 gets satisfied
+/// "for free").
+///
+/// Returns `None` both when no resolver was ever registered (a build
+/// without `agent-runtime`/the gateway, or a test) and when the
+/// registered resolver itself found nothing — callers that treat a
+/// tenant-scoped job's identity as a security boundary (as
+/// `run_agent_job` does) must treat `None` as "refuse to run unscoped",
+/// never as "fall back to an operator run", so the two cases are
+/// deliberately not distinguished here.
+pub async fn resolve_tenant_context(tenant_id: &str, agent_type: &str) -> Option<Arc<TenantContext>> {
+    match TENANT_RESOLVE_FN.get() {
+        Some(f) => f(tenant_id.to_string(), agent_type.to_string()).await,
+        None => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +427,78 @@ mod tests {
             })
             .await;
         assert!(current_tenant().is_none());
+    }
+
+    /// ADR-009 Phase 1. `TENANT_RESOLVE_FN` is a process-wide `OnceLock`
+    /// (first writer wins, matching `cron::scheduler::DELIVERY_FN`'s own
+    /// documented idempotency contract), so this registers exactly one
+    /// closure for the whole test binary and dispatches on `tenant_id`
+    /// rather than trying to register different behavior per test.
+    /// `"resolvable"` finds a tenant; `"resolvable-empty-persona"` finds a
+    /// tenant with no persona row (still `Some`, exercising the `Ok(None)`
+    /// "no persona, defaults apply" path distinctly from resolution
+    /// failure); anything else (including `"unresolvable"`) returns `None`.
+    fn register_test_tenant_resolver() {
+        register_tenant_resolve_fn(Box::new(|tenant_id, agent_type| {
+            Box::pin(async move {
+                match tenant_id.as_str() {
+                    "resolvable" => Some(Arc::new(TenantContext {
+                        tenant_id: format!("{tenant_id}:{agent_type}"),
+                        platform_user_id: tenant_id,
+                        agent_type,
+                        persona: Some("<operator_config>test persona</operator_config>".into()),
+                        connected_toolkits: Vec::new(),
+                        disabled_toolkits: Vec::new(),
+                        tenant_custom_mcp_servers: Vec::new(),
+                    })),
+                    "resolvable-empty-persona" => Some(Arc::new(TenantContext {
+                        tenant_id: format!("{tenant_id}:{agent_type}"),
+                        platform_user_id: tenant_id,
+                        agent_type,
+                        persona: None,
+                        connected_toolkits: Vec::new(),
+                        disabled_toolkits: Vec::new(),
+                        tenant_custom_mcp_servers: Vec::new(),
+                    })),
+                    _ => None,
+                }
+            })
+        }));
+    }
+
+    #[tokio::test]
+    async fn resolve_tenant_context_returns_none_when_nothing_registered_or_unresolvable() {
+        // Exercises the "nothing registered yet" branch too when this
+        // happens to run before any other test in the binary calls
+        // `register_test_tenant_resolver` — either way, an unresolvable
+        // tenant_id must come back `None`.
+        register_test_tenant_resolver();
+        assert!(
+            resolve_tenant_context("unresolvable", "customer_service")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_tenant_context_finds_a_registered_tenant() {
+        register_test_tenant_resolver();
+        let ctx = resolve_tenant_context("resolvable", "customer_service")
+            .await
+            .expect("registered resolver should find this tenant_id");
+        assert_eq!(ctx.tenant_id, "resolvable:customer_service");
+        assert_eq!(ctx.platform_user_id, "resolvable");
+        assert_eq!(ctx.agent_type, "customer_service");
+        assert!(ctx.persona.is_some());
+    }
+
+    #[tokio::test]
+    async fn resolve_tenant_context_distinguishes_no_persona_from_unresolvable() {
+        register_test_tenant_resolver();
+        let ctx = resolve_tenant_context("resolvable-empty-persona", "leads_qualifier")
+            .await
+            .expect("tenant exists even with no persona row");
+        assert!(ctx.persona.is_none());
     }
 
     fn sample_custom_server() -> TenantCustomMcpServer {

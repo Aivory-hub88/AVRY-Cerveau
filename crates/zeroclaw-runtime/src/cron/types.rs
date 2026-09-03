@@ -170,6 +170,37 @@ pub struct CronJob {
     pub last_run: Option<DateTime<Utc>>,
     pub last_status: Option<String>,
     pub last_output: Option<String>,
+    /// ADR-009 Phase 1: the tenant this job runs on behalf of, if any.
+    /// `None` (the only value reachable via the public `cron_add` tool or
+    /// `/api/cron` today) is today's exact behavior — an untenanted
+    /// operator run. `Some` is only set by the internal
+    /// `add_agent_job_for_tenant`, never by anything a tenant or agent can
+    /// reach directly yet (that is Phase 2's job). Paired with
+    /// `tenant_agent_type`: both `Some` or both `None`, never mixed — see
+    /// [`CronJob::tenant_selector`].
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    /// The Aivory agent type (`customer_service`, `leads_qualifier`, …)
+    /// half of the tenant identity — see `tenant_id`.
+    #[serde(default)]
+    pub tenant_agent_type: Option<String>,
+}
+
+impl CronJob {
+    /// `(tenant_id, agent_type)` if this job carries a complete tenant
+    /// identity, `None` for an untenanted operator run — including the
+    /// data-inconsistent case where only one of the two fields is set
+    /// (never produced by `add_agent_job_for_tenant`, but a hand-edited
+    /// row or a future migration bug should degrade to "no tenant" rather
+    /// than resolving a tenant context from half an identity).
+    pub fn tenant_selector(&self) -> Option<(&str, &str)> {
+        match (self.tenant_id.as_deref(), self.tenant_agent_type.as_deref()) {
+            (Some(id), Some(agent_type)) if !id.is_empty() && !agent_type.is_empty() => {
+                Some((id, agent_type))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,6 +247,75 @@ impl ::zeroclaw_api::attribution::Attributable for CronJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn minimal_job() -> CronJob {
+        CronJob {
+            id: "job-1".into(),
+            expression: String::new(),
+            schedule: Schedule::Every { every_ms: 60_000 },
+            command: String::new(),
+            prompt: None,
+            name: None,
+            job_type: JobType::Shell,
+            session_target: SessionTarget::Isolated,
+            model: None,
+            agent_alias: "test-agent".into(),
+            enabled: true,
+            delivery: DeliveryConfig::default(),
+            delete_after_run: false,
+            allowed_tools: None,
+            uses_memory: true,
+            source: "imperative".into(),
+            shell_output_format: CronShellOutputFormat::default(),
+            created_at: chrono::Utc::now(),
+            next_run: chrono::Utc::now(),
+            last_run: None,
+            last_status: None,
+            last_output: None,
+            tenant_id: None,
+            tenant_agent_type: None,
+        }
+    }
+
+    #[test]
+    fn tenant_selector_is_none_by_default() {
+        assert!(minimal_job().tenant_selector().is_none());
+    }
+
+    #[test]
+    fn tenant_selector_is_some_when_both_fields_set() {
+        let mut job = minimal_job();
+        job.tenant_id = Some("u1".into());
+        job.tenant_agent_type = Some("customer_service".into());
+        assert_eq!(
+            job.tenant_selector(),
+            Some(("u1", "customer_service"))
+        );
+    }
+
+    #[test]
+    fn tenant_selector_is_none_when_only_one_field_set() {
+        let mut job = minimal_job();
+        job.tenant_id = Some("u1".into());
+        job.tenant_agent_type = None;
+        assert!(
+            job.tenant_selector().is_none(),
+            "half an identity must never resolve a tenant scope"
+        );
+
+        let mut job = minimal_job();
+        job.tenant_id = None;
+        job.tenant_agent_type = Some("customer_service".into());
+        assert!(job.tenant_selector().is_none());
+    }
+
+    #[test]
+    fn tenant_selector_is_none_when_either_field_is_empty_string() {
+        let mut job = minimal_job();
+        job.tenant_id = Some(String::new());
+        job.tenant_agent_type = Some("customer_service".into());
+        assert!(job.tenant_selector().is_none());
+    }
 
     #[test]
     fn deserialize_schedule_from_object() {

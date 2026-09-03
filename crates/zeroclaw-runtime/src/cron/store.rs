@@ -195,12 +195,98 @@ pub fn add_agent_job(
     get_job(config, &id)
 }
 
+/// ADR-009 Phase 1: identical to [`add_agent_job`] but stamps a tenant
+/// identity onto the row, which `run_agent_job` resolves into a live
+/// `TenantContext` (persona, connected toolkits, tenant memory/graph
+/// access) at fire time via the registered tenant-resolve function — see
+/// `cron::scheduler::resolve_tenant_context`.
+///
+/// Deliberately internal (not `pub` beyond the crate) and not wired to the
+/// `cron_add` tool or `/api/cron`: nothing outside Cerveau's own trusted
+/// call sites can set an arbitrary tenant on a job yet. Phase 2
+/// (`avry-backend`'s own tenant-scheduled-runs API, JWT-authenticated
+/// against the caller's own identity) is the intended, safe way for a
+/// tenant to actually reach this — see ADR-009 §5.
+///
+/// `#[allow(dead_code)]`: exercised only by this module's own tests today
+/// (no production call site until Phase 2 exists) — deliberate, not
+/// forgotten.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub(crate) fn add_agent_job_for_tenant(
+    config: &Config,
+    agent_alias: &str,
+    name: Option<String>,
+    schedule: Schedule,
+    prompt: &str,
+    session_target: SessionTarget,
+    model: Option<String>,
+    delivery: Option<DeliveryConfig>,
+    delete_after_run: bool,
+    allowed_tools: Option<Vec<String>>,
+    uses_memory: bool,
+    tenant_id: &str,
+    tenant_agent_type: &str,
+) -> Result<CronJob> {
+    anyhow::ensure!(!tenant_id.trim().is_empty(), "tenant_id must not be empty");
+    anyhow::ensure!(
+        !tenant_agent_type.trim().is_empty(),
+        "tenant_agent_type must not be empty"
+    );
+
+    let now = Utc::now();
+    validate_schedule(&schedule, now)?;
+    validate_delivery_config(delivery.as_ref())?;
+    let next_run = next_run_for_schedule(&schedule, now)?;
+    let id = Uuid::new_v4().to_string();
+    let expression = schedule_cron_expression(&schedule).unwrap_or_default();
+    let schedule_json = serde_json::to_string(&schedule)?;
+    let delivery = delivery.unwrap_or_default();
+    let agent_alias = agent_alias.trim();
+    if agent_alias.is_empty() {
+        anyhow::bail!("agent_alias is required; cron jobs must name an owning agent");
+    }
+
+    with_initialized_connection(config, |conn| {
+        conn.execute(
+            "INSERT INTO cron_jobs (
+                id, expression, command, schedule, job_type, prompt, name, session_target, model,
+                enabled, delivery, delete_after_run, allowed_tools, agent_alias, created_at, next_run,
+                uses_memory, tenant_id, tenant_agent_type
+             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                id,
+                expression,
+                schedule_json,
+                prompt,
+                name,
+                session_target.as_str(),
+                model,
+                serde_json::to_string(&delivery)?,
+                if delete_after_run { 1 } else { 0 },
+                encode_allowed_tools(allowed_tools.as_ref())?,
+                agent_alias,
+                now.to_rfc3339(),
+                next_run.to_rfc3339(),
+                if uses_memory { 1 } else { 0 },
+                tenant_id,
+                tenant_agent_type,
+            ],
+        )
+        .context("Failed to insert tenant-scoped cron agent job")?;
+        Ok(())
+    })?;
+
+    get_job(config, &id)
+}
+
 pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
     let Some(jobs) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                      enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format,
+                     tenant_id, tenant_agent_type
              FROM cron_jobs ORDER BY next_run ASC",
         )?;
 
@@ -238,7 +324,8 @@ fn get_job_raw(config: &Config, job_id: &str) -> Result<CronJob> {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                      enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format,
+                     tenant_id, tenant_agent_type
              FROM cron_jobs WHERE id = ?1",
         )?;
 
@@ -310,7 +397,8 @@ pub fn list_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<Vec<Cron
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                      enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format,
+                     tenant_id, tenant_agent_type
              FROM cron_jobs WHERE agent_alias = ?1 ORDER BY next_run ASC",
         )?;
         let rows = stmt.query_map(params![agent_alias], map_cron_job_row)?;
@@ -366,7 +454,8 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                      enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format,
+                     tenant_id, tenant_agent_type
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1 AND locked_at IS NULL
              ORDER BY next_run ASC",
@@ -417,7 +506,8 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                      enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format,
+                     tenant_id, tenant_agent_type
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1 AND locked_at IS NULL
              ORDER BY next_run ASC",
@@ -1031,6 +1121,8 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         let raw: Option<String> = row.get(21)?;
         decode_shell_output_format(raw.as_deref()).map_err(sql_conversion_error)?
     };
+    let tenant_id: Option<String> = row.get(22)?;
+    let tenant_agent_type: Option<String> = row.get(23)?;
 
     Ok(CronJob {
         id: row.get(0)?,
@@ -1061,6 +1153,8 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         last_output: row.get(16)?,
         allowed_tools: decode_allowed_tools(allowed_tools_raw.as_deref())
             .map_err(sql_conversion_error)?,
+        tenant_id,
+        tenant_agent_type,
     })
 }
 
@@ -1678,6 +1772,14 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
         "shell_output_format",
         "TEXT NOT NULL DEFAULT 'wrapped'",
     )?;
+    // ADR-009 Phase 1: which tenant (if any) this job runs on behalf of.
+    // NULL on every existing row — `run_agent_job` treats that exactly as
+    // it does today, an untenanted operator run. Only settable via the
+    // internal `add_agent_job_for_tenant`; the public `cron_add` tool and
+    // `/api/cron` never accept these, so no caller can create a job
+    // scoped to a tenant it doesn't already have a resolved identity for.
+    add_column_if_missing(conn, "tenant_id", "TEXT")?;
+    add_column_if_missing(conn, "tenant_agent_type", "TEXT")?;
 
     Ok(())
 }
@@ -2250,6 +2352,101 @@ mod tests {
 
         let stored = get_job(&config, &job.id).unwrap();
         assert_eq!(stored.allowed_tools, job.allowed_tools);
+    }
+
+    #[test]
+    fn add_agent_job_for_tenant_persists_and_round_trips_the_tenant_selector() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_agent_job_for_tenant(
+            &config,
+            "default",
+            Some("tenant-digest".into()),
+            Schedule::Every { every_ms: 60_000 },
+            "summarize this week",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+            "u1",
+            "customer_service",
+        )
+        .unwrap();
+
+        assert_eq!(job.tenant_id.as_deref(), Some("u1"));
+        assert_eq!(job.tenant_agent_type.as_deref(), Some("customer_service"));
+        assert_eq!(job.tenant_selector(), Some(("u1", "customer_service")));
+
+        // Round-trips through a fresh SELECT, not just the INSERT's own
+        // returned row — the two new trailing columns must be readable
+        // back out of storage, not merely accepted on the way in.
+        let stored = get_job(&config, &job.id).unwrap();
+        assert_eq!(stored.tenant_id.as_deref(), Some("u1"));
+        assert_eq!(stored.tenant_agent_type.as_deref(), Some("customer_service"));
+
+        // An ordinary (non-tenant) job created in the same store is
+        // untouched by the new columns — they default to NULL/None, not
+        // some inherited or leaked value.
+        let untenanted = add_agent_job(
+            &config,
+            "default",
+            None,
+            Schedule::Every { every_ms: 60_000 },
+            "do work",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(untenanted.tenant_selector().is_none());
+    }
+
+    #[test]
+    fn add_agent_job_for_tenant_rejects_empty_tenant_identity() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let err = add_agent_job_for_tenant(
+            &config,
+            "default",
+            None,
+            Schedule::Every { every_ms: 60_000 },
+            "summarize this week",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+            "",
+            "customer_service",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("tenant_id must not be empty"));
+
+        let err = add_agent_job_for_tenant(
+            &config,
+            "default",
+            None,
+            Schedule::Every { every_ms: 60_000 },
+            "summarize this week",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+            "u1",
+            "",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("tenant_agent_type must not be empty"));
     }
 
     #[test]
@@ -3273,6 +3470,8 @@ schedule = { kind = "every", every_ms = 300000 }
             last_run: None,
             last_status: None,
             last_output: None,
+            tenant_id: None,
+            tenant_agent_type: None,
         };
         let job_type_str: String = match &job.job_type {
             JobType::Shell => "shell".to_string(),

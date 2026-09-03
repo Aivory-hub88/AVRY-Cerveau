@@ -3,6 +3,16 @@
     clippy::useless_format,
     clippy::manual_inspect
 )]
+// ADR-009 Phase 1: `cron::scheduler::run_agent_job` now wraps its
+// `agent::run` call in an extra `TENANT_CONTEXT.scope(...)` (the same
+// task-local nesting shape `zeroclaw-gateway`'s webhook/approval-resume
+// paths already use around `process_message`), which pushes the
+// Send-auto-trait recursion needed to type-check the resulting deeply
+// nested `TaskLocalFuture<..., Instrumented<...>>` chain past the default
+// limit (`overflow evaluating the requirement ...: Send`, exactly the
+// error rustc suggests this fix for) — not a real cycle, just more nested
+// generic layers than the default budget expects.
+#![recursion_limit = "256"]
 //! Agent runtime — orchestration, security, observability, cron, SOP, skills, hardware, and more.
 
 pub mod cli_input;

@@ -3839,6 +3839,62 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 })
             },
         ));
+
+        // ADR-009 Phase 1: give the cron scheduler the same tenant-
+        // resolution path a live `/webhook` call already gets — the exact
+        // resolve-and-build sequence
+        // `zeroclaw_gateway::api_tenant_approvals::run_continuation` uses
+        // to re-resolve fresh tenant context for a resumed approval turn.
+        // `zeroclaw-runtime` cannot depend on `zeroclaw-gateway` (the
+        // dependency runs the other way), so this closure is the seam:
+        // registered once here, called by
+        // `zeroclaw_runtime::agent::tenant::resolve_tenant_context`
+        // whenever a tenant-scoped cron job fires, with no scheduler code
+        // needing to know these resolvers exist.
+        zeroclaw_runtime::agent::tenant::register_tenant_resolve_fn(Box::new(
+            |tenant_id, agent_type| {
+                Box::pin(async move {
+                    let sel = zeroclaw_gateway::tenant::TenantSelector {
+                        user_id: tenant_id,
+                        agent_type,
+                    };
+                    // Persona resolution is the security boundary here
+                    // (per `TenantResolver::resolve`'s own doc): `Ok(None)`
+                    // means "no persona row, defaults apply" and is safe
+                    // to continue on; `Err` means the resolution
+                    // infrastructure itself failed (no DSN, DB down) and
+                    // must reject rather than proceed with an
+                    // unscoped/defaulted context — exactly the distinction
+                    // `run_continuation`'s `?` makes for a live request.
+                    let persona = match zeroclaw_gateway::tenant::TenantResolver::global()
+                        .resolve(&sel)
+                        .await
+                    {
+                        Ok(persona) => persona,
+                        Err(_) => return None,
+                    };
+                    let connected_toolkits =
+                        zeroclaw_gateway::tenant::ToolkitConnectionResolver::global()
+                            .resolve(&sel.user_id)
+                            .await;
+                    let disabled_toolkits =
+                        zeroclaw_gateway::tenant::AgentToolScopeResolver::global()
+                            .resolve(&sel)
+                            .await;
+                    let tenant_custom_mcp_servers =
+                        zeroclaw_gateway::tenant::TenantCustomMcpResolver::global()
+                            .resolve(&sel)
+                            .await;
+                    Some(zeroclaw_gateway::tenant::build_tenant_context(
+                        &sel,
+                        persona.as_deref(),
+                        connected_toolkits,
+                        disabled_toolkits,
+                        tenant_custom_mcp_servers,
+                    ))
+                })
+            },
+        ));
     }
 
     #[cfg(feature = "agent-runtime")]

@@ -804,9 +804,33 @@ async fn run_agent_job(
         // worker is the only `mcp_registry` supplier.
         mcp_registry: None,
     };
+    // ADR-009 Phase 1: resolve this job's tenant identity, if it carries
+    // one, at fire time — never cached across runs (Decision 3). A job
+    // whose tenant identity cannot be resolved right now refuses to run
+    // rather than silently falling back to an untenanted operator run:
+    // identity/memory scoping is the security boundary here, the same
+    // stance `api_tenant_approvals::run_continuation` takes for a resumed
+    // approval turn.
+    let tenant_ctx = if let Some((tenant_id, tenant_agent_type)) = job.tenant_selector() {
+        match crate::agent::tenant::resolve_tenant_context(tenant_id, tenant_agent_type).await {
+            Some(ctx) => Some(ctx),
+            None => {
+                return (
+                    false,
+                    format!(
+                        "tenant resolution failed for tenant_id={tenant_id:?} agent_type={tenant_agent_type:?} — refusing to run this job unscoped"
+                    ),
+                );
+            }
+        }
+    } else {
+        None
+    };
+
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            Box::pin(
+            Box::pin(crate::agent::tenant::TENANT_CONTEXT.scope(
+                tenant_ctx,
                 crate::agent::run(
                     cron_config,
                     agent_alias,
@@ -824,7 +848,7 @@ async fn run_agent_job(
                     run_overrides,
                 )
                 .instrument(subagent_span),
-            )
+            ))
             .await
         }
     };
@@ -1336,6 +1360,8 @@ mod tests {
             last_run: None,
             last_status: None,
             last_output: None,
+            tenant_id: None,
+            tenant_agent_type: None,
         }
     }
 
@@ -1936,6 +1962,85 @@ mod tests {
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("rate limit exceeded"));
+    }
+
+    /// ADR-009 Phase 1. `agent::tenant::TENANT_RESOLVE_FN` is a
+    /// process-wide `OnceLock` shared across every test module in this
+    /// crate's test binary (first writer wins), so this uses the same
+    /// `"resolvable"` / anything-else-is-`None` dispatch convention as
+    /// `agent::tenant::tests::register_test_tenant_resolver` rather than
+    /// assuming this particular closure is the one that actually got
+    /// installed.
+    fn register_test_tenant_resolver_for_scheduler_tests() {
+        crate::agent::tenant::register_tenant_resolve_fn(Box::new(|tenant_id, agent_type| {
+            Box::pin(async move {
+                if tenant_id == "resolvable" {
+                    Some(std::sync::Arc::new(crate::agent::tenant::TenantContext {
+                        tenant_id: format!("{tenant_id}:{agent_type}"),
+                        platform_user_id: tenant_id,
+                        agent_type,
+                        persona: None,
+                        connected_toolkits: Vec::new(),
+                        disabled_toolkits: Vec::new(),
+                        tenant_custom_mcp_servers: Vec::new(),
+                    }))
+                } else {
+                    None
+                }
+            })
+        }));
+    }
+
+    #[tokio::test]
+    async fn run_agent_job_refuses_when_tenant_cannot_be_resolved() {
+        register_test_tenant_resolver_for_scheduler_tests();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Say hello".into());
+        job.tenant_id = Some("unresolvable".into());
+        job.tenant_agent_type = Some("customer_service".into());
+        let security = test_security(&config);
+
+        let (success, output) =
+            Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
+        assert!(!success);
+        assert!(
+            output.contains("tenant resolution failed"),
+            "expected a tenant-refusal message, got: {output}"
+        );
+        // Must refuse before ever attempting the agent turn — the missing-
+        // provider-key failure (`run_agent_job_returns_error_without_provider_key`)
+        // must never be reachable for a job whose tenant identity doesn't resolve.
+        assert!(!output.contains("agent job failed:"));
+    }
+
+    #[tokio::test]
+    async fn run_agent_job_proceeds_past_the_tenant_check_when_resolvable() {
+        register_test_tenant_resolver_for_scheduler_tests();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Say hello".into());
+        job.tenant_id = Some("resolvable".into());
+        job.tenant_agent_type = Some("customer_service".into());
+        let security = test_security(&config);
+
+        let (success, output) =
+            Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
+        // Same eventual failure as the untenanted case (no provider key
+        // configured in this test's config) — the point is *which* failure:
+        // it must get past the tenant check to reach the agent-run attempt,
+        // proving resolution succeeded and TENANT_CONTEXT was populated
+        // rather than the job being refused.
+        assert!(!success);
+        assert!(
+            output.contains("agent job failed:"),
+            "expected the job to reach (and fail) the agent run itself, got: {output}"
+        );
+        assert!(!output.contains("tenant resolution failed"));
     }
 
     #[tokio::test]
