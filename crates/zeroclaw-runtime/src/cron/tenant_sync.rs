@@ -251,7 +251,13 @@ fn apply_row(
         // exactly that.
         tz: Some(row.timezone.clone()),
     };
-    let tenant_id = format!("{}.{}", row.user_id, row.agent_type);
+    // `CronJob::tenant_id` is the *raw* platform user id, not the composed
+    // `<user_id>.<agent_type>` alias: `run_agent_job` hands it straight to
+    // `resolve_tenant_context`, whose registered resolver assigns it to
+    // `TenantSelector::user_id` and derives the composed form itself via
+    // `TenantSelector::tenant_id()`. Passing the composed form here would
+    // make the selector `user_id = "u1.customer_service"`, no persona row
+    // would resolve, and every tenant schedule would refuse to run.
     store::upsert_tenant_schedule_job(
         config,
         &row.id,
@@ -260,7 +266,7 @@ fn apply_row(
         &row.prompt,
         schedule,
         row.enabled,
-        &tenant_id,
+        &row.user_id,
         &row.agent_type,
     )
     .map_err(|e| format!("{e:#}"))
@@ -343,15 +349,42 @@ mod tests {
         }
     }
 
+    fn test_config(tmp: &tempfile::TempDir) -> Config {
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config
+    }
+
     #[test]
-    fn tenant_id_is_the_dotted_pair_the_tenant_layer_keys_on() {
-        // `TenantSelector::tenant_id()` builds `<user_id>.<agent_type>`, and
-        // `run_agent_job` compares against exactly that. Getting this
-        // separator wrong would resolve every schedule to no tenant at all.
+    fn the_stored_identity_is_the_raw_user_id_not_the_composed_alias() {
+        // The distinction is load-bearing and easy to get backwards.
+        // `run_agent_job` hands `tenant_id` straight to
+        // `resolve_tenant_context`, whose resolver assigns it to
+        // `TenantSelector::user_id` and derives `<user_id>.<agent_type>`
+        // itself. Storing the composed form here would make the selector
+        // `user_id = "u1.customer_service"`, resolve no persona row, and
+        // every tenant schedule would refuse to run rather than fail loudly.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = test_config(&tmp);
         let r = row("a", true, "pending_activation");
+
+        apply_row(&config, "default", &r).expect("a valid row must apply");
+
+        let jobs = store::list_tenant_schedule_jobs(&config).unwrap();
+        let job = jobs
+            .iter()
+            .find(|j| j.id == r.id)
+            .expect("the reconcile must store the row under the backend's id");
+        assert_eq!(job.tenant_id.as_deref(), Some("u1"));
+        assert_eq!(job.tenant_agent_type.as_deref(), Some("customer_service"));
         assert_eq!(
-            format!("{}.{}", r.user_id, r.agent_type),
-            "u1.customer_service"
+            job.tenant_selector(),
+            Some(("u1", "customer_service")),
+            "both halves must survive the round-trip or the job runs unscoped"
         );
     }
 
