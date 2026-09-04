@@ -549,11 +549,33 @@ fn cron_agent_run_security_policy(base: &SecurityPolicy, job: &CronJob) -> Secur
     policy
 }
 
+/// Prefix on the session path of an `Isolated` cron run.
+///
+/// Load-bearing beyond naming: it is the only thing on a pending-approval
+/// row that distinguishes an approval nobody is waiting on (a scheduled run
+/// that fired while the tenant was asleep) from one blocking a live
+/// conversation. `is_unattended_session` is the single reader; keep them
+/// together so the convention and its consumer cannot drift apart, and see
+/// the test that pins the two.
+pub const CRON_SESSION_PREFIX: &str = "cron-";
+
 fn cron_agent_session_path(target: &SessionTarget, run_session_id: &str) -> std::path::PathBuf {
     match target {
         SessionTarget::Main => std::path::PathBuf::from("main"),
-        SessionTarget::Isolated => std::path::PathBuf::from(format!("cron-{run_session_id}")),
+        SessionTarget::Isolated => {
+            std::path::PathBuf::from(format!("{CRON_SESSION_PREFIX}{run_session_id}"))
+        }
     }
+}
+
+/// Whether a stored session id belongs to an unattended (scheduled) run.
+///
+/// `false` for `None` and for a `Main`-target cron job, which shares the
+/// interactive `main` session and is indistinguishable from a live turn by
+/// design — a false negative here costs a missing badge, whereas guessing
+/// the other way would tell someone nobody is waiting when someone is.
+pub fn is_unattended_session(session_id: Option<&str>) -> bool {
+    session_id.is_some_and(|s| s.starts_with(CRON_SESSION_PREFIX))
 }
 
 async fn execute_job_with_retry(
@@ -827,28 +849,48 @@ async fn run_agent_job(
         None
     };
 
+    // ADR-009 Phase 3: give the turn an origin the same way the gateway's
+    // webhook path does. Without it a pending approval this run creates has
+    // no `session_id`/`origin_message`, and resolving it later resumes with
+    // the literal text "(original message not captured)" — the model is then
+    // asked to continue a conversation it cannot see. The session id is the
+    // real session path (not a synthetic label), because the resumed turn's
+    // memory recall is scoped by it and must land on the same session the
+    // original run used.
+    let turn_origin = Some(std::sync::Arc::new(
+        crate::agent::tenant::TurnOriginContext {
+            session_id: Some(session_path.to_string_lossy().into_owned()),
+            origin_message: job.prompt.clone().unwrap_or_default(),
+        },
+    ));
+
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            Box::pin(crate::agent::tenant::TENANT_CONTEXT.scope(
-                tenant_ctx,
-                crate::agent::run(
-                    cron_config,
-                    agent_alias,
-                    Some(prefixed_prompt),
-                    None,
-                    model_override,
-                    config
-                        .model_provider_for_agent(agent_alias)
-                        .and_then(|e| e.temperature),
-                    vec![],
-                    false,
-                    Some(session_path.clone()),
-                    job.allowed_tools.clone(),
-                    zeroclaw_api::ingress::TurnOrigin::Cron,
-                    run_overrides,
-                )
-                .instrument(subagent_span),
-            ))
+            Box::pin(
+                crate::agent::tenant::TENANT_CONTEXT.scope(
+                    tenant_ctx,
+                    crate::agent::tenant::TURN_ORIGIN_CONTEXT.scope(
+                        turn_origin,
+                        crate::agent::run(
+                            cron_config,
+                            agent_alias,
+                            Some(prefixed_prompt),
+                            None,
+                            model_override,
+                            config
+                                .model_provider_for_agent(agent_alias)
+                                .and_then(|e| e.temperature),
+                            vec![],
+                            false,
+                            Some(session_path.clone()),
+                            job.allowed_tools.clone(),
+                            zeroclaw_api::ingress::TurnOrigin::Cron,
+                            run_overrides,
+                        )
+                        .instrument(subagent_span),
+                    ),
+                ),
+            )
             .await
         }
     };
@@ -1445,6 +1487,27 @@ mod tests {
             cron_agent_session_path(&SessionTarget::Isolated, "abc").to_string_lossy(),
             "cron-abc"
         );
+    }
+
+    #[test]
+    fn unattended_detection_tracks_the_path_the_scheduler_actually_writes() {
+        // Pins the writer to the reader. A pending approval raised by an
+        // isolated cron run is the one nobody is waiting on, and this prefix
+        // is the only thing on the stored row that says so — if either side
+        // is changed alone, the dashboard silently stops distinguishing "a
+        // schedule fired overnight" from "someone is blocked in a chat".
+        let isolated = cron_agent_session_path(&SessionTarget::Isolated, "abc");
+        assert!(is_unattended_session(Some(&isolated.to_string_lossy())));
+
+        // A `Main`-target job shares the interactive session on purpose and
+        // is indistinguishable from a live turn. Reporting it as unattended
+        // would be the harmful direction of the error.
+        let main = cron_agent_session_path(&SessionTarget::Main, "abc");
+        assert!(!is_unattended_session(Some(&main.to_string_lossy())));
+
+        assert!(!is_unattended_session(None));
+        assert!(!is_unattended_session(Some("")));
+        assert!(!is_unattended_session(Some("sess-42")));
     }
 
     #[test]
