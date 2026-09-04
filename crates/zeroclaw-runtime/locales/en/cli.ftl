@@ -925,7 +925,7 @@ history-trim-reason-message-cap = history message limit exceeded
 # Remediation surfaced when the system prompt + inlined tool definitions alone
 # meet or exceed the context budget, so no amount of conversation trimming can
 # fit the request (#5808).
-history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
+history-trim-floor-exceeds-budget = the system prompt ({$floor} tokens) alone meets or exceeds the context budget ({$budget} tokens); this counts system-role messages only — not tool schemas, which are sent separately — so the usual cause is skills injected in full, not the tool surface. Check [skills] open_skills_enabled and prompt_injection_mode first, then raise [runtime_profiles.<name>] max_context_tokens
 # Refusal returned when the ingress policy layer (RFC #6971) drops an inbound
 # turn before it reaches the model. Unreachable under the default `Loop` policy
 # (phase 1); becomes live when non-`Loop` policy is configured (phase 3).

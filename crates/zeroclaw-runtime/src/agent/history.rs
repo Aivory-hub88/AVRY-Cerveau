@@ -246,6 +246,22 @@ pub fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
     history.iter().map(estimate_message_tokens).sum()
 }
 
+/// The irreducible part of the context: everything already in `system`-role
+/// messages before a single turn of conversation is added.
+///
+/// **Counts system messages only.** Tool schemas are not in here — native
+/// tool specs travel beside the messages in the provider request, and MCP
+/// tools are usually collapsed into a single deferred `tool_search` stub.
+/// What *is* in here, and what dominates it in practice, is whatever was
+/// inlined into the system prompt: the base prompt, the persona, and —
+/// by far the largest contributor when it happens — skills injected in
+/// full (`[skills] prompt_injection_mode = "full"`, magnified by
+/// `open_skills_enabled`).
+///
+/// This distinction is load-bearing: the caller's warning used to read
+/// "system prompt and tool definitions", which sent an investigation
+/// after the tool surface while ~110k tokens of irrelevant community
+/// skills sat in the system prompt (see docs/ADR-010 in AVRY-V2-Main).
 pub fn estimate_system_floor_tokens(history: &[ChatMessage]) -> usize {
     history
         .iter()
@@ -477,6 +493,19 @@ mod tests {
         assert!(
             !msg.contains("agent.max_context_tokens"),
             "remediation must not reference the inert agent.max_context_tokens: {msg}"
+        );
+        // ... and must not claim to have measured tool definitions, which it
+        // does not: `estimate_system_floor_tokens` sums system-role messages
+        // only. The earlier wording ("system prompt and tool definitions")
+        // sent a real investigation after the tool surface while the actual
+        // cause — skills inlined into the system prompt — sat in plain sight.
+        assert!(
+            !msg.contains("tool definitions"),
+            "remediation must not claim tool definitions are counted: {msg}"
+        );
+        assert!(
+            msg.contains("[skills]"),
+            "remediation must point at the skills-injection surface that usually causes this: {msg}"
         );
     }
 
