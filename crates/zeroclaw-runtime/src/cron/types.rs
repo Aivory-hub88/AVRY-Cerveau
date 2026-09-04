@@ -178,6 +178,13 @@ pub struct CronJob {
     /// reach directly yet (that is Phase 2's job). Paired with
     /// `tenant_agent_type`: both `Some` or both `None`, never mixed — see
     /// [`CronJob::tenant_selector`].
+    ///
+    /// This is the **raw** platform user id, never the composed
+    /// `<user_id>.<agent_type>` alias. `run_agent_job` hands it to
+    /// `agent::tenant::resolve_tenant_context`, whose registered resolver
+    /// assigns it to `TenantSelector::user_id` and derives the composed form
+    /// itself. Storing the composed form resolves no persona row, and the
+    /// job then refuses to run rather than failing anywhere visible.
     #[serde(default)]
     pub tenant_id: Option<String>,
     /// The Aivory agent type (`customer_service`, `leads_qualifier`, …)
