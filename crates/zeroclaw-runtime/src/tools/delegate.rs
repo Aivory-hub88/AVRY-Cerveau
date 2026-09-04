@@ -52,6 +52,10 @@ pub struct BackgroundDelegateResult {
 }
 
 /// Status of a background delegate task.
+///
+/// ADR-008 Phase 3b added `InputRequired` — and deliberately only that one
+/// of A2A's seven states. See `BackgroundResultState` below for why the
+/// other three were not adopted.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BackgroundTaskStatus {
@@ -59,8 +63,35 @@ pub enum BackgroundTaskStatus {
     Completed,
     Failed,
     Cancelled,
+    /// The turn finished, but it parked an `Irreversible` tool call as a
+    /// pending approval — so real work is waiting on a human, not done.
+    /// Reporting `Completed` here was a lie the caller had no way to
+    /// detect except by reading the model's own prose.
+    InputRequired,
 }
 
+/// Runtime view of a background task's state — the file status plus the two
+/// outcomes only an outside observer (the reaper) can assign.
+///
+/// **On A2A's seven states.** ADR-008 Phase 3b originally proposed adopting
+/// the whole `submitted / working / input-required / completed / canceled /
+/// failed / rejected` set. Only `input-required` earned its place:
+///
+/// - `submitted` never exists here. A background delegate is written as
+///   `Running` and spawned in the same breath — there is no queue for a
+///   task to sit in, so the state would be unreachable ceremony.
+/// - `rejected` (refused up front) versus `failed` (tried and failed) is a
+///   real distinction Cerveau makes — a `forbidden` delegation policy, a
+///   denied approval — but it is currently flattened into the error string,
+///   and its only consumer would be a dashboard that does not exist yet
+///   (Phase 4). Splitting it now would be a state nothing reads.
+/// - `working` is `Running` under another name.
+///
+/// ADR-008 §5 says the A2A *wire protocol* waits for a real customer or
+/// partner trigger rather than internal aesthetics. Taking its vocabulary
+/// wholesale while the protocol itself is deferred would be exactly that.
+/// `InputRequired` is here because it fixes a wrong answer, not because
+/// the spec lists it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackgroundResultState {
     Running,
@@ -69,6 +100,7 @@ enum BackgroundResultState {
     Cancelled,
     Lost,
     TimedOut,
+    InputRequired,
 }
 
 impl BackgroundResultState {
@@ -78,6 +110,7 @@ impl BackgroundResultState {
             BackgroundTaskStatus::Completed => Self::Completed,
             BackgroundTaskStatus::Failed => Self::Failed,
             BackgroundTaskStatus::Cancelled => Self::Cancelled,
+            BackgroundTaskStatus::InputRequired => Self::InputRequired,
         }
     }
 
@@ -89,6 +122,7 @@ impl BackgroundResultState {
             Self::Cancelled => "cancelled",
             Self::Lost => "lost",
             Self::TimedOut => "timed_out",
+            Self::InputRequired => "input_required",
         }
     }
 
@@ -96,12 +130,23 @@ impl BackgroundResultState {
         self == Self::Completed
     }
 
+    /// Whether an `await_sessions` caller should keep waiting.
+    ///
+    /// `InputRequired` is deliberately **not** pending: the thing it waits
+    /// on is a human, and blocking a parent turn until someone opens the
+    /// dashboard would hang the caller for hours. The await returns and
+    /// reports the state instead.
     fn is_pending(self) -> bool {
         self == Self::Running
     }
 
+    /// `InputRequired` is excluded explicitly. The old body was
+    /// `!matches!(self, Running | Completed)`, which would have swept the
+    /// new state into "failure" the moment it was added — a parked
+    /// approval is a pause, not an error, and reporting it as one would
+    /// have been a worse answer than the `Completed` this replaced.
     fn is_failure(self) -> bool {
-        !matches!(self, Self::Running | Self::Completed)
+        !matches!(self, Self::Running | Self::Completed | Self::InputRequired)
     }
 }
 
@@ -1574,41 +1619,76 @@ impl DelegateTool {
                     "prompt": full_prompt,
                 });
 
-                // Race the delegation against cancellation
-                let outcome = tokio::select! {
-                    () = child_token.cancelled() => {
-                        Err("Cancelled by parent session".to_string())
-                    }
-                    result = Box::pin(inner.execute_sync_with_admission(
-                        &agent_name_owned,
-                        &full_prompt,
-                        &args_inner,
-                        DelegateAdmission::Prevalidated,
-                    )) => {
-                        match result {
-                            Ok(tool_result) => {
-                                if tool_result.success {
-                                    Ok(tool_result.output.into_string())
-                                } else {
-                                    Err(tool_result.error.unwrap_or_else(|| "Unknown error".into()))
+                // ADR-008 Phase 3b: give this turn somewhere to record a
+                // parked approval. `approval_gate` calls
+                // `record_pending_approval` unconditionally whenever it
+                // creates a `Pending` row, but that is a no-op unless
+                // something scoped the cell — and nothing did on this path,
+                // so a background delegate that parked an `Irreversible`
+                // call still finished as `Completed`. Scoping it here is
+                // what makes `InputRequired` observable at all.
+                let pending_cell = std::sync::Arc::new(parking_lot::Mutex::new(None));
+                let outcome = crate::agent::tenant::LAST_PENDING_APPROVAL
+                    .scope(Some(pending_cell.clone()), async {
+                        // Race the delegation against cancellation
+                        tokio::select! {
+                            () = child_token.cancelled() => {
+                                Err("Cancelled by parent session".to_string())
+                            }
+                            result = Box::pin(inner.execute_sync_with_admission(
+                                &agent_name_owned,
+                                &full_prompt,
+                                &args_inner,
+                                DelegateAdmission::Prevalidated,
+                            )) => {
+                                match result {
+                                    Ok(tool_result) => {
+                                        if tool_result.success {
+                                            Ok(tool_result.output.into_string())
+                                        } else {
+                                            Err(tool_result.error.unwrap_or_else(|| "Unknown error".into()))
+                                        }
+                                    }
+                                    Err(e) => Err(e.to_string()),
                                 }
                             }
-                            Err(e) => Err(e.to_string()),
                         }
-                    }
-                };
+                    })
+                    .await;
+
+                // Only meaningful on the success arm: a turn that errored
+                // has a real failure to report, and that outranks "it also
+                // parked something on the way".
+                let parked_approval = pending_cell.lock().take();
 
                 let finished_at = chrono::Utc::now().to_rfc3339();
                 let final_result = match outcome {
-                    Ok(output) => BackgroundDelegateResult {
-                        task_id: task_id_clone.clone(),
-                        agent: agent_name_owned,
-                        status: BackgroundTaskStatus::Completed,
-                        output: Some(output),
-                        error: None,
-                        started_at,
-                        finished_at: Some(finished_at),
-                    },
+                    Ok(output) => {
+                        // A turn can finish "successfully" having parked an
+                        // Irreversible call for a human. The model's own
+                        // prose usually says so; the status did not, and a
+                        // caller reading the status is the one that has to
+                        // decide whether the work is really done.
+                        let (status, error) = match &parked_approval {
+                            Some(summary) => (
+                                BackgroundTaskStatus::InputRequired,
+                                Some(format!(
+                                    "Waiting on approval {} for tool {}",
+                                    summary.id, summary.tool_name
+                                )),
+                            ),
+                            None => (BackgroundTaskStatus::Completed, None),
+                        };
+                        BackgroundDelegateResult {
+                            task_id: task_id_clone.clone(),
+                            agent: agent_name_owned,
+                            status,
+                            output: Some(output),
+                            error,
+                            started_at,
+                            finished_at: Some(finished_at),
+                        }
+                    }
                     Err(err) => {
                         let status = if err.contains("Cancelled") {
                             BackgroundTaskStatus::Cancelled
@@ -1640,6 +1720,14 @@ impl DelegateTool {
                             crate::control_plane::TaskStatus::Cancelled
                         }
                         BackgroundTaskStatus::Running => crate::control_plane::TaskStatus::Running,
+                        // `Paused` is "intentionally stopped but resumable"
+                        // and, unlike every other outcome here, non-terminal
+                        // — which is exactly right: the reaper should keep
+                        // reconciling a task that is waiting on a person,
+                        // not write it off as finished.
+                        BackgroundTaskStatus::InputRequired => {
+                            crate::control_plane::TaskStatus::Paused
+                        }
                     };
                     let _ = cp
                         .store
@@ -6445,6 +6533,62 @@ mod tests {
         assert!(list.output.contains("researcher"));
 
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    // ── ADR-008 Phase 3b: InputRequired ──────────────────────────────
+    //
+    // These pin the three answers that are easy to get wrong by adding a
+    // variant and moving on. Each one was a real decision, not a
+    // restatement of the code.
+
+    #[test]
+    fn input_required_is_not_pending_so_an_await_cannot_block_on_a_human() {
+        assert!(
+            !BackgroundResultState::InputRequired.is_pending(),
+            "await_sessions must return on InputRequired — the thing it waits on is a \
+             person, and blocking the parent turn until someone opens the dashboard \
+             would hang it for hours"
+        );
+        assert!(BackgroundResultState::Running.is_pending());
+    }
+
+    #[test]
+    fn input_required_is_neither_success_nor_failure() {
+        let s = BackgroundResultState::InputRequired;
+        assert!(!s.is_success(), "the work did not finish");
+        assert!(
+            !s.is_failure(),
+            "a parked approval is a pause, not an error — `is_failure`'s old \
+             `!matches!(self, Running | Completed)` body would have swept it in"
+        );
+        // The states either side of it must be unaffected.
+        assert!(BackgroundResultState::Completed.is_success());
+        assert!(BackgroundResultState::Failed.is_failure());
+        assert!(BackgroundResultState::TimedOut.is_failure());
+    }
+
+    #[test]
+    fn input_required_round_trips_through_the_on_disk_format() {
+        let state = BackgroundResultState::from_file_status(&BackgroundTaskStatus::InputRequired);
+        assert_eq!(state, BackgroundResultState::InputRequired);
+        assert_eq!(state.as_str(), "input_required");
+        // The wire/disk spelling is snake_case like every sibling; an old
+        // binary reading a new file is the only incompatible direction, and
+        // that is a rollback concern, not a forward one.
+        let json = serde_json::to_string(&BackgroundTaskStatus::InputRequired).unwrap();
+        assert_eq!(json, "\"input_required\"");
+        let back: BackgroundTaskStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, BackgroundTaskStatus::InputRequired);
+    }
+
+    #[test]
+    fn the_control_plane_status_input_required_maps_to_is_non_terminal() {
+        // The spawn path maps InputRequired -> TaskStatus::Paused. That is
+        // only the right choice while Paused stays non-terminal: the reaper
+        // reconciles non-terminal records, and a task waiting on a person
+        // must keep being reconciled rather than written off as finished.
+        assert!(!crate::control_plane::TaskStatus::Paused.is_terminal());
+        assert!(crate::control_plane::TaskStatus::Completed.is_terminal());
     }
 
     #[tokio::test]
