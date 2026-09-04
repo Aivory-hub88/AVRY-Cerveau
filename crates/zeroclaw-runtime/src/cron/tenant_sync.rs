@@ -87,14 +87,51 @@ fn backend() -> Option<(String, String)> {
     )
 }
 
+/// Whether this process is the one that owns tenant schedules.
+///
+/// **Exactly one Cerveau instance in a pool may set this.** Instances behind
+/// the same load balancer share the backend but each keeps its own cron
+/// store, so a reconcile running on both would create the same job twice and
+/// the schedule would fire — and bill — once per instance. There is no
+/// coordination between them to prevent that, so ownership is declared, not
+/// inferred.
+///
+/// Opt-in, and off by default, deliberately. Getting it wrong in the "off"
+/// direction is visible: the backend row stays `pending_activation`, which
+/// is exactly what that column exists to say. Getting it wrong in the "on"
+/// direction is silent duplicate LLM spend, which is not.
+fn sync_owner_from(raw: Option<String>) -> bool {
+    matches!(
+        raw.as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn sync_owner() -> bool {
+    sync_owner_from(std::env::var("AVRY_TENANT_SCHEDULE_SYNC").ok())
+}
+
 /// Run the reconcile until `cancel` fires. Returns immediately, for the
-/// process's lifetime, when the backend seam is not configured — an install
-/// with no avry-backend has nothing to reconcile against and should not
-/// spend a timer discovering that once a minute.
+/// process's lifetime, when the backend seam is not configured or this
+/// instance is not the declared owner — neither has anything to reconcile
+/// and neither should spend a timer discovering that once a minute.
 pub async fn reconcile_loop(config: Config, cancel: CancellationToken) {
-    if backend().is_none() {
+    if backend().is_none() || !sync_owner() {
         return;
     }
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "interval_secs": RECONCILE_INTERVAL.as_secs(),
+            })
+        ),
+        "tenant schedule reconcile: this instance owns tenant schedules"
+    );
     // Boxed deliberately, so this function's own future stays roughly a
     // `Config` and a token rather than the whole loop body (HTTP client,
     // response buffer, per-row work, all live across awaits). The spawn site
@@ -362,6 +399,22 @@ mod tests {
             backend_from(url(), Some("t".into())),
             Some(("http://127.0.0.1:8081".to_string(), "t".to_string()))
         );
+    }
+
+    #[test]
+    fn sync_ownership_is_opt_in_and_off_by_default() {
+        // Off by default: an instance that says nothing must not reconcile,
+        // because in a two-instance pool the other one already does.
+        assert!(!sync_owner_from(None));
+        assert!(!sync_owner_from(Some(String::new())));
+        assert!(!sync_owner_from(Some("0".into())));
+        assert!(!sync_owner_from(Some("false".into())));
+        // Anything unrecognised also means no — an operator typo must fail
+        // towards "no duplicate billing", not towards it.
+        assert!(!sync_owner_from(Some("maybe".into())));
+        for yes in ["1", "true", "TRUE", "yes", "on", " true "] {
+            assert!(sync_owner_from(Some(yes.into())), "{yes} should opt in");
+        }
     }
 
     #[test]
