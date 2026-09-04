@@ -8,6 +8,7 @@ mod store;
 mod types;
 
 pub mod scheduler;
+pub mod tenant_sync;
 
 #[allow(unused_imports)]
 pub use schedule::{
