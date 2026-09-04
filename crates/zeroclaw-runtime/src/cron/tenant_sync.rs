@@ -188,15 +188,10 @@ async fn run_once(config: &Config) {
     for row in &desired {
         seen.push(row.id.clone());
         let (status, detail) = match apply_row(config, &host_alias, row) {
-            Ok(outcome) => {
-                let status = if row.enabled { "active" } else { "paused" };
-                // Only ack when the backend's view is actually stale, so a
-                // steady state costs one GET per interval and no writes.
-                if outcome == ScheduleUpsert::Unchanged && row.status == status {
-                    continue;
-                }
-                (status, None)
-            }
+            Ok(outcome) => match ack_decision(outcome, row.enabled, &row.status) {
+                Some(status) => (status, None),
+                None => continue,
+            },
             Err(e) => ("failed", Some(e)),
         };
         ack(&client, &base, &token, &row.id, status, detail.as_deref()).await;
@@ -269,6 +264,21 @@ fn apply_row(
         &row.agent_type,
     )
     .map_err(|e| format!("{e:#}"))
+}
+
+/// What to report back for a row, or `None` when the backend's view already
+/// matches and a write would be pure noise. Steady state must cost one GET
+/// per interval and zero writes — the reconcile runs once a minute forever.
+fn ack_decision(
+    outcome: ScheduleUpsert,
+    enabled: bool,
+    backend_status: &str,
+) -> Option<&'static str> {
+    let want = if enabled { "active" } else { "paused" };
+    if outcome == ScheduleUpsert::Unchanged && backend_status == want {
+        return None;
+    }
+    Some(want)
 }
 
 async fn ack(
@@ -364,17 +374,39 @@ mod tests {
 
     #[test]
     fn an_unchanged_row_whose_status_already_matches_is_not_re_acked() {
-        // Steady state must cost one GET and zero writes; the guard is the
-        // pair (Unchanged, status already correct).
-        let active = row("a", true, "active");
-        let should_skip =
-            ScheduleUpsert::Unchanged == ScheduleUpsert::Unchanged && active.status == "active";
-        assert!(should_skip);
+        // The only silent case: nothing changed here and the backend already
+        // says what we would tell it.
+        assert_eq!(
+            ack_decision(ScheduleUpsert::Unchanged, true, "active"),
+            None
+        );
+        assert_eq!(
+            ack_decision(ScheduleUpsert::Unchanged, false, "paused"),
+            None
+        );
 
-        // A paused row still reporting `active` must be acked.
-        let paused = row("b", false, "active");
-        let want = if paused.enabled { "active" } else { "paused" };
-        assert_ne!(paused.status, want);
+        // A paused row the backend still reports `active` must be corrected,
+        // even though this pass changed nothing — otherwise a tenant who
+        // pressed pause keeps reading `active` forever.
+        assert_eq!(
+            ack_decision(ScheduleUpsert::Unchanged, false, "active"),
+            Some("paused")
+        );
+        // A row the backend has never heard of us owning is always acked.
+        assert_eq!(
+            ack_decision(ScheduleUpsert::Unchanged, true, "pending_activation"),
+            Some("active")
+        );
+        // And a pass that actually wrote something always reports, so
+        // `last_synced_at` tracks reality.
+        assert_eq!(
+            ack_decision(ScheduleUpsert::Created, true, "active"),
+            Some("active")
+        );
+        assert_eq!(
+            ack_decision(ScheduleUpsert::Updated, true, "active"),
+            Some("active")
+        );
     }
 
     #[test]
