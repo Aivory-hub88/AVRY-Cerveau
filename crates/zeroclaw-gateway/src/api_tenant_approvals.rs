@@ -197,7 +197,7 @@ pub async fn handle_webhook_approval_list(
         )
     }
 
-    let Some(ref secret_hash) = state.webhook_secret_hash else {
+    let Some(secret_hash) = crate::configured_gateway_webhook_secret_hash(&state) else {
         return Err(unauthorized(
             "tenant-scoped approval listing requires X-Webhook-Secret auth on this deployment",
         ));
@@ -209,7 +209,7 @@ pub async fn handle_webhook_approval_list(
         .filter(|value| !value.is_empty())
         .map(crate::hash_webhook_secret);
     match header_hash {
-        Some(val) if constant_time_eq(&val, secret_hash.as_ref()) => {}
+        Some(val) if constant_time_eq(&val, &secret_hash) => {}
         _ => return Err(unauthorized("invalid or missing X-Webhook-Secret header")),
     }
 

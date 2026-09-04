@@ -166,7 +166,10 @@ fn authorize_tenant_request(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<TenantSelector, JsonErr> {
-    verify_webhook_secret(state.webhook_secret_hash.as_deref(), headers)?;
+    verify_webhook_secret(
+        crate::configured_gateway_webhook_secret_hash(&state).as_deref(),
+        headers,
+    )?;
     verify_tenant_headers(headers)
 }
 

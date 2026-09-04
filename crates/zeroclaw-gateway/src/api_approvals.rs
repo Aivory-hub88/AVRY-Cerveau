@@ -93,6 +93,21 @@ pub(crate) fn pending_approval_json(
         // that failed to parse," it can only ever mean "nothing to show."
         "verifier_finding": row.verifier_finding.as_deref()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
+        // ADR-009 Phase 3: whether anyone is waiting on this decision. An
+        // approval raised by a scheduled run fired at 03:00 and blocks
+        // nobody; one raised in a live conversation is holding a person up.
+        // The reader has no other way to tell those apart, and treating them
+        // the same makes the urgent ones harder to find. Derived by the
+        // runtime from the session it actually wrote, never by matching a
+        // string here.
+        "unattended": zeroclaw_runtime::cron::scheduler::is_unattended_session(
+            row.session_id.as_deref(),
+        ),
+        // What the turn was originally asked to do — for a scheduled run,
+        // the tenant's own schedule instruction. Gives the card a subtitle
+        // that says why this tool call happened, rather than only which
+        // tool it was.
+        "origin_message": row.origin_message,
     })
 }
 
@@ -429,5 +444,67 @@ mod tenant_custom_fallback_tests {
                 .await
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod approval_json_tests {
+    use super::*;
+    use zeroclaw_runtime::control_plane::pending_approvals::PendingApproval;
+
+    fn row(session_id: Option<&str>, origin: Option<&str>) -> PendingApproval {
+        PendingApproval {
+            id: "pa_1".into(),
+            principal: "u1".into(),
+            tool_name: "GMAIL__SEND_EMAIL".into(),
+            arguments: "{\"to\":\"a@b.c\"}".into(),
+            risk_tier: "irreversible".into(),
+            requested_at: "2026-09-05T03:00:00Z".into(),
+            status: "pending".into(),
+            resolved_at: None,
+            resolved_by: None,
+            tenant_id: Some("u1.customer_service".into()),
+            agent_type: Some("customer_service".into()),
+            session_id: session_id.map(str::to_owned),
+            origin_message: origin.map(str::to_owned),
+            delivered_at: None,
+            verifier_finding: None,
+        }
+    }
+
+    #[test]
+    fn an_approval_from_a_scheduled_run_is_marked_unattended() {
+        // The whole point of the flag: this one fired at 03:00 with nobody
+        // watching, so it can wait — and a reader triaging a list needs to
+        // see that without opening it.
+        let json = pending_approval_json(&row(
+            Some("cron-9f1c"),
+            Some("Summarise last week's deals."),
+        ));
+        assert_eq!(json["unattended"], serde_json::Value::Bool(true));
+        assert_eq!(json["origin_message"], "Summarise last week's deals.");
+    }
+
+    #[test]
+    fn an_approval_from_a_live_turn_is_not() {
+        // A person is blocked on this one. Erring towards `false` is the
+        // safe direction: a missing badge costs nothing, telling someone
+        // nobody is waiting when someone is costs them the wait.
+        for session in [None, Some("sess-42"), Some("main")] {
+            let json = pending_approval_json(&row(session, Some("send that email")));
+            assert_eq!(
+                json["unattended"],
+                serde_json::Value::Bool(false),
+                "session {session:?} must not read as unattended"
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_with_no_captured_origin_serialises_as_null_not_empty_string() {
+        // The UI hides the subtitle on null. An empty string would render an
+        // empty line instead, which looks like a rendering bug.
+        let json = pending_approval_json(&row(Some("cron-1"), None));
+        assert_eq!(json["origin_message"], serde_json::Value::Null);
     }
 }
