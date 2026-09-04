@@ -291,6 +291,21 @@ async fn classify_gateway_bind_outcome(
     }
 }
 
+/// Spawn the ADR-009 tenant-schedule reconcile.
+///
+/// A free function rather than an inline block inside `run` on purpose. The
+/// async block below owns a `Config` and is built as a temporary before
+/// `spawn!` takes it; built inline, that temporary sits in `run`'s poll
+/// frame for the whole of boot, and `run`'s frame was already close enough
+/// to the limit that adding it overflowed a test thread's stack outright.
+/// Here the temporary lives and dies in this frame instead.
+#[inline(never)]
+fn spawn_tenant_schedule_sync(config: Config, cancel: tokio_util::sync::CancellationToken) {
+    zeroclaw_spawn::spawn!(async move {
+        crate::cron::tenant_sync::reconcile_loop(config, cancel).await;
+    });
+}
+
 pub async fn run(
     mut config: Config,
     host: String,
@@ -471,6 +486,14 @@ pub async fn run(
             );
         }
     }
+
+    // ADR-009 Phase 2b: reconcile tenant schedules from avry-backend into
+    // this instance's cron store. `reconcile_loop` returns immediately when
+    // the backend seam isn't configured, so this is a no-op spawn on an
+    // install without one. Same lifecycle as the reaper and the verifier
+    // sweep above — respawned per run iteration, torn down by the same
+    // `channels_cancel`.
+    spawn_tenant_schedule_sync(config.clone(), channels_cancel.clone());
 
     if let Some(channels_start) = registry.take_channels_start() {
         if has_supervised_channels(&config) {

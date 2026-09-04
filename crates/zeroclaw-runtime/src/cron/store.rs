@@ -280,6 +280,142 @@ pub(crate) fn add_agent_job_for_tenant(
     get_job(config, &id)
 }
 
+/// `source` value marking a cron row the tenant-schedule reconcile owns.
+///
+/// Deliberately distinct from `imperative` (a human or agent created it
+/// here) and `declarative` (config.toml owns it): the reconcile deletes any
+/// row of *its* source that avry-backend no longer lists, so it must never
+/// be able to reach a row somebody else created.
+pub(crate) const TENANT_SCHEDULE_SOURCE: &str = "tenant_schedule";
+
+/// What `upsert_tenant_schedule_job` actually did, so the caller can report
+/// it and avoid acking rows that did not change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScheduleUpsert {
+    Created,
+    Updated,
+    Unchanged,
+}
+
+/// Every cron row owned by the tenant-schedule reconcile.
+pub(crate) fn list_tenant_schedule_jobs(config: &Config) -> Result<Vec<CronJob>> {
+    Ok(list_jobs(config)?
+        .into_iter()
+        .filter(|j| j.source == TENANT_SCHEDULE_SOURCE)
+        .collect())
+}
+
+/// Bring one cron row in line with what avry-backend says it should be.
+///
+/// The row id **is** the backend row's id — they are both UUIDs and keeping
+/// them equal is what makes this idempotent without a mapping table.
+///
+/// Only touches `next_run` when the schedule itself changed. Recomputing it
+/// on every pass would push the next firing forward by one reconcile
+/// interval each time, so a job whose interval is longer than the pass
+/// would never fire at all — the failure would look exactly like the
+/// scheduler being broken, which this codebase has already chased once
+/// (ADR-009 §6).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn upsert_tenant_schedule_job(
+    config: &Config,
+    id: &str,
+    agent_alias: &str,
+    name: &str,
+    prompt: &str,
+    schedule: Schedule,
+    enabled: bool,
+    tenant_id: &str,
+    tenant_agent_type: &str,
+) -> Result<ScheduleUpsert> {
+    let now = Utc::now();
+    validate_schedule(&schedule, now)?;
+    let expression = schedule_cron_expression(&schedule).unwrap_or_default();
+    let schedule_json = serde_json::to_string(&schedule)?;
+
+    let existing = get_job(config, id).ok();
+
+    if let Some(job) = existing {
+        if job.source != TENANT_SCHEDULE_SOURCE {
+            anyhow::bail!(
+                "cron job '{id}' exists but is owned by '{}', not the tenant-schedule \
+                 reconcile — refusing to overwrite it",
+                job.source
+            );
+        }
+        let schedule_changed =
+            job.expression != expression || serde_json::to_string(&job.schedule)? != schedule_json;
+        let unchanged = !schedule_changed
+            && job.prompt.as_deref() == Some(prompt)
+            && job.name.as_deref() == Some(name)
+            && job.enabled == enabled
+            && job.tenant_id.as_deref() == Some(tenant_id)
+            && job.tenant_agent_type.as_deref() == Some(tenant_agent_type);
+        if unchanged {
+            return Ok(ScheduleUpsert::Unchanged);
+        }
+        let next_run = if schedule_changed {
+            next_run_for_schedule(&schedule, now)?
+        } else {
+            job.next_run
+        };
+        with_initialized_connection(config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs
+                    SET expression = ?1, schedule = ?2, prompt = ?3, name = ?4,
+                        enabled = ?5, next_run = ?6, agent_alias = ?7,
+                        tenant_id = ?8, tenant_agent_type = ?9
+                  WHERE id = ?10",
+                params![
+                    expression,
+                    schedule_json,
+                    prompt,
+                    name,
+                    i32::from(enabled),
+                    next_run.to_rfc3339(),
+                    agent_alias,
+                    tenant_id,
+                    tenant_agent_type,
+                    id,
+                ],
+            )
+            .context("Failed to update tenant-schedule cron job")?;
+            Ok(())
+        })?;
+        return Ok(ScheduleUpsert::Updated);
+    }
+
+    let next_run = next_run_for_schedule(&schedule, now)?;
+    with_initialized_connection(config, |conn| {
+        conn.execute(
+            "INSERT INTO cron_jobs (
+                id, expression, command, schedule, job_type, prompt, name, session_target, model,
+                enabled, delivery, delete_after_run, allowed_tools, agent_alias, created_at,
+                next_run, uses_memory, source, tenant_id, tenant_agent_type
+             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, 'isolated', NULL, ?6, ?7, 0, NULL, ?8, ?9,
+                       ?10, 1, ?11, ?12, ?13)",
+            params![
+                id,
+                expression,
+                schedule_json,
+                prompt,
+                name,
+                i32::from(enabled),
+                serde_json::to_string(&DeliveryConfig::default())?,
+                agent_alias,
+                now.to_rfc3339(),
+                next_run.to_rfc3339(),
+                TENANT_SCHEDULE_SOURCE,
+                tenant_id,
+                tenant_agent_type,
+            ],
+        )
+        .context("Failed to insert tenant-schedule cron job")?;
+        Ok(())
+    })?;
+    Ok(ScheduleUpsert::Created)
+}
+
 pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
     let Some(jobs) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
@@ -2354,6 +2490,202 @@ mod tests {
         assert_eq!(stored.allowed_tools, job.allowed_tools);
     }
 
+    // ── ADR-009 Phase 2b: the reconcile's upsert ─────────────────────
+
+    fn upsert(
+        config: &Config,
+        id: &str,
+        prompt: &str,
+        expr: &str,
+        enabled: bool,
+    ) -> ScheduleUpsert {
+        upsert_tenant_schedule_job(
+            config,
+            id,
+            "default",
+            "weekly digest",
+            prompt,
+            Schedule::Cron {
+                expr: expr.into(),
+                tz: Some("Asia/Jakarta".into()),
+            },
+            enabled,
+            "u1.customer_service",
+            "customer_service",
+        )
+        .expect("upsert should succeed")
+    }
+
+    #[test]
+    fn upsert_creates_then_reports_unchanged_without_moving_next_run() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let id = "11111111-1111-1111-1111-111111111111";
+
+        assert_eq!(
+            upsert(&config, id, "Summarise.", "0 9 * * 1", true),
+            ScheduleUpsert::Created
+        );
+        let first = get_job(&config, id).unwrap();
+        assert_eq!(first.source, TENANT_SCHEDULE_SOURCE);
+        assert_eq!(
+            first.tenant_selector(),
+            Some(("u1.customer_service", "customer_service"))
+        );
+        assert_eq!(first.job_type, JobType::Agent);
+
+        // The reconcile runs every minute. If an unchanged row recomputed
+        // `next_run`, each pass would push the next firing forward by an
+        // interval and a job whose period exceeds it would never fire —
+        // indistinguishable from the scheduler being broken.
+        assert_eq!(
+            upsert(&config, id, "Summarise.", "0 9 * * 1", true),
+            ScheduleUpsert::Unchanged
+        );
+        let second = get_job(&config, id).unwrap();
+        assert_eq!(
+            second.next_run, first.next_run,
+            "an unchanged pass must not move next_run"
+        );
+    }
+
+    #[test]
+    fn upsert_updates_content_without_moving_next_run() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let id = "22222222-2222-2222-2222-222222222222";
+        upsert(&config, id, "Summarise.", "0 9 * * 1", true);
+        let before = get_job(&config, id).unwrap();
+
+        assert_eq!(
+            upsert(&config, id, "Summarise in Indonesian.", "0 9 * * 1", true),
+            ScheduleUpsert::Updated
+        );
+        let after = get_job(&config, id).unwrap();
+        assert_eq!(after.prompt.as_deref(), Some("Summarise in Indonesian."));
+        // Only the schedule governs when it next fires — editing the prompt
+        // must not silently reschedule it.
+        assert_eq!(after.next_run, before.next_run);
+    }
+
+    #[test]
+    fn upsert_recomputes_next_run_only_when_the_schedule_changes() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let id = "33333333-3333-3333-3333-333333333333";
+        upsert(&config, id, "Summarise.", "0 9 * * 1", true);
+        let before = get_job(&config, id).unwrap();
+
+        assert_eq!(
+            upsert(&config, id, "Summarise.", "30 17 * * 5", true),
+            ScheduleUpsert::Updated
+        );
+        let after = get_job(&config, id).unwrap();
+        assert_ne!(
+            after.next_run, before.next_run,
+            "a new expression must reschedule"
+        );
+        assert_eq!(after.expression, "30 17 * * 5");
+    }
+
+    #[test]
+    fn upsert_pauses_by_disabling_rather_than_deleting() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let id = "44444444-4444-4444-4444-444444444444";
+        upsert(&config, id, "Summarise.", "0 9 * * 1", true);
+        assert_eq!(
+            upsert(&config, id, "Summarise.", "0 9 * * 1", false),
+            ScheduleUpsert::Updated
+        );
+        let job = get_job(&config, id).unwrap();
+        assert!(!job.enabled);
+        assert_eq!(
+            job.source, TENANT_SCHEDULE_SOURCE,
+            "a paused row is still ours to reconcile"
+        );
+    }
+
+    #[test]
+    fn upsert_refuses_to_take_over_a_row_it_does_not_own() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        // An operator's own job, created the ordinary way.
+        let operator_job = add_agent_job(
+            &config,
+            "default",
+            Some("mine".into()),
+            Schedule::Every { every_ms: 60_000 },
+            "do work",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(operator_job.source, "imperative");
+
+        let err = upsert_tenant_schedule_job(
+            &config,
+            &operator_job.id,
+            "default",
+            "hijack",
+            "Summarise.",
+            Schedule::Cron {
+                expr: "0 9 * * 1".into(),
+                tz: Some("UTC".into()),
+            },
+            true,
+            "u1.customer_service",
+            "customer_service",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to overwrite"),
+            "the reconcile must never reach a row another source owns: {err}"
+        );
+        // And the operator's job is untouched.
+        let still = get_job(&config, &operator_job.id).unwrap();
+        assert_eq!(still.prompt.as_deref(), Some("do work"));
+    }
+
+    #[test]
+    fn list_tenant_schedule_jobs_sees_only_reconcile_owned_rows() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        add_agent_job(
+            &config,
+            "default",
+            Some("operator".into()),
+            Schedule::Every { every_ms: 60_000 },
+            "do work",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        upsert(
+            &config,
+            "55555555-5555-5555-5555-555555555555",
+            "Summarise.",
+            "0 9 * * 1",
+            true,
+        );
+
+        let owned = list_tenant_schedule_jobs(&config).unwrap();
+        assert_eq!(
+            owned.len(),
+            1,
+            "the operator's job must not be in scope for deletion"
+        );
+        assert_eq!(owned[0].id, "55555555-5555-5555-5555-555555555555");
+    }
+
     #[test]
     fn add_agent_job_for_tenant_persists_and_round_trips_the_tenant_selector() {
         let tmp = TempDir::new().unwrap();
@@ -2385,7 +2717,10 @@ mod tests {
         // back out of storage, not merely accepted on the way in.
         let stored = get_job(&config, &job.id).unwrap();
         assert_eq!(stored.tenant_id.as_deref(), Some("u1"));
-        assert_eq!(stored.tenant_agent_type.as_deref(), Some("customer_service"));
+        assert_eq!(
+            stored.tenant_agent_type.as_deref(),
+            Some("customer_service")
+        );
 
         // An ordinary (non-tenant) job created in the same store is
         // untouched by the new columns — they default to NULL/None, not
@@ -2446,7 +2781,10 @@ mod tests {
             "",
         )
         .unwrap_err();
-        assert!(err.to_string().contains("tenant_agent_type must not be empty"));
+        assert!(
+            err.to_string()
+                .contains("tenant_agent_type must not be empty")
+        );
     }
 
     #[test]
