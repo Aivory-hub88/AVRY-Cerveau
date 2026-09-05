@@ -39,7 +39,16 @@ pub struct PendingApproval {
     pub arguments: String,
     pub risk_tier: String,
     pub requested_at: String,
-    /// `"pending"` | `"approved"` | `"denied"`.
+    /// `"pending"` | `"approved"` | `"denied"` | `"expired"`.
+    ///
+    /// `"expired"` is written only by
+    /// [`super::approval_expiry`], never by any human-facing resolve path
+    /// (the tenant API accepts `approve`/`deny` and nothing else). It is
+    /// deliberately *not* `"denied"`: a denial is a decision someone made
+    /// and owes the caller a reply, so it enters the redelivery sweep and
+    /// buys a continuation turn. An expiry is the absence of a decision on
+    /// a run nobody was watching — there is no one to reply to, and paying
+    /// for a turn to say so would be spend with no reader.
     pub status: String,
     pub resolved_at: Option<String>,
     /// Free-text identity of whoever resolved it (e.g. an operator email or
@@ -235,6 +244,19 @@ impl PendingApprovalsStore {
         Ok(id)
     }
 
+    /// Move a row's `requested_at` backwards so an age-dependent test does
+    /// not have to sleep. Test-only: nothing in the running system may
+    /// rewrite when an approval was asked for.
+    #[cfg(test)]
+    pub(crate) fn backdate_for_test(&self, id: &str, requested_at: &str) {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE pending_approvals SET requested_at = ?2 WHERE id = ?1",
+            params![id, requested_at],
+        )
+        .expect("backdate a test row");
+    }
+
     /// Fetch one row by id, regardless of status.
     pub fn get(&self, id: &str) -> Result<Option<PendingApproval>> {
         let conn = self.conn.lock();
@@ -279,6 +301,39 @@ impl PendingApprovalsStore {
         };
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("list pending_approvals")
+    }
+
+    /// Who a row's `resolved_by` names when it lapsed instead of being
+    /// decided. A real string rather than `NULL` so an audit read can tell
+    /// "nobody ever answered" apart from "resolved by an unknown party".
+    pub const EXPIRY_ACTOR: &'static str = "system:expiry";
+
+    /// Retire a `pending` row that nobody answered in time.
+    ///
+    /// A separate method from [`Self::resolve`] on purpose. `resolve` is the
+    /// human-facing transition and its vocabulary is `approved`/`denied`;
+    /// letting `"expired"` travel through it would put a status the tenant
+    /// API must never accept into the same doorway the tenant API uses.
+    /// Here the status and the actor are both fixed by the function, so
+    /// there is no argument a caller could get wrong.
+    ///
+    /// The row is retired, never deleted: it stays readable for an audit,
+    /// and a future UI that wants to show "this one lapsed" already has
+    /// everything it needs.
+    ///
+    /// Same idempotency contract as `resolve` — `false` means the row was
+    /// already resolved (very plausibly by a human, moments before this
+    /// sweep reached it), which is a race this must lose rather than win.
+    pub fn expire(&self, id: &str) -> Result<bool> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE pending_approvals
+                SET status = 'expired', resolved_at = ?2, resolved_by = ?3
+              WHERE id = ?1 AND status = 'pending'",
+            params![id, now, Self::EXPIRY_ACTOR],
+        )?;
+        Ok(updated == 1)
     }
 
     /// Transition a `pending` row to `approved`/`denied`. Returns `true` if

@@ -291,6 +291,21 @@ async fn classify_gateway_bind_outcome(
     }
 }
 
+/// Spawn the ADR-009 unattended-approval expiry sweep.
+///
+/// Same `#[inline(never)]` reasoning as `spawn_tenant_schedule_sync` below:
+/// an async block built inline in `run`'s poll frame is what overflowed a
+/// test thread's stack once already.
+#[inline(never)]
+fn spawn_approval_expiry(
+    store: std::sync::Arc<crate::control_plane::pending_approvals::PendingApprovalsStore>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    zeroclaw_spawn::spawn!(async move {
+        crate::control_plane::approval_expiry::sweep_loop(store, cancel).await;
+    });
+}
+
 /// Spawn the ADR-009 tenant-schedule reconcile.
 ///
 /// A free function rather than an inline block inside `run` on purpose. The
@@ -469,6 +484,12 @@ pub async fn run(
     // same `channels_cancel` on reload/shutdown.
     match crate::control_plane::pending_approvals::PendingApprovalsStore::shared(&config.data_dir) {
         Ok(store) => {
+            // ADR-009 Decision 5: retire unattended approvals nobody ever
+            // answered. Shares the store the verifier sweep just opened —
+            // `shared()` is a process-wide singleton, so this is the same
+            // handle either way, but taking it here makes that obvious.
+            spawn_approval_expiry(std::sync::Arc::clone(&store), channels_cancel.clone());
+
             let sweep_config = config.clone();
             let sweep_cancel = channels_cancel.clone();
             zeroclaw_spawn::spawn!(async move {
