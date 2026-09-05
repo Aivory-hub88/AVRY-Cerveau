@@ -274,6 +274,17 @@ pub struct TurnOriginContext {
     pub session_id: Option<String>,
     /// Verbatim user message that started this turn.
     pub origin_message: String,
+    /// ADR-009 §14 follow-up: the `product.tenant_scheduled_runs` row this
+    /// turn is running on behalf of, when it is a tenant schedule firing
+    /// unattended (`cron::scheduler::run_agent_job` sets it from the job's
+    /// own id — the two are the same id by construction, since
+    /// `tenant_sync::apply_row` stores the backend row under it). `None`
+    /// for every other kind of turn: a live webhook turn, a resumed
+    /// approval, an operator's own untenanted cron job. The one reader is
+    /// `control_plane::approval_expiry`, which reports a lapsed approval
+    /// back to this schedule so the tenant sees it there instead of only
+    /// in a notification that quietly disappears.
+    pub schedule_id: Option<String>,
 }
 
 tokio::task_local! {
@@ -366,9 +377,9 @@ pub type TenantResolveFn = Box<
     dyn Fn(
             String,
             String,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Arc<TenantContext>>> + Send>>
-        + Send
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<Arc<TenantContext>>> + Send>,
+        > + Send
         + Sync,
 >;
 
@@ -393,7 +404,10 @@ pub fn register_tenant_resolve_fn(f: TenantResolveFn) {
 /// `run_agent_job` does) must treat `None` as "refuse to run unscoped",
 /// never as "fall back to an operator run", so the two cases are
 /// deliberately not distinguished here.
-pub async fn resolve_tenant_context(tenant_id: &str, agent_type: &str) -> Option<Arc<TenantContext>> {
+pub async fn resolve_tenant_context(
+    tenant_id: &str,
+    agent_type: &str,
+) -> Option<Arc<TenantContext>> {
     match TENANT_RESOLVE_FN.get() {
         Some(f) => f(tenant_id.to_string(), agent_type.to_string()).await,
         None => None,
@@ -619,6 +633,7 @@ mod tests {
         let ctx = Arc::new(TurnOriginContext {
             session_id: Some("sess-1".to_string()),
             origin_message: "please finalize invoice inv_123".to_string(),
+            schedule_id: None,
         });
         TURN_ORIGIN_CONTEXT
             .scope(Some(ctx.clone()), async {

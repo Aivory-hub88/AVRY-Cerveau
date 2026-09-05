@@ -861,6 +861,12 @@ async fn run_agent_job(
         crate::agent::tenant::TurnOriginContext {
             session_id: Some(session_path.to_string_lossy().into_owned()),
             origin_message: job.prompt.clone().unwrap_or_default(),
+            // ADR-009 §14 follow-up: only a tenant-owned job has a
+            // `product.tenant_scheduled_runs` row on the other end to
+            // report a lapse back to — an operator's own untenanted cron
+            // job (`job.tenant_selector()` is `None`) has nothing there,
+            // and `job.id` would be meaningless to avry-backend anyway.
+            schedule_id: job.tenant_selector().map(|_| job.id.clone()),
         },
     ));
 

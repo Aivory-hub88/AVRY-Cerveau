@@ -58,6 +58,7 @@ pub(crate) async fn gate_tool_approval(
                     tenant.as_ref().map(|t| t.agent_type.as_str()),
                     turn_origin.as_ref().and_then(|o| o.session_id.as_deref()),
                     turn_origin.as_ref().map(|o| o.origin_message.as_str()),
+                    turn_origin.as_ref().and_then(|o| o.schedule_id.as_deref()),
                 )
                 .ok(),
             None => None,
@@ -68,11 +69,13 @@ pub(crate) async fn gate_tool_approval(
             // front-end can attach a real approve/deny affordance without
             // scraping the id back out of the model's own reply text — see
             // `PendingApprovalSummary`'s doc.
-            crate::agent::tenant::record_pending_approval(crate::agent::tenant::PendingApprovalSummary {
-                id: id.clone(),
-                tool_name: tool_name.to_string(),
-                risk_tier: "irreversible".to_string(),
-            });
+            crate::agent::tenant::record_pending_approval(
+                crate::agent::tenant::PendingApprovalSummary {
+                    id: id.clone(),
+                    tool_name: tool_name.to_string(),
+                    risk_tier: "irreversible".to_string(),
+                },
+            );
         }
         let message = match &pending_id {
             Some(id) => format!(

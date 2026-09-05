@@ -2751,6 +2751,8 @@ pub(crate) async fn run_gateway_chat_with_tools(
         let turn_origin = std::sync::Arc::new(zeroclaw_runtime::agent::tenant::TurnOriginContext {
             session_id: session_id.map(str::to_owned),
             origin_message: message.to_owned(),
+            // A live webhook turn, never a schedule firing unattended.
+            schedule_id: None,
         });
         // Cerveau (patch 0035): a fresh, empty cell for this turn only — see
         // `LAST_PENDING_APPROVAL`'s doc for why this needs `Mutex`-wrapped
