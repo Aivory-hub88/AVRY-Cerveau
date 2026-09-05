@@ -51,16 +51,19 @@ pub struct TenantContext {
     /// raw `X-Agent-Type` header value, authenticated by the gateway same
     /// as `tenant_id`/`platform_user_id`.
     ///
-    /// This is deliberately *not* used to select which host
-    /// `[agents.<alias>]` a turn runs on (that's `?agent=`, resolved
-    /// independently — see `zeroclaw-gateway`'s
-    /// `resolve_gateway_chat_agent_alias`, and the current bridge's own
-    /// `telegram-agent.js` for the reference pattern: one running process,
-    /// `agent_type` is a per-request data value that dynamically selects
-    /// prompt/tools, never a provisioning axis). Here it drives which
-    /// *additional* skill bundles this turn loads on top of whatever the
-    /// host alias already grants — see
-    /// `Config::skill_bundle_aliases_for_tenant` (Phase 4.1 follow-on,
+    /// An explicit `?agent=` override still wins outright. Absent that,
+    /// this value gets first refusal on selecting the host
+    /// `[agents.<alias>]` a turn runs on: `Config::
+    /// resolved_runtime_agent_alias_for_tenant_type` resolves it directly
+    /// to a same-named, enabled `[agents.<agent_type>]` entry when one
+    /// exists, giving that product type its own risk profile and prompt
+    /// workspace instead of every tenant sharing one type-blind alias; an
+    /// `agent_type` with no matching entry (or a disabled one) falls
+    /// through unchanged to the old alphabetically-smallest-enabled-alias
+    /// fallback (see `resolve_gateway_chat_agent_alias`). Independently of
+    /// alias selection, it also drives which *additional* skill bundles
+    /// this turn loads on top of whatever the host alias already grants —
+    /// see `Config::skill_bundle_aliases_for_tenant` (Phase 4.1 follow-on,
     /// patch 0011) — the same data-driven pattern already used for
     /// persona (this struct) and Composio entity scoping
     /// (`platform_user_id`, patch 0010).
