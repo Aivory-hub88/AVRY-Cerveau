@@ -77,7 +77,11 @@ fn backend_from(url: Option<String>, token: Option<String>) -> Option<(String, S
     Some((url, token))
 }
 
-fn backend() -> Option<(String, String)> {
+/// `pub(crate)`: `control_plane::approval_expiry` reports a lapsed schedule
+/// through this exact seam, and a second copy of the parsing (trim,
+/// trailing-slash strip, blank-is-absent) is exactly the kind of duplication
+/// that drifts the two silently apart.
+pub(crate) fn backend() -> Option<(String, String)> {
     // Same two variables `zeroclaw_gateway::tenant`'s resolvers already use,
     // read the same way, so there is one place to configure the backend seam
     // rather than two that can disagree.

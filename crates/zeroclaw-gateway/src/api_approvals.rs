@@ -405,6 +405,7 @@ mod tenant_custom_fallback_tests {
             origin_message: None,
             delivered_at: None,
             verifier_finding: None,
+            schedule_id: None,
         }
     }
 
@@ -469,6 +470,7 @@ mod approval_json_tests {
             origin_message: origin.map(str::to_owned),
             delivered_at: None,
             verifier_finding: None,
+            schedule_id: None,
         }
     }
 

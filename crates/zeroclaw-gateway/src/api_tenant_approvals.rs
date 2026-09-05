@@ -423,6 +423,9 @@ async fn run_continuation(
     let turn_origin = Arc::new(zeroclaw_runtime::agent::tenant::TurnOriginContext {
         session_id: row.session_id.clone(),
         origin_message: row.origin_message.clone().unwrap_or_default(),
+        // A resumed approval is not a fresh schedule firing — nothing new
+        // to report back to a schedule row here, ever.
+        schedule_id: None,
     });
 
     let config = state.config.read().clone();
@@ -717,6 +720,7 @@ mod tests {
             origin_message: Some("please reply to ticket 42".into()),
             delivered_at: None,
             verifier_finding: None,
+            schedule_id: None,
         };
         let result = serde_json::json!({"success": true, "output": "ok"});
         let prompt = continuation_prompt(&row, "approve", Some(&result));
@@ -744,6 +748,7 @@ mod tests {
             origin_message: None,
             delivered_at: None,
             verifier_finding: None,
+            schedule_id: None,
         };
         let prompt = continuation_prompt(&row, "deny", None);
         assert!(prompt.contains("declined to approve"));
@@ -772,6 +777,7 @@ mod tests {
             origin_message: None,
             delivered_at: None,
             verifier_finding: None,
+            schedule_id: None,
         };
         let err = tenant_selector_for_resume(&row).unwrap_err();
         assert!(err.to_string().contains("no agent_type"));
@@ -795,6 +801,7 @@ mod tests {
             origin_message: None,
             delivered_at: None,
             verifier_finding: None,
+            schedule_id: None,
         };
         let err = tenant_selector_for_resume(&row).unwrap_err();
         assert!(err.to_string().contains("no principal"));
@@ -818,6 +825,7 @@ mod tests {
             origin_message: Some("hi".into()),
             delivered_at: None,
             verifier_finding: None,
+            schedule_id: None,
         };
         let sel = tenant_selector_for_resume(&row).unwrap();
         assert_eq!(sel.user_id, "u1");

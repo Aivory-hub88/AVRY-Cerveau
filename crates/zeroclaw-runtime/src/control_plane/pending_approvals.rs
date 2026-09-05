@@ -94,6 +94,15 @@ pub struct PendingApproval {
     /// agent has no tool that could resolve this row itself — it can only
     /// ever produce a finding for a human to read, never a decision.
     pub verifier_finding: Option<String>,
+    /// ADR-009 §14 follow-up: the `product.tenant_scheduled_runs` row that
+    /// caused this approval, when the turn that raised it was a tenant
+    /// schedule (`cron::scheduler::run_agent_job` stamps it from
+    /// `TurnOriginContext`; every other caller leaves it `None`). The one
+    /// consumer is [`super::approval_expiry`]: an approval that lapses here
+    /// unanswered is reported back to avry-backend against this id, so the
+    /// tenant sees "your last run raised a question nobody answered" on the
+    /// schedule itself rather than watching a notification quietly vanish.
+    pub schedule_id: Option<String>,
 }
 
 /// SQLite-backed store for pending-approval records.
@@ -170,6 +179,10 @@ impl PendingApprovalsStore {
                 "verifier_finding",
                 "ALTER TABLE pending_approvals ADD COLUMN verifier_finding TEXT",
             ),
+            (
+                "schedule_id",
+                "ALTER TABLE pending_approvals ADD COLUMN schedule_id TEXT",
+            ),
         ] {
             if let Err(e) = conn.execute(ddl, []) {
                 let msg = e.to_string();
@@ -196,18 +209,20 @@ impl PendingApprovalsStore {
         risk_tier: &str,
     ) -> Result<String> {
         self.insert_with_context(
-            principal, tool_name, arguments, risk_tier, None, None, None, None,
+            principal, tool_name, arguments, risk_tier, None, None, None, None, None,
         )
     }
 
     /// Insert a new pending row carrying enough context
-    /// (`tenant_id`/`agent_type`/`session_id`/`origin_message`) for a
-    /// later tenant-scoped resolve call (`zeroclaw_gateway::api_tenant_approvals`,
-    /// patch 0029) to synthesize a coherent continuation turn instead of
-    /// just executing the tool out-of-band. Any of the four may be `None`
-    /// (e.g. a tenant turn with no session id) — a resume path must
-    /// tolerate a missing `origin_message` by falling back to a generic
-    /// continuation prompt, not by failing.
+    /// (`tenant_id`/`agent_type`/`session_id`/`origin_message`/`schedule_id`)
+    /// for a later tenant-scoped resolve call
+    /// (`zeroclaw_gateway::api_tenant_approvals`, patch 0029) to synthesize a
+    /// coherent continuation turn instead of just executing the tool
+    /// out-of-band, and for `approval_expiry` to report a lapse back to the
+    /// schedule that caused it. Any of the five may be `None` (e.g. a tenant
+    /// turn with no session id, or one not raised by a schedule at all) — a
+    /// resume path must tolerate a missing `origin_message` by falling back
+    /// to a generic continuation prompt, not by failing.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_with_context(
         &self,
@@ -219,6 +234,7 @@ impl PendingApprovalsStore {
         agent_type: Option<&str>,
         session_id: Option<&str>,
         origin_message: Option<&str>,
+        schedule_id: Option<&str>,
     ) -> Result<String> {
         let id = format!("pa_{}", uuid::Uuid::new_v4());
         let now = chrono::Utc::now().to_rfc3339();
@@ -226,8 +242,8 @@ impl PendingApprovalsStore {
         conn.execute(
             "INSERT INTO pending_approvals
                  (id, principal, tool_name, arguments, risk_tier, requested_at, status,
-                  tenant_id, agent_type, session_id, origin_message)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9, ?10)",
+                  tenant_id, agent_type, session_id, origin_message, schedule_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9, ?10, ?11)",
             params![
                 id,
                 principal,
@@ -238,7 +254,8 @@ impl PendingApprovalsStore {
                 tenant_id,
                 agent_type,
                 session_id,
-                origin_message
+                origin_message,
+                schedule_id
             ],
         )?;
         Ok(id)
@@ -264,7 +281,7 @@ impl PendingApprovalsStore {
             "SELECT id, principal, tool_name, arguments, risk_tier, requested_at,
                     status, resolved_at, resolved_by,
                     tenant_id, agent_type, session_id, origin_message, delivered_at,
-                    verifier_finding
+                    verifier_finding, schedule_id
                FROM pending_approvals WHERE id = ?1",
             params![id],
             Self::row_to_pending_approval,
@@ -282,7 +299,7 @@ impl PendingApprovalsStore {
                 "SELECT id, principal, tool_name, arguments, risk_tier, requested_at,
                         status, resolved_at, resolved_by,
                         tenant_id, agent_type, session_id, origin_message, delivered_at,
-                    verifier_finding
+                    verifier_finding, schedule_id
                    FROM pending_approvals WHERE status = ?1 ORDER BY requested_at DESC",
             )?
         } else {
@@ -290,7 +307,7 @@ impl PendingApprovalsStore {
                 "SELECT id, principal, tool_name, arguments, risk_tier, requested_at,
                         status, resolved_at, resolved_by,
                         tenant_id, agent_type, session_id, origin_message, delivered_at,
-                    verifier_finding
+                    verifier_finding, schedule_id
                    FROM pending_approvals ORDER BY requested_at DESC",
             )?
         };
@@ -369,6 +386,7 @@ impl PendingApprovalsStore {
             origin_message: r.get(12)?,
             delivered_at: r.get(13)?,
             verifier_finding: r.get(14)?,
+            schedule_id: r.get(15)?,
         })
     }
 
@@ -383,7 +401,7 @@ impl PendingApprovalsStore {
             "SELECT id, principal, tool_name, arguments, risk_tier, requested_at,
                     status, resolved_at, resolved_by,
                     tenant_id, agent_type, session_id, origin_message, delivered_at,
-                    verifier_finding
+                    verifier_finding, schedule_id
                FROM pending_approvals
               WHERE status = 'pending' AND verifier_finding IS NULL
               ORDER BY requested_at ASC",
@@ -443,7 +461,7 @@ impl PendingApprovalsStore {
             "SELECT id, principal, tool_name, arguments, risk_tier, requested_at,
                     status, resolved_at, resolved_by,
                     tenant_id, agent_type, session_id, origin_message, delivered_at,
-                    verifier_finding
+                    verifier_finding, schedule_id
                FROM pending_approvals
               WHERE status IN ('approved', 'denied')
                 AND delivered_at IS NULL
@@ -508,6 +526,7 @@ mod tests {
                 Some("finance_invoice_ops"),
                 Some("sess-1"),
                 Some("please finalize invoice inv_123"),
+                None,
             )
             .unwrap();
         let row = store.get(&id).unwrap().expect("row must exist");
@@ -524,7 +543,17 @@ mod tests {
     fn insert_with_context_tolerates_all_none_context() {
         let store = PendingApprovalsStore::new_in_memory().unwrap();
         let id = store
-            .insert_with_context("u1", "tool_a", "{}", "irreversible", None, None, None, None)
+            .insert_with_context(
+                "u1",
+                "tool_a",
+                "{}",
+                "irreversible",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         let row = store.get(&id).unwrap().expect("row must exist");
         assert!(row.origin_message.is_none());
@@ -587,6 +616,7 @@ mod tests {
                 Some("customer_service"),
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert!(store.get(&id).unwrap().unwrap().delivered_at.is_none());
@@ -626,6 +656,7 @@ mod tests {
                 Some("customer_service"),
                 Some("sess-1"),
                 Some("hi"),
+                None,
             )
             .unwrap();
         store
@@ -643,6 +674,7 @@ mod tests {
                 Some("customer_service"),
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -655,6 +687,7 @@ mod tests {
                 "irreversible",
                 Some("u1.cs"),
                 Some("customer_service"),
+                None,
                 None,
                 None,
             )
