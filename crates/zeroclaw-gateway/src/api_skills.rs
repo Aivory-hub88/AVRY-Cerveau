@@ -333,7 +333,7 @@ pub async fn handle_delete_skill(
 
 // ── Error mapping ───────────────────────────────────────────────────
 
-fn service_error_response(err: ServiceError) -> Response {
+pub(crate) fn service_error_response(err: ServiceError) -> Response {
     let status = match &err {
         ServiceError::Ref(_) => StatusCode::BAD_REQUEST,
         ServiceError::Bundle(_) => StatusCode::BAD_REQUEST,

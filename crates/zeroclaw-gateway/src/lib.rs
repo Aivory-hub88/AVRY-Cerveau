@@ -25,6 +25,7 @@ pub mod api_sop;
 pub mod api_sop_author;
 pub mod api_tenant_approvals;
 pub mod api_tenant_memory;
+pub mod api_tenant_skills;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
 #[cfg(any(
@@ -1842,6 +1843,12 @@ pub async fn run_gateway(
             "/webhook/memory/{key}",
             put(api_tenant_memory::handle_webhook_memory_edit)
                 .delete(api_tenant_memory::handle_webhook_memory_delete),
+        )
+        // ADR-008 Phase 4: read-only Skills listing per agent, same
+        // two-layer contract as the routes above.
+        .route(
+            "/webhook/skills",
+            get(api_tenant_skills::handle_webhook_skills),
         )
         .merge(optional_channel_routes())
         // ── Claude Code runner hooks ──
