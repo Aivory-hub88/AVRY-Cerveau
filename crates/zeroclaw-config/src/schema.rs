@@ -4636,6 +4636,29 @@ impl Config {
             })
     }
 
+    /// Same resolution as `resolved_runtime_agent_alias`, but first gives a
+    /// tenant's own `X-Agent-Type` a chance to resolve directly to a
+    /// same-named, enabled `[agents.<agent_type>]` entry — a per-product-type
+    /// identity (own risk profile, prompt workspace, `mcp_bundles`/
+    /// `skill_bundles`) reachable natively from a live tenant turn, instead
+    /// of every tenant sharing one type-blind alias.
+    ///
+    /// Falls straight through to `resolved_runtime_agent_alias()` when
+    /// `tenant_agent_type` is `None`, names no `[agents.<type>]` entry, or
+    /// names one that's `enabled = false` — so an unmigrated agent type is
+    /// byte-for-byte unaffected by this method existing.
+    #[must_use]
+    pub fn resolved_runtime_agent_alias_for_tenant_type(
+        &self,
+        tenant_agent_type: Option<&str>,
+    ) -> Option<&str> {
+        tenant_agent_type
+            .and_then(|t| self.agents.get_key_value(t))
+            .filter(|(_, a)| a.enabled)
+            .map(|(k, _)| k.as_str())
+            .or_else(|| self.resolved_runtime_agent_alias())
+    }
+
     /// Resolve the active storage backend for the memory subsystem.
     ///
     /// `MemoryConfig.backend` is a dotted reference (`<backend>.<alias>`) into
@@ -24772,6 +24795,93 @@ untrusted_outbound_redact = false
                 "finance-invoice-ops-stripe".to_string(),
                 "shared-ops".to_string()
             ]
+        );
+    }
+
+    #[test]
+    async fn resolved_runtime_agent_alias_for_tenant_type_none_falls_through() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "finance_invoice_ops".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            config.resolved_runtime_agent_alias_for_tenant_type(None),
+            config.resolved_runtime_agent_alias(),
+            "no tenant_agent_type — identical to the type-blind fallback"
+        );
+    }
+
+    #[test]
+    async fn resolved_runtime_agent_alias_for_tenant_type_unmigrated_type_falls_through() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "finance_invoice_ops".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            config.resolved_runtime_agent_alias_for_tenant_type(Some("customer_service")),
+            config.resolved_runtime_agent_alias(),
+            "an agent_type with no matching [agents.<type>] entry falls through unchanged \
+             — never partially matches another type's alias"
+        );
+    }
+
+    #[test]
+    async fn resolved_runtime_agent_alias_for_tenant_type_disabled_entry_falls_through() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "finance_invoice_ops".to_string(),
+            AliasedAgentConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "default".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            config.resolved_runtime_agent_alias_for_tenant_type(Some("finance_invoice_ops")),
+            Some("default"),
+            "a disabled [agents.<type>] entry never wins — falls through to the old fallback \
+             exactly as if the entry didn't exist"
+        );
+    }
+
+    #[test]
+    async fn resolved_runtime_agent_alias_for_tenant_type_matching_enabled_type_resolves_directly()
+    {
+        let mut config = Config::default();
+        config.agents.insert(
+            "finance_invoice_ops".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        // A lexicographically-smaller "default" alias exists too, but the
+        // tenant's own agent_type must win outright — this is the whole
+        // point of the method over the type-blind fallback.
+        config.agents.insert(
+            "default".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            config.resolved_runtime_agent_alias_for_tenant_type(Some("finance_invoice_ops")),
+            Some("finance_invoice_ops")
         );
     }
 

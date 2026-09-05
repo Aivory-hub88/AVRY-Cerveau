@@ -179,18 +179,31 @@ async fn run_once(config: &Config) {
         }
     };
 
-    let Some(host_alias) = config.resolved_runtime_agent_alias().map(str::to_owned) else {
+    // No single upfront fallback here: each row carries its own `agent_type`,
+    // and a migrated type (a same-named, enabled `[agents.<agent_type>]`
+    // entry) must resolve to its own host alias per row — same as a live
+    // interactive turn — rather than every row sharing one resolution
+    // computed before any row's `agent_type` is even known. An unmigrated
+    // type still falls through to the exact old type-blind fallback inside
+    // `resolved_runtime_agent_alias_for_tenant_type` itself.
+    if config.resolved_runtime_agent_alias().is_none() {
         warn(
             "no configured [agents.<alias>] entry to run tenant schedules on",
             "resolved_runtime_agent_alias returned None",
         );
         return;
-    };
+    }
 
     let mut seen: Vec<String> = Vec::with_capacity(desired.len());
 
     for row in &desired {
         seen.push(row.id.clone());
+        let Some(host_alias) = config
+            .resolved_runtime_agent_alias_for_tenant_type(Some(row.agent_type.as_str()))
+            .map(str::to_owned)
+        else {
+            continue;
+        };
         let (status, detail) = match apply_row(config, &host_alias, row) {
             Ok(outcome) => match ack_decision(outcome, row.enabled, &row.status) {
                 Some(status) => (status, None),

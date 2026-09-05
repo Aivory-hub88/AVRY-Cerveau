@@ -2725,7 +2725,9 @@ pub(crate) async fn run_gateway_chat_with_tools(
     #[cfg(not(test))]
     {
         let config = state.config.read().clone();
-        let agent_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
+        let tenant_agent_type = tenant.as_ref().map(|t| t.agent_type.as_str());
+        let agent_alias =
+            require_gateway_chat_agent_alias(&config, agent_override, tenant_agent_type)?;
 
         // Scope the cost tracking context so per-LLM-call usage flows into
         // the gateway's cost tracker and costs.jsonl. A separate
@@ -2818,18 +2820,22 @@ pub(crate) async fn run_gateway_chat_with_tools(
 fn resolve_gateway_chat_agent_alias(
     config: &Config,
     agent_override: Option<&str>,
+    tenant_agent_type: Option<&str>,
 ) -> Option<String> {
-    agent_override
-        .map(ToString::to_string)
-        .or_else(|| config.resolved_runtime_agent_alias().map(str::to_owned))
+    agent_override.map(ToString::to_string).or_else(|| {
+        config
+            .resolved_runtime_agent_alias_for_tenant_type(tenant_agent_type)
+            .map(str::to_owned)
+    })
 }
 
 #[cfg(not(test))]
 fn require_gateway_chat_agent_alias(
     config: &Config,
     agent_override: Option<&str>,
+    tenant_agent_type: Option<&str>,
 ) -> anyhow::Result<String> {
-    resolve_gateway_chat_agent_alias(config, agent_override).ok_or_else(|| {
+    resolve_gateway_chat_agent_alias(config, agent_override, tenant_agent_type).ok_or_else(|| {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -3187,7 +3193,11 @@ async fn handle_webhook(
 
     let model_label = {
         let cfg = state.config.read();
-        let resolved_agent_alias = resolve_gateway_chat_agent_alias(&cfg, agent_override);
+        let resolved_agent_alias = resolve_gateway_chat_agent_alias(
+            &cfg,
+            agent_override,
+            tenant_ctx.as_ref().map(|t| t.agent_type.as_str()),
+        );
         let resolved_provider = resolved_agent_alias
             .as_deref()
             .and_then(|alias| cfg.resolved_model_provider_for_agent(alias));

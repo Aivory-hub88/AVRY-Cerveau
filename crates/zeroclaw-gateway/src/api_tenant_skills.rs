@@ -18,16 +18,17 @@
 //!
 //! **No `agent` selector, unlike `/webhook/memory`.** A tenant's
 //! `agent_type` header (`customer_service`, `leads_qualifier`, …) is a
-//! product-facing persona label, not a Cerveau config alias — this
-//! install's `config.toml` has no `[agents.customer_service]` section at
-//! all, only the delegation-mesh brains (`analyst_brain`, `security_brain`,
-//! …). Every tenant turn already runs on the one alias
-//! `resolve_gateway_chat_agent_alias`'s own fallback picks with no override
-//! — `config.resolved_runtime_agent_alias()`, the same call the plain
-//! `/webhook` turn and `cron::tenant_sync`'s reconcile both use. Asking the
-//! tenant to name a Cerveau-internal alias they have no way to know would
-//! only 400; resolving the same alias every other tenant-facing surface
-//! already resolves is the correct behaviour, not a shortcut.
+//! product-facing persona label, not something the caller picks a Cerveau
+//! config alias with directly. Most agent types still have no matching
+//! `[agents.<type>]` section — only the delegation-mesh brains
+//! (`analyst_brain`, `security_brain`, …) and any migrated product type
+//! (see `Config::resolved_runtime_agent_alias_for_tenant_type`) do. This
+//! resolves through the exact same tenant-aware call the plain `/webhook`
+//! turn and `cron::tenant_sync`'s reconcile both use, so a migrated type's
+//! skills listing reflects its own alias, and an unmigrated type still
+//! falls through to the old type-blind fallback — never diverging from
+//! what a live turn for the same `agent_type` actually resolves to. Asking
+//! the tenant to name a Cerveau-internal alias directly would only 400.
 //!
 //! **Trimmed on purpose.** The loopback route's full `AgentSkillEntry` also
 //! carries `directory` (a server filesystem path) and `editable` — neither
@@ -139,11 +140,15 @@ fn tenant_skill_entry(s: EffectiveSkill) -> TenantSkillEntry {
 
 /// `GET /webhook/skills`
 pub async fn handle_webhook_skills(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(e) = authorize_tenant_request(&state, &headers) {
-        return e.into_response();
-    }
+    let sel = match authorize_tenant_request(&state, &headers) {
+        Ok(sel) => sel,
+        Err(e) => return e.into_response(),
+    };
     let config = state.config.read().clone();
-    let Some(alias) = config.resolved_runtime_agent_alias().map(str::to_owned) else {
+    let Some(alias) = config
+        .resolved_runtime_agent_alias_for_tenant_type(Some(sel.agent_type.as_str()))
+        .map(str::to_owned)
+    else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({

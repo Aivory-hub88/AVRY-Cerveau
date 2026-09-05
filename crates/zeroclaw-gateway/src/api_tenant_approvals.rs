@@ -438,9 +438,11 @@ async fn run_continuation(
     // which is `#[cfg(not(test))]`-gated because `run_gateway_chat_with_
     // tools`'s own test branch never reaches it) — mapped to an error by
     // hand so this function compiles and behaves the same under both cfgs.
-    let agent_alias = crate::resolve_gateway_chat_agent_alias(&config, None).ok_or_else(|| {
-        anyhow::anyhow!("no configured [agents.<alias>] entry to resume this approval on")
-    })?;
+    let agent_alias =
+        crate::resolve_gateway_chat_agent_alias(&config, None, Some(sel.agent_type.as_str()))
+            .ok_or_else(|| {
+                anyhow::anyhow!("no configured [agents.<alias>] entry to resume this approval on")
+            })?;
 
     let cost_tracking_context = state.cost_tracker.as_ref().map(|tracker| {
         let pricing = zeroclaw_runtime::agent::cost::build_model_provider_pricing(&config);
