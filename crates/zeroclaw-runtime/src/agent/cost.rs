@@ -56,6 +56,31 @@ pub fn tool_loop_cost_tracking_context_for_agent(
         .map(|tracker| tool_loop_cost_tracking_context_from_tracker(config, agent_alias, tracker))
 }
 
+/// The ambient cost context, re-pointed at `agent_alias`.
+///
+/// A delegated sub-turn runs inside the *caller's* `TOOL_LOOP_COST_TRACKING_CONTEXT`
+/// (a task-local, inherited because `delegate` wraps the sub-loop in
+/// `tokio::time::timeout` rather than spawning it). Every provider call the
+/// sub-agent makes therefore lands in `costs.jsonl` under the caller's alias,
+/// and per-agent cost reporting attributes the work to the wrong agent —
+/// measured live: a `security_brain` sub-turn of 3,731 tokens recorded as
+/// `analyst_brain`.
+///
+/// Only the label moves. The tracker, the pricing table and the turn-usage
+/// accumulator are all the same `Arc`s, so daily totals, the context-window
+/// readout and budget enforcement are byte-for-byte unchanged — enforcement
+/// in particular never reads the alias (`check_tool_loop_budget` calls
+/// `tracker.check_budget` directly), which is what makes re-labelling safe.
+///
+/// `None` when no context is scoped at all, which is the existing no-op case.
+pub fn reattributed_cost_context(agent_alias: &str) -> Option<ToolLoopCostTrackingContext> {
+    TOOL_LOOP_COST_TRACKING_CONTEXT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .map(|ctx| ctx.with_agent_alias(agent_alias))
+}
+
 pub fn tool_loop_cost_tracking_context_from_tracker(
     config: &Config,
     agent_alias: &str,
@@ -846,5 +871,68 @@ mod tests {
         );
 
         assert_eq!(ctx.agent_alias, Some("peer-recipient".to_string()));
+    }
+
+    #[tokio::test]
+    async fn reattribution_moves_the_label_and_nothing_else() {
+        // The contract the delegate cost fix rests on: a sub-turn's spend is
+        // filed under the agent that ran it, while the tracker, the pricing
+        // table and the turn-usage accumulator stay the *same* allocations —
+        // so daily totals, the context-window readout and budget enforcement
+        // (which never reads the alias) behave exactly as before.
+        let workspace = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    track_per_agent: true,
+                    ..zeroclaw_config::schema::CostConfig::default()
+                },
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let caller = tool_loop_cost_tracking_context_from_tracker(
+            &Config::default(),
+            "analyst_brain",
+            tracker,
+        );
+
+        let observed = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(caller.clone()), async {
+                reattributed_cost_context("security_brain")
+            })
+            .await
+            .expect("a scoped context must be re-attributable");
+
+        assert_eq!(observed.agent_alias, Some("security_brain".to_string()));
+        assert_eq!(
+            caller.agent_alias,
+            Some("analyst_brain".to_string()),
+            "the caller's own context must not be mutated"
+        );
+        assert!(
+            Arc::ptr_eq(
+                caller.tracker.as_ref().unwrap(),
+                observed.tracker.as_ref().unwrap()
+            ),
+            "same tracker, or daily totals and budget enforcement would fork"
+        );
+        assert!(
+            Arc::ptr_eq(&caller.turn_usage, &observed.turn_usage),
+            "same accumulator, or the caller's context-window readout would lose the sub-turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn reattribution_is_none_when_nothing_is_scoped() {
+        // The existing no-op case: a delegate running outside any cost scope
+        // (a configless test, a CLI path) must stay a no-op rather than
+        // inventing a tracker.
+        assert!(reattributed_cost_context("security_brain").is_none());
+        let inside = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(None, async { reattributed_cost_context("security_brain") })
+            .await;
+        assert!(inside.is_none());
     }
 }

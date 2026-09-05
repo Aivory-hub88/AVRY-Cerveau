@@ -1370,9 +1370,49 @@ impl DelegateTool {
             .resolve_delegation_timeout(&agent_config.runtime_profile)
             .unwrap_or(self.delegate_config.timeout_secs);
         let dispatcher = ProviderDispatch::from_ref(&*model_provider);
+
+        // `chat_with_system` returns only a `String`, so a non-agentic
+        // delegation used to spend real provider tokens and record *nothing*:
+        // the recorder lives in the tool loop (`agent::turn::execution`), which
+        // this path deliberately skips. Measured live — a `comms_brain`
+        // sub-turn produced zero rows in `costs.jsonl`. Going through `chat`
+        // gets the same completion plus the `usage` the provider already
+        // returned, so the spend can be booked against the agent that incurred
+        // it (see `reattributed_cost_context` for why re-labelling is safe).
+        let mut messages: Vec<ChatMessage> = Vec::with_capacity(2);
+        if let Some(system_prompt) = system_prompt_ref {
+            messages.push(ChatMessage::system(system_prompt.to_string()));
+        }
+        messages.push(ChatMessage::user(full_prompt.clone()));
+
+        let sub_cost_ctx = crate::agent::cost::reattributed_cost_context(agent_name);
+        let provider_name = provider_type.clone();
+        let model_for_cost = model.clone();
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
+            crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(sub_cost_ctx, async {
+                let resp = dispatcher
+                    .chat(
+                        zeroclaw_api::model_provider::ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        &model_for_cost,
+                        temperature,
+                    )
+                    .await?;
+                // Book the spend before anything downstream can fail, matching
+                // `agent::turn::execution`'s own ordering.
+                if let Some(usage) = resp.usage.as_ref() {
+                    crate::agent::cost::record_tool_loop_cost_usage(
+                        &provider_name,
+                        &model_for_cost,
+                        usage,
+                    );
+                }
+                Ok::<String, anyhow::Error>(resp.text_or_empty().to_string())
+            }),
         )
         .await;
 
@@ -2713,76 +2753,89 @@ impl DelegateTool {
         let receipt_generator = receipt_scope.as_ref().map(|s| &s.generator);
         let collected_receipts = receipt_scope.as_ref().map(|s| s.collector.as_ref());
         let turn_id = uuid::Uuid::new_v4().to_string();
+        // Bill this sub-turn to the agent that actually runs it. The ambient
+        // cost context is the *caller's* (a task-local, inherited because the
+        // loop below is wrapped in `timeout`, not spawned), so without this
+        // every token the target spends is filed under the caller's alias.
+        // Only the label changes — same tracker, same pricing, same turn-usage
+        // accumulator, and budget enforcement never reads the alias.
+        let sub_cost_ctx = crate::agent::cost::reattributed_cost_context(agent_name);
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
-            run_tool_call_loop(ToolLoop {
-                sop_reassembly: None,
-                exec: ResolvedAgentExecution::resolve(
-                    ResolvedModelAccess {
-                        model_provider,
-                        provider_name: provider_type,
-                        model,
-                        temperature,
-                    },
-                    ResolvedIo {
-                        tools_registry: &sub_tools,
-                        observer: &noop_observer,
-                        silent: true,
-                        approval: None,
-                        multimodal_config: &self.multimodal_config,
-                        // Full config so the delegated sub-agent's vision route
-                        // resolves the configured `vision_model_provider`'s alias
-                        // options (the `vision` override, endpoint URI, credentials),
-                        // exactly as the parent turn does. `None` only on the
-                        // configless test builder (`root_config` unset).
-                        config: self.root_config.as_deref(),
-                        hooks: None,
-                        // Thread the target's deferred-MCP activated set so `tool_search`
-                        // can activate the target's deferred tools mid-turn (Some only for
-                        // an independent target with granted deferred-MCP bundles).
-                        activated_tools: sub_activated.as_ref(),
-                        model_switch_callback: None,
-                        // delegate subagents don't support approval
-                        receipt_generator,
-                    },
-                    ResolvedRuntimeKnobs {
-                        max_tool_iterations: loop_runtime.max_tool_iterations,
-                        excluded_tools: &[],
-                        dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
-                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                        strict_tool_parsing: loop_runtime.strict_tool_parsing,
-                        parallel_tools: loop_runtime.parallel_tools,
-                        max_tool_result_chars: loop_runtime.max_tool_result_chars,
-                        // Keep delegate subagent context pruning aligned with top-level
-                        // agents instead of preserving the old disabled-by-zero path.
-                        context_token_budget: loop_runtime.max_context_tokens,
-                        knobs: &LoopKnobs::default(),
-                    },
-                ),
-                history: &mut history,
-                channel_name: "delegate",
-                channel_reply_target: None,
-                cancellation_token: Some(self.cancellation_token.child_token()),
-                on_delta: None,
-                shared_budget: None,
-                // TODO thread from parent in future
-                channel: None,
-                collected_receipts,
-                event_tx: None,
-                steering: None,
-                new_messages_out: None,
-                image_cache: None,
-                // Phase 1: stamp Internal/Trusted. Per-transport
-                // stamping lands in a later phase.
-                memory: None,
-                ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
-                agent_alias: Some(agent_name),
-                parent_agent_alias: None,
-                turn_id: &turn_id,
-            })
-            .instrument(::zeroclaw_log::attribution_span!(
-                &crate::agent::AgentAttribution(agent_name)
-            )),
+            crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                sub_cost_ctx,
+                run_tool_call_loop(ToolLoop {
+                    sop_reassembly: None,
+                    exec: ResolvedAgentExecution::resolve(
+                        ResolvedModelAccess {
+                            model_provider,
+                            provider_name: provider_type,
+                            model,
+                            temperature,
+                        },
+                        ResolvedIo {
+                            tools_registry: &sub_tools,
+                            observer: &noop_observer,
+                            silent: true,
+                            approval: None,
+                            multimodal_config: &self.multimodal_config,
+                            // Full config so the delegated sub-agent's vision route
+                            // resolves the configured `vision_model_provider`'s alias
+                            // options (the `vision` override, endpoint URI, credentials),
+                            // exactly as the parent turn does. `None` only on the
+                            // configless test builder (`root_config` unset).
+                            config: self.root_config.as_deref(),
+                            hooks: None,
+                            // Thread the target's deferred-MCP activated set so `tool_search`
+                            // can activate the target's deferred tools mid-turn (Some only for
+                            // an independent target with granted deferred-MCP bundles).
+                            activated_tools: sub_activated.as_ref(),
+                            model_switch_callback: None,
+                            // delegate subagents don't support approval
+                            receipt_generator,
+                        },
+                        ResolvedRuntimeKnobs {
+                            max_tool_iterations: loop_runtime.max_tool_iterations,
+                            excluded_tools: &[],
+                            dedup_exempt_tools: tool_policy
+                                .excluded_tools
+                                .as_deref()
+                                .unwrap_or(&[]),
+                            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                            strict_tool_parsing: loop_runtime.strict_tool_parsing,
+                            parallel_tools: loop_runtime.parallel_tools,
+                            max_tool_result_chars: loop_runtime.max_tool_result_chars,
+                            // Keep delegate subagent context pruning aligned with top-level
+                            // agents instead of preserving the old disabled-by-zero path.
+                            context_token_budget: loop_runtime.max_context_tokens,
+                            knobs: &LoopKnobs::default(),
+                        },
+                    ),
+                    history: &mut history,
+                    channel_name: "delegate",
+                    channel_reply_target: None,
+                    cancellation_token: Some(self.cancellation_token.child_token()),
+                    on_delta: None,
+                    shared_budget: None,
+                    // TODO thread from parent in future
+                    channel: None,
+                    collected_receipts,
+                    event_tx: None,
+                    steering: None,
+                    new_messages_out: None,
+                    image_cache: None,
+                    // Phase 1: stamp Internal/Trusted. Per-transport
+                    // stamping lands in a later phase.
+                    memory: None,
+                    ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
+                    agent_alias: Some(agent_name),
+                    parent_agent_alias: None,
+                    turn_id: &turn_id,
+                })
+                .instrument(::zeroclaw_log::attribution_span!(
+                    &crate::agent::AgentAttribution(agent_name)
+                )),
+            ),
         )
         .await;
 
