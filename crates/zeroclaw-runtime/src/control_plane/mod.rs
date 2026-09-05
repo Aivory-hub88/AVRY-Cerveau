@@ -1,6 +1,7 @@
 //! The durable run/task control-plane — supervised lifecycle for delegated and
 //! subagent runs.
 
+pub mod approval_expiry;
 pub mod authority;
 pub mod boot;
 pub mod continuation_drive;
