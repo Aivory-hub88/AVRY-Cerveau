@@ -28,6 +28,15 @@ use serde::{Deserialize, Serialize};
 ///   has no runtime consumer — the context compressor was removed —
 ///   so it currently has no effect. One warning per non-default field (see
 ///   `collect_context_compression_ignored_warnings` in `schema.rs`).
+/// - `delegation_depth_ceiling_unreachable`: `runtime_profiles.<alias>.max_delegation_depth`
+///   is set above `1`, but both delegation modes (`Bounded` and `Independent`)
+///   unconditionally strip the `delegate` tool from a sub-agent's own toolset
+///   before it ever runs — a chain can reach depth 1 and no further, regardless
+///   of the configured ceiling. Not raised for `0` (the documented "inherit the
+///   default" sentinel) or `1` (matches the actual behavior exactly), only for a
+///   value that represents a deliberate ask for a real multi-hop chain that
+///   currently cannot happen (see `collect_delegation_depth_ceiling_warnings` in
+///   `schema.rs`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {

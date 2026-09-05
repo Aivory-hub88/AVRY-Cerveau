@@ -19797,6 +19797,7 @@ impl Config {
         // warning when the more specific cross-provider diagnostic already
         // covers the same path.
         self.collect_context_compression_ignored_warnings(&mut warnings);
+        self.collect_delegation_depth_ceiling_warnings(&mut warnings);
         warnings.extend(validate_memory_semantics(&self.memory));
         for (alias, wa) in &self.channels.whatsapp {
             warnings.extend(validate_whatsapp_semantics(alias, wa));
@@ -20177,6 +20178,50 @@ impl Config {
     /// (a fallback naming an alias that is not configured) and cycles (a
     /// fallback path that loops back onto itself). Both are warn-and-skip — the
     /// chain still loads and runs with the offending edge pruned at build time.
+    /// Surface a `max_delegation_depth` that promises a real multi-hop
+    /// delegation chain the runtime cannot currently deliver.
+    ///
+    /// `resolve_max_depth` (`zeroclaw-runtime/src/tools/delegate.rs`) treats
+    /// `0` as "inherit the default" — the same convention `max_cost_per_day_cents`
+    /// and `shell_timeout_secs` already use, and load-bearing here: every
+    /// profile that never touches this field is `0` via `Default`, and must
+    /// keep resolving to the fallback rather than being read as "depth zero,
+    /// no delegation at all". A `1` matches what every delegation path
+    /// actually does today (`Bounded`'s explicit filter, `Independent`'s
+    /// unconditional retain in `independent_agentic_tools_for_target` — both
+    /// strip `delegate` from a sub-agent's own toolset before it runs, so a
+    /// chain reaches depth 1 and stops regardless of the counter). Neither
+    /// value is worth a warning: `0` was never a deliberate choice about
+    /// depth, and `1` is not a lie.
+    ///
+    /// Anything above `1` is a deliberate ask this build cannot honor —
+    /// verified against production directly rather than assumed: every real
+    /// profile on the deployed install is `1`, and a synthetic sub-agent
+    /// still under a configured ceiling of `3` was proven, live, to have
+    /// `delegate` already absent from its tools.
+    fn collect_delegation_depth_ceiling_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        let mut offenders: Vec<(&String, u32)> = self
+            .runtime_profiles
+            .iter()
+            .filter(|(_, profile)| profile.max_delegation_depth > 1)
+            .map(|(alias, profile)| (alias, profile.max_delegation_depth))
+            .collect();
+        offenders.sort_by(|a, b| a.0.cmp(b.0));
+
+        for (alias, depth) in offenders {
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                "delegation_depth_ceiling_unreachable",
+                format!(
+                    "runtime_profiles.{alias}.max_delegation_depth is {depth}, but every                      delegation path strips the delegate tool from a sub-agent's own toolset                      before it runs — a chain reaches depth 1 and stops no matter how high                      this is set. Lower it to 1 to match actual behavior, or treat this as a                      feature request for real multi-hop delegation rather than a working                      config knob."
+                ),
+                format!("runtime_profiles.{alias}.max_delegation_depth"),
+            ));
+        }
+    }
+
     fn collect_fallback_warnings(
         &self,
         warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
@@ -37885,6 +37930,108 @@ allowed_users = []
         assert_eq!(
             w.path,
             "runtime_profiles.default.context_compression.enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_warnings_silent_for_max_delegation_depth_zero_and_one() {
+        // 0 is the documented "inherit the default" sentinel — every profile
+        // that never touches this field lands here via `Default`, and must
+        // never be read as a deliberate ask about depth. 1 matches what
+        // every delegation path actually enforces today. Neither is a lie
+        // worth a warning.
+        let toml = r#"
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.alpha]
+            enabled = true
+            risk_profile = "default"
+
+            [runtime_profiles.zero]
+            max_delegation_depth = 0
+
+            [runtime_profiles.one]
+            max_delegation_depth = 1
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = cfg.collect_warnings();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.code == "delegation_depth_ceiling_unreachable"),
+            "0 and 1 must never flag delegation_depth_ceiling_unreachable: {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_warnings_flags_unreachable_delegation_depth_ceiling() {
+        // Verified live against production before writing this: a synthetic
+        // sub-agent under a configured ceiling of 3, still one hop below it,
+        // had `delegate` already absent from its own tools — the ceiling
+        // above 1 has never been reachable. This is what tells an operator
+        // that before they discover it the same way.
+        let toml = r#"
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.alpha]
+            enabled = true
+            risk_profile = "default"
+
+            [runtime_profiles.deep]
+            max_delegation_depth = 3
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = cfg.collect_warnings();
+        let warning = warnings
+            .iter()
+            .find(|w| w.code == "delegation_depth_ceiling_unreachable")
+            .expect("expected delegation_depth_ceiling_unreachable warning");
+        assert_eq!(warning.path, "runtime_profiles.deep.max_delegation_depth");
+        assert!(
+            warning.message.contains('3'),
+            "message should name the configured value: {}",
+            warning.message
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_warnings_delegation_depth_ceiling_reports_every_offending_profile_sorted() {
+        // Two profiles above the ceiling, one at it — only the two above get
+        // a warning, and they come back alias-sorted despite `runtime_profiles`
+        // being a HashMap with no ordering guarantee of its own.
+        let toml = r#"
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.alpha]
+            enabled = true
+            risk_profile = "default"
+
+            [runtime_profiles.zulu]
+            max_delegation_depth = 5
+
+            [runtime_profiles.alpha_profile]
+            max_delegation_depth = 2
+
+            [runtime_profiles.fine]
+            max_delegation_depth = 1
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = cfg.collect_warnings();
+        let paths: Vec<&str> = warnings
+            .iter()
+            .filter(|w| w.code == "delegation_depth_ceiling_unreachable")
+            .map(|w| w.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "runtime_profiles.alpha_profile.max_delegation_depth",
+                "runtime_profiles.zulu.max_delegation_depth",
+            ],
+            "expected exactly the two offending profiles, alias-sorted: {warnings:?}"
         );
     }
 
