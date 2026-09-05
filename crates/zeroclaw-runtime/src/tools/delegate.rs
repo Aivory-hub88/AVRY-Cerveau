@@ -1476,9 +1476,49 @@ impl DelegateTool {
             .resolve_delegation_timeout(&agent_config.runtime_profile)
             .unwrap_or(self.delegate_config.timeout_secs);
         let dispatcher = ProviderDispatch::from_ref(&*model_provider);
+
+        // `chat_with_system` returns only a `String`, so a non-agentic
+        // delegation used to spend real provider tokens and record *nothing*:
+        // the recorder lives in the tool loop (`agent::turn::execution`), which
+        // this path deliberately skips. Measured live — a `comms_brain`
+        // sub-turn produced zero rows in `costs.jsonl`. Going through `chat`
+        // gets the same completion plus the `usage` the provider already
+        // returned, so the spend can be booked against the agent that incurred
+        // it (see `reattributed_cost_context` for why re-labelling is safe).
+        let mut messages: Vec<ChatMessage> = Vec::with_capacity(2);
+        if let Some(system_prompt) = system_prompt_ref {
+            messages.push(ChatMessage::system(system_prompt.to_string()));
+        }
+        messages.push(ChatMessage::user(full_prompt.clone()));
+
+        let sub_cost_ctx = crate::agent::cost::reattributed_cost_context(agent_name);
+        let provider_name = provider_type.clone();
+        let model_for_cost = model.clone();
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
+            crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(sub_cost_ctx, async {
+                let resp = dispatcher
+                    .chat(
+                        zeroclaw_api::model_provider::ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        &model_for_cost,
+                        temperature,
+                    )
+                    .await?;
+                // Book the spend before anything downstream can fail, matching
+                // `agent::turn::execution`'s own ordering.
+                if let Some(usage) = resp.usage.as_ref() {
+                    crate::agent::cost::record_tool_loop_cost_usage(
+                        &provider_name,
+                        &model_for_cost,
+                        usage,
+                    );
+                }
+                Ok::<String, anyhow::Error>(resp.text_or_empty().to_string())
+            }),
         )
         .await;
 
@@ -2918,11 +2958,20 @@ impl DelegateTool {
         let receipt_generator = receipt_scope.as_ref().map(|s| &s.generator);
         let collected_receipts = receipt_scope.as_ref().map(|s| s.collector.as_ref());
         let turn_id = uuid::Uuid::new_v4().to_string();
+        // Bill this sub-turn to the agent that actually runs it. The ambient
+        // cost context is the *caller's* (a task-local, inherited because the
+        // loop below is wrapped in `timeout`, not spawned), so without this
+        // every token the target spends is filed under the caller's alias.
+        // Only the label changes — same tracker, same pricing, same turn-usage
+        // accumulator, and budget enforcement never reads the alias.
+        let sub_cost_ctx = crate::agent::cost::reattributed_cost_context(agent_name);
         let pacing = zeroclaw_config::schema::PacingConfig::default();
         let loop_knobs = LoopKnobs::default();
         let execution = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
-            run_tool_call_loop(ToolLoop {
+            crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                sub_cost_ctx,
+                run_tool_call_loop(ToolLoop {
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
@@ -2989,6 +3038,7 @@ impl DelegateTool {
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(agent_name)
             )),
+            ),
         );
         let result = match thinking_params {
             Some(params) => {
