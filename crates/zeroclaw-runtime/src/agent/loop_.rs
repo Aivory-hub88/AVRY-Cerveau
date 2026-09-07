@@ -6279,6 +6279,7 @@ mod tests {
             name: "file_read".to_string(),
             arguments: serde_json::json!({"path": "a.txt"}),
             tool_call_id: None,
+            arguments_parse_error: None,
         }];
 
         assert!(!should_execute_tools_in_parallel(&calls, None));
@@ -6291,11 +6292,13 @@ mod tests {
                 name: "shell".to_string(),
                 arguments: serde_json::json!({"command": "pwd"}),
                 tool_call_id: None,
+                arguments_parse_error: None,
             },
             ParsedToolCall {
                 name: "http_request".to_string(),
                 arguments: serde_json::json!({"url": "https://example.com"}),
                 tool_call_id: None,
+                arguments_parse_error: None,
             },
         ];
         let approval_cfg = zeroclaw_config::schema::RiskProfileConfig::default();
@@ -6314,11 +6317,13 @@ mod tests {
                 name: "shell".to_string(),
                 arguments: serde_json::json!({"command": "pwd"}),
                 tool_call_id: None,
+                arguments_parse_error: None,
             },
             ParsedToolCall {
                 name: "http_request".to_string(),
                 arguments: serde_json::json!({"url": "https://example.com"}),
                 tool_call_id: None,
+                arguments_parse_error: None,
             },
         ];
         let approval_cfg = zeroclaw_config::schema::RiskProfileConfig {
@@ -13232,6 +13237,7 @@ Let me check the result."#;
             name: "shell".into(),
             arguments: serde_json::json!({"command": "pwd"}),
             tool_call_id: Some("call_2".into()),
+            arguments_parse_error: None,
         }];
         let result = build_native_assistant_history_from_parsed_calls(
             "answer",
@@ -13251,6 +13257,7 @@ Let me check the result."#;
             name: "shell".into(),
             arguments: serde_json::json!({"command": "pwd"}),
             tool_call_id: Some("call_2".into()),
+            arguments_parse_error: None,
         }];
         let result = build_native_assistant_history_from_parsed_calls("answer", &calls, None);
         assert!(result.is_some());

@@ -38,12 +38,137 @@ pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn T
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
 }
 
+// ── Hallucinated tool-name repair ───────────────────────────────────────
+//
+// Models occasionally emit a tool name that is close to, but not exactly,
+// a registered one: a typo, `-` vs `_`, singular vs plural, or a stale
+// alias. Rather than failing the call outright, `execute_one_tool` tries
+// to repair the name by fuzzy-matching it against every tool actually
+// available this turn (static registry + activated dynamic tools) before
+// giving up. This is name-repair only — see `repair_unknown_tool_name`
+// for the security note on why it can't widen what a turn is allowed to
+// call.
+
+/// Normalize a tool name for fuzzy comparison: lowercase, and collapse
+/// `-`, `_`, and spaces to a single separator so `Some-Tool`, `some_tool`,
+/// and `some tool` all compare as identical.
+fn normalize_tool_name(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            '-' | '_' | ' ' => '_',
+            c => c.to_ascii_lowercase(),
+        })
+        .collect()
+}
+
+/// Iterative Levenshtein (edit) distance, operating on `char`s. Written by
+/// hand rather than pulling in `strsim`/`edit-distance`: neither is a
+/// direct dependency of this crate today (only a transitive one, via
+/// `clap`), and one comparison at one call site doesn't earn a new direct
+/// dependency.
+fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (m, n) = (a.len(), b.len());
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
+
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr = vec![0usize; n + 1];
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
+
+/// Maximum edit distance (after normalization) still treated as "the same
+/// tool, misspelled" rather than a genuinely different name.
+const TOOL_NAME_REPAIR_MAX_DISTANCE: usize = 2;
+
+/// Find the single closest match for `unknown` among `known` tool names.
+///
+/// Matching runs on the normalized form (see [`normalize_tool_name`]), so
+/// separator/case-only differences count as distance 0. Otherwise plain
+/// Levenshtein distance is used with a tolerance of
+/// [`TOOL_NAME_REPAIR_MAX_DISTANCE`]. If two or more known names tie for
+/// the closest match, the result is ambiguous and `None` is returned —
+/// this never guesses between two live tools.
+fn find_closest_tool_name(unknown: &str, known: &[&str]) -> Option<String> {
+    let normalized_unknown = normalize_tool_name(unknown);
+
+    let mut scored: Vec<(usize, &str)> = known
+        .iter()
+        .filter(|&&candidate| candidate != unknown)
+        .map(|&candidate| {
+            let normalized_candidate = normalize_tool_name(candidate);
+            let distance = if normalized_candidate == normalized_unknown {
+                0
+            } else {
+                levenshtein_distance(&normalized_unknown, &normalized_candidate)
+            };
+            (distance, candidate)
+        })
+        .filter(|&(distance, _)| distance <= TOOL_NAME_REPAIR_MAX_DISTANCE)
+        .collect();
+
+    scored.sort_by_key(|&(distance, _)| distance);
+
+    match scored.as_slice() {
+        [] => None,
+        [(_, name)] => Some((*name).to_string()),
+        [(d0, name0), (d1, _), ..] if d0 < d1 => Some((*name0).to_string()),
+        _ => None, // Tie for the closest match — ambiguous, don't guess.
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct ToolDispatchContext<'a> {
     pub tools_registry: &'a [Box<dyn Tool>],
     pub activated_tools: Option<&'a std::sync::Arc<std::sync::Mutex<ActivatedToolSet>>>,
     pub excluded_tools: &'a [String],
     pub model_switch_callback: Option<&'a ModelSwitchCallback>,
+}
+
+/// Try to repair an unknown tool name by fuzzy-matching it against every
+/// tool name available this turn (static registry + activated dynamic
+/// tools). Returns `None` when no candidate is close enough, or when the
+/// closest match is ambiguous.
+///
+/// SECURITY NOTE: this only ever *selects among tools already registered
+/// for this turn* — it does not create, authorize, or expose any tool
+/// that wasn't already reachable. The caller still runs the ordinary
+/// `is_excluded_tool` check against the *real* resolved tool's name
+/// before executing (see the call site in `execute_one_tool`), exactly as
+/// it would if the model had named that tool correctly to begin with.
+/// Repair never bypasses that check and never touches approval/risk-tier
+/// gating, which operates on the resolved tool the same way regardless of
+/// how its name was determined.
+fn repair_unknown_tool_name(call_name: &str, dispatch: ToolDispatchContext<'_>) -> Option<String> {
+    let mut known: Vec<String> = dispatch
+        .tools_registry
+        .iter()
+        .map(|t| t.name().to_string())
+        .collect();
+
+    if let Some(activated) = dispatch.activated_tools {
+        let guard = match activated.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        known.extend(guard.tool_names().into_iter().map(str::to_string));
+    }
+
+    let known_refs: Vec<&str> = known.iter().map(String::as_str).collect();
+    find_closest_tool_name(call_name, &known_refs)
 }
 
 fn is_excluded_tool(name: &str, excluded_tools: &[String]) -> bool {
@@ -171,6 +296,66 @@ pub(crate) async fn execute_one_tool(
     } else {
         None
     };
+
+    // Neither the static registry nor the activated dynamic tools have an
+    // exact match. Try to repair a hallucinated name before failing — see
+    // `repair_unknown_tool_name` for why this can't grant access beyond
+    // what was already registered/authorized for this turn.
+    let (static_tool, activated_arc, repaired_name) =
+        if static_tool.is_none() && activated_arc.is_none() {
+            match repair_unknown_tool_name(call_name, dispatch) {
+                Some(repaired) => {
+                    let repaired_static = find_tool(dispatch.tools_registry, &repaired);
+                    let repaired_activated = if repaired_static.is_some() {
+                        None
+                    } else {
+                        dispatch.activated_tools.and_then(|at| {
+                            let guard = match at.lock() {
+                                Ok(guard) => guard,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            guard.get_resolved(&repaired)
+                        })
+                    };
+                    if repaired_static.is_some() || repaired_activated.is_some() {
+                        (repaired_static, repaired_activated, Some(repaired))
+                    } else {
+                        (None, None, None)
+                    }
+                }
+                None => (None, None, None),
+            }
+        } else {
+            (static_tool, activated_arc, None)
+        };
+
+    if let Some(repaired) = &repaired_name {
+        let note = format!("tool name auto-repaired: '{call_name}' -> '{repaired}'");
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
+                .with_attrs(::serde_json::json!({
+                    "requested_tool": call_name,
+                    "resolved_tool": repaired,
+                    "tool_call_id": tool_call_id,
+                })),
+            note.clone()
+        );
+        observer.record_event(&ObserverEvent::ToolCall {
+            tool: "tool_name_repair".to_string(),
+            tool_call_id: tool_call_id_owned.clone(),
+            duration: Duration::from_secs(0),
+            success: true,
+            arguments: Some(full_args.clone()),
+            result: Some(note),
+            channel: Some(meta.channel_name.to_string()),
+            agent_alias: meta.agent_alias.map(|s| s.to_string()),
+            parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
+            turn_id: Some(meta.turn_id.to_string()),
+        });
+    }
+
     let Some(tool) = static_tool.or(activated_arc.as_deref()) else {
         let reason = format!("Unknown tool: {call_name}");
         let duration = start.elapsed();
@@ -433,6 +618,45 @@ pub(crate) async fn execute_one_tool(
 
 // ── Parallel / sequential decision ───────────────────────────────────────
 
+/// Argument keys that, across the tool registry, carry a filesystem path
+/// (see `file_write`, `file_edit`, `file_download`, `file_upload`). Kept as
+/// a flat list rather than per-tool metadata — this is a conservative,
+/// best-effort heuristic, not a full dependency analysis.
+const PATH_ARG_KEYS: &[&str] = &["path", "file_path", "dest_path"];
+
+/// Extract every path-shaped string argument from a single tool call.
+/// Missing keys or non-string values are simply skipped — a tool call with
+/// no path arguments contributes nothing to the overlap check.
+fn path_args_of(call: &ParsedToolCall) -> Vec<&str> {
+    let Some(obj) = call.arguments.as_object() else {
+        return Vec::new();
+    };
+    PATH_ARG_KEYS
+        .iter()
+        .filter_map(|key| obj.get(*key).and_then(|v| v.as_str()))
+        .collect()
+}
+
+/// Conservative check: does this batch contain two or more tool calls that
+/// reference the same path argument value (plain string comparison, no
+/// canonicalization)? If so, they may race on the same file/resource and
+/// must not be dispatched concurrently.
+///
+/// This mirrors Hermes Agent's `_plan_tool_batch_segments`, scaled down to
+/// this codebase's existing "heuristic, not a dependency graph" style.
+fn batch_has_path_overlap(tool_calls: &[ParsedToolCall]) -> bool {
+    let mut seen: Vec<&str> = Vec::new();
+    for call in tool_calls {
+        for path in path_args_of(call) {
+            if seen.contains(&path) {
+                return true;
+            }
+            seen.push(path);
+        }
+    }
+    false
+}
+
 pub fn should_execute_tools_in_parallel(
     tool_calls: &[ParsedToolCall],
     approval: Option<&ApprovalManager>,
@@ -454,6 +678,14 @@ pub fn should_execute_tools_in_parallel(
     {
         // Approval-gated calls must keep sequential handling so the caller can
         // enforce CLI prompt/deny policy consistently.
+        return false;
+    }
+
+    // Two or more calls touching the same path/file argument race on that
+    // resource if dispatched concurrently (e.g. two `file_write` calls to
+    // the same path). Fall back to sequential rather than risk an
+    // unpredictable interleaving.
+    if batch_has_path_overlap(tool_calls) {
         return false;
     }
 
@@ -608,6 +840,97 @@ mod tests {
         }
     }
 
+    // ── Tool-name repair (fuzzy match) tests ─────────────────────────────
+
+    use super::find_closest_tool_name;
+
+    #[test]
+    fn find_closest_tool_name_repairs_single_character_typo() {
+        // "file_readef" is one substitution away from "file_reader"
+        // (edit distance 1) and much farther from every other candidate,
+        // so this must resolve unambiguously.
+        let known = ["file_reader", "file_writer", "shell"];
+        assert_eq!(
+            find_closest_tool_name("file_readef", &known),
+            Some("file_reader".to_string())
+        );
+    }
+
+    #[test]
+    fn find_closest_tool_name_returns_none_for_distant_name() {
+        // Nothing in `known` is within the repair tolerance of this name,
+        // so behavior must stay "fail like before" — no guessing.
+        let known = ["file_reader", "file_writer", "shell"];
+        assert_eq!(
+            find_closest_tool_name("completely_unrelated_tool_xyz", &known),
+            None
+        );
+    }
+
+    #[test]
+    fn find_closest_tool_name_returns_none_when_two_candidates_tie() {
+        // "cat" is edit distance 1 from both "car" and "bat" — a genuine
+        // tie for closest match. Auto-repair must refuse to guess between
+        // two live tools and behave as if nothing matched.
+        let known = ["car", "bat"];
+        assert_eq!(find_closest_tool_name("cat", &known), None);
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_repairs_hallucinated_typo_to_registered_static_tool() {
+        // A model that hallucinates "file_readef" instead of the
+        // registered "file_reader" should still get its call executed
+        // against the real tool, with an audit trail recorded via the
+        // existing ObserverEvent mechanism (asserted indirectly here by
+        // checking the call actually ran).
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tool: Box<dyn Tool> = Box::new(CountingTool::new(
+            "file_reader",
+            Arc::clone(&invocations),
+        ));
+        let registry = vec![tool];
+
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
+
+        let outcome = execute_one_tool(
+            "file_readef",
+            serde_json::json!({}),
+            None,
+            ToolDispatchContext {
+                tools_registry: &registry,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &meta,
+            &NoopObserver,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("hallucinated typo should be repaired and dispatched");
+
+        assert!(
+            outcome.success,
+            "repaired call should execute the real tool successfully"
+        );
+        assert!(
+            outcome.output.contains("executed via poisoned lock recovery"),
+            "output should come from the repaired tool's execute()"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "the repaired tool should have been invoked exactly once"
+        );
+    }
+
     #[tokio::test]
     async fn execute_one_tool_recovers_poisoned_activated_tool_lock() {
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
@@ -732,6 +1055,16 @@ mod tests {
             name: name.to_string(),
             arguments: serde_json::json!({}),
             tool_call_id: None,
+            arguments_parse_error: None,
+        }
+    }
+
+    fn parsed_tool_call_with_args(name: &str, arguments: serde_json::Value) -> ParsedToolCall {
+        ParsedToolCall {
+            name: name.to_string(),
+            arguments,
+            tool_call_id: None,
+            arguments_parse_error: None,
         }
     }
 
@@ -890,6 +1223,57 @@ mod tests {
         assert!(
             should_execute_tools_in_parallel(&batch, None),
             "no approval manager + non-tool_search batch must run in parallel"
+        );
+    }
+
+    // --- path-overlap branch ---
+
+    #[test]
+    fn overlapping_path_args_force_serial() {
+        // Two `file_write` calls targeting the same path race on that file
+        // if dispatched concurrently. The overlap check must force serial
+        // execution even though neither call is `tool_search` nor
+        // approval-gated.
+        let batch = vec![
+            parsed_tool_call_with_args("file_write", serde_json::json!({"path": "notes.txt", "content": "a"})),
+            parsed_tool_call_with_args("file_write", serde_json::json!({"path": "notes.txt", "content": "b"})),
+        ];
+
+        assert!(
+            !should_execute_tools_in_parallel(&batch, None),
+            "batch with two tool calls writing the same path must force sequential execution"
+        );
+    }
+
+    #[test]
+    fn distinct_path_args_remain_parallel_eligible() {
+        // Regression guard: different paths must not trip the overlap
+        // heuristic and must remain parallel-eligible as before.
+        let batch = vec![
+            parsed_tool_call_with_args("file_write", serde_json::json!({"path": "a.txt", "content": "a"})),
+            parsed_tool_call_with_args("file_write", serde_json::json!({"path": "b.txt", "content": "b"})),
+        ];
+
+        assert!(
+            should_execute_tools_in_parallel(&batch, None),
+            "batch with distinct path arguments must remain parallel-eligible"
+        );
+    }
+
+    #[test]
+    fn tool_call_without_path_args_does_not_panic_and_has_no_overlap() {
+        // A tool call whose arguments carry no path-shaped field (or no
+        // object at all) must be treated as contributing no path to the
+        // overlap check, and must never cause a panic.
+        let batch = vec![
+            parsed_tool_call("calculator"),
+            parsed_tool_call_with_args("file_write", serde_json::json!({"path": "a.txt", "content": "a"})),
+            parsed_tool_call_with_args("memory_recall", serde_json::json!("not-an-object")),
+        ];
+
+        assert!(
+            should_execute_tools_in_parallel(&batch, None),
+            "tool calls lacking path arguments must not trigger a false-positive overlap"
         );
     }
 

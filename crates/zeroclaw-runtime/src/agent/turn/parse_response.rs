@@ -4,7 +4,8 @@
 
 use super::context::TurnCtx;
 use super::protocol_detect::{
-    detect_internal_protocol_without_tools, detect_tool_call_parse_issue_for_known_tools,
+    detect_internal_protocol_without_tools, detect_residual_tool_protocol_issue,
+    detect_tool_call_parse_issue_for_known_tools,
 };
 use super::redact::scrub_credentials;
 use super::tool_specs::IterationToolSpecs;
@@ -113,6 +114,13 @@ pub(crate) struct InterpretedResponse {
     pub(crate) assistant_history_content: String,
     pub(crate) native_tool_calls: Vec<ToolCall>,
     pub(crate) parse_issue_detected: bool,
+    /// Set when one or more tool calls WERE successfully extracted from this response, but
+    /// some leftover text still looks like a botched tool-call attempt (e.g. a second,
+    /// malformed `<tool_call>` block alongside a valid one). Unlike `parse_issue_detected`,
+    /// this never gates execution of the valid calls or consumes a retry — it is surfaced
+    /// purely for observability so a partially-malformed response doesn't pass through
+    /// silently. `None` in the normal, fully-clean case.
+    pub(crate) partial_parse_issue: Option<String>,
     pub(crate) input_tokens: Option<u64>,
 }
 
@@ -182,15 +190,31 @@ pub(crate) async fn interpret_chat_response(
     } else {
         resp.tool_calls
             .iter()
-            .map(|call| ParsedToolCall {
-                name: call.name.clone(),
-                arguments: serde_json::from_str::<serde_json::Value>(&call.arguments)
-                    .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
-                tool_call_id: Some(call.id.clone()),
+            .map(|call| {
+                let (arguments, arguments_parse_error) =
+                    match serde_json::from_str::<serde_json::Value>(&call.arguments) {
+                        Ok(value) => (value, None),
+                        Err(e) => (
+                            serde_json::Value::Object(serde_json::Map::new()),
+                            Some(format!(
+                                "failed to parse tool arguments as JSON: {e}"
+                            )),
+                        ),
+                    };
+                ParsedToolCall {
+                    name: call.name.clone(),
+                    arguments,
+                    tool_call_id: Some(call.id.clone()),
+                    arguments_parse_error,
+                }
             })
             .collect()
     };
     let mut parsed_text = String::new();
+    // Leftover narration text from the text-based fallback parser, kept around
+    // (independent of `parsed_text`) so a partial-parse check can inspect it even
+    // when it isn't surfaced as display text (see `partial_parse_issue` below).
+    let mut fallback_residual_text: Option<String> = None;
 
     if calls.is_empty()
         && !specs.tool_specs.is_empty()
@@ -207,7 +231,10 @@ pub(crate) async fn interpret_chat_response(
             })
             .collect();
         if !fallback_text.is_empty() && !filtered_calls.is_empty() {
-            parsed_text = fallback_text;
+            parsed_text = fallback_text.clone();
+        }
+        if !filtered_calls.is_empty() {
+            fallback_residual_text = Some(fallback_text);
         }
         calls = filtered_calls;
     }
@@ -252,6 +279,38 @@ pub(crate) async fn interpret_chat_response(
                     "trace_id": ctx.turn_id,
                 })),
             "tool_call_parse_issue"
+        );
+    }
+
+    // Partial-parse observability: some tool calls WERE extracted (so the retry/correction
+    // path above never engages), but text-based fallback parsing left behind a residual chunk
+    // that still looks like a botched tool-call attempt (e.g. two `<tool_call>` blocks where
+    // only the first one closed cleanly). The valid calls always still execute — this is
+    // logged purely so a silently-dropped fragment doesn't go unnoticed.
+    let partial_parse_issue = if ctx.strict_tool_parsing || specs.tool_specs.is_empty() {
+        None
+    } else if !calls.is_empty() {
+        fallback_residual_text
+            .as_deref()
+            .and_then(detect_residual_tool_protocol_issue)
+    } else {
+        None
+    };
+    if let Some(ref issue) = partial_parse_issue {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "model": ctx.model,
+                    "iteration": iteration + 1,
+                    "issue": issue.as_str(),
+                    "valid_tool_calls": calls.len(),
+                    "response": scrub_credentials(&response_text),
+                    "trace_id": ctx.turn_id,
+                })),
+            "tool_call_partial_parse_issue"
         );
     }
 
@@ -305,6 +364,7 @@ pub(crate) async fn interpret_chat_response(
         assistant_history_content,
         native_tool_calls: native_calls,
         parse_issue_detected: parse_issue.is_some(),
+        partial_parse_issue,
         input_tokens: resp_input_tokens,
     }
 }

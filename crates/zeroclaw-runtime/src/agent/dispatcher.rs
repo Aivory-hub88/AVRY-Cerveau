@@ -9,6 +9,12 @@ pub struct ParsedToolCall {
     pub name: String,
     pub arguments: Value,
     pub tool_call_id: Option<String>,
+    /// Set when the provider emitted this tool call with an `arguments`
+    /// payload that failed to parse as JSON. `arguments` is then a placeholder
+    /// empty object — callers MUST check this field before executing the
+    /// call, and report the failure back to the model instead of running the
+    /// tool with arguments nobody actually sent.
+    pub arguments_parse_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +72,7 @@ impl XmlToolDispatcher {
                             name,
                             arguments,
                             tool_call_id: None,
+                            arguments_parse_error: None,
                         });
                     }
                     Err(e) => {
@@ -196,13 +203,23 @@ impl ToolDispatcher for NativeToolDispatcher {
         let calls = response
             .tool_calls
             .iter()
-            .map(|tc| ParsedToolCall {
-                name: tc.name.clone(),
-                arguments: serde_json::from_str(&tc.arguments).unwrap_or_else(|e| {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Tool).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"tool": tc.name, "error": format!("{}", e)})), "Failed to parse native tool call arguments as JSON; defaulting to empty object");
-                    Value::Object(serde_json::Map::new())
-                }),
-                tool_call_id: Some(tc.id.clone()),
+            .map(|tc| {
+                let (arguments, arguments_parse_error) = match serde_json::from_str(&tc.arguments) {
+                    Ok(value) => (value, None),
+                    Err(e) => {
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Tool).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"tool": tc.name, "error": format!("{}", e)})), "Failed to parse native tool call arguments as JSON; not executing the tool");
+                        (
+                            Value::Object(serde_json::Map::new()),
+                            Some(format!("failed to parse tool arguments as JSON: {e}")),
+                        )
+                    }
+                };
+                ParsedToolCall {
+                    name: tc.name.clone(),
+                    arguments,
+                    tool_call_id: Some(tc.id.clone()),
+                    arguments_parse_error,
+                }
             })
             .collect();
         (text, calls)
@@ -361,6 +378,38 @@ mod tests {
             }
             _ => panic!("expected tool results"),
         }
+    }
+
+    #[test]
+    fn native_dispatcher_flags_unparsable_arguments_instead_of_defaulting_silently() {
+        // Regression: a native tool call whose `arguments` string is not
+        // valid JSON must NOT be silently turned into an empty-object call
+        // that looks just like a real, intentional no-args invocation.
+        // `arguments_parse_error` must be set so callers can refuse to
+        // execute it and report the failure back to the model instead.
+        let response = ChatResponse {
+            text: Some("ok".into()),
+            tool_calls: vec![zeroclaw_providers::ToolCall {
+                id: "tc1".into(),
+                name: "file_write".into(),
+                arguments: "{not valid json".into(),
+                extra_content: None,
+            }],
+            usage: None,
+            reasoning_content: None,
+        };
+        let dispatcher = NativeToolDispatcher;
+        let (_, calls) = dispatcher.parse_response(&response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments, Value::Object(serde_json::Map::new()));
+        let err = calls[0]
+            .arguments_parse_error
+            .as_deref()
+            .expect("malformed arguments must be flagged with a parse error");
+        assert!(
+            err.contains("failed to parse tool arguments as JSON"),
+            "unexpected error message: {err}"
+        );
     }
 
     #[test]
