@@ -100,6 +100,7 @@ pub use zeroclaw_tools::poll::PollTool;
 pub use zeroclaw_tools::project_intel::ProjectIntelTool;
 pub use zeroclaw_tools::proxy_config::ProxyConfigTool;
 pub use zeroclaw_tools::pushover::PushoverTool;
+pub use zeroclaw_tools::python_execute::PythonExecuteTool;
 pub use zeroclaw_tools::reaction::ReactionTool;
 pub use zeroclaw_tools::report_template_tool::ReportTemplateTool;
 pub use zeroclaw_tools::screenshot::ScreenshotTool;
@@ -1084,6 +1085,35 @@ pub fn all_tools_with_runtime(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "google_workspace: skipped registration because shell access is unavailable"
         );
+    }
+
+    // Python code execution tool — opt-in (disabled by default), and only
+    // registered when the runtime is actually Docker (the tool refuses to
+    // run at all otherwise, but there's no point offering it to the model
+    // when it can never succeed) and shell access is available (mirrors the
+    // google_workspace/browser_delegate gating above).
+    if root_config.python_execute.enabled {
+        if has_shell_access && runtime.name() == "docker" {
+            tool_arcs.push(Arc::new(RateLimitedTool::new(
+                PathGuardedTool::new(
+                    PythonExecuteTool::new(
+                        security.clone(),
+                        runtime.clone(),
+                        root_config.python_execute.clone(),
+                        root_config.runtime.docker.allowed_workspace_roots.clone(),
+                    ),
+                    security.clone(),
+                ),
+                security.clone(),
+            )));
+        } else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "python_execute: skipped registration because the current runtime is not Docker"
+            );
+        }
     }
 
     // Claude Code delegation tool

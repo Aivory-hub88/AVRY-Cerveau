@@ -66,6 +66,9 @@ probe = ["dep:probe-rs"]
 test-helpers = []
 memory-postgres = ["zeroclaw-memory/memory-postgres"]
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 zeroclaw-infra.workspace = true
 tempfile = "3.26"

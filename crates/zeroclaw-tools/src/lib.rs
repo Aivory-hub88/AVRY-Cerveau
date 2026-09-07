@@ -76,6 +76,7 @@ pub mod poll;
 pub mod project_intel;
 pub mod proxy_config;
 pub mod pushover;
+pub mod python_execute;
 pub mod reaction;
 pub mod report_template_tool;
 pub mod report_templates;

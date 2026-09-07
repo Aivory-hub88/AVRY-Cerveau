@@ -10,26 +10,28 @@ use zeroclaw_api::platform::is_android;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 
 /// Maximum output size in bytes (1MB).
-const MAX_OUTPUT_BYTES: usize = 1_048_576;
-const POST_EXIT_DRAIN: Duration = Duration::from_millis(250);
+pub(crate) const MAX_OUTPUT_BYTES: usize = 1_048_576;
+pub(crate) const POST_EXIT_DRAIN: Duration = Duration::from_millis(250);
 
 /// Drop guard that SIGKILLs the child's process group on cancel/timeout paths.
 /// Disarmed after `child.wait()` returns so it never signals a recycled PID.
+/// Shared with `python_execute.rs`, which spawns its own `docker run` child
+/// and needs the same kill-on-timeout/cancel guarantee.
 #[cfg(unix)]
-struct ChildGroupGuard {
+pub(crate) struct ChildGroupGuard {
     pgid: std::sync::atomic::AtomicI32,
 }
 
 #[cfg(unix)]
 impl ChildGroupGuard {
-    fn new(child_pid: Option<u32>) -> Self {
+    pub(crate) fn new(child_pid: Option<u32>) -> Self {
         let pgid = child_pid.and_then(|p| i32::try_from(p).ok()).unwrap_or(0);
         Self {
             pgid: std::sync::atomic::AtomicI32::new(pgid),
         }
     }
 
-    fn disarm(&self) {
+    pub(crate) fn disarm(&self) {
         self.pgid.store(0, std::sync::atomic::Ordering::Release);
     }
 }
@@ -146,7 +148,7 @@ impl ShellTool {
 }
 
 #[cfg(target_os = "windows")]
-fn decode_output(bytes: &[u8]) -> String {
+pub(crate) fn decode_output(bytes: &[u8]) -> String {
     use windows::Win32::Globalization::GetACP;
     use windows::Win32::System::Console::GetConsoleOutputCP;
 
@@ -191,7 +193,7 @@ fn windows_code_page_to_encoding(cp: u32) -> &'static encoding_rs::Encoding {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn decode_output(bytes: &[u8]) -> String {
+pub(crate) fn decode_output(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
@@ -456,18 +458,18 @@ impl Tool for ShellTool {
     }
 }
 
-struct DrainHandle {
+pub(crate) struct DrainHandle {
     task: tokio::task::JoinHandle<()>,
     output: Arc<std::sync::Mutex<DrainOutput>>,
 }
 
 #[derive(Clone, Default)]
-struct DrainOutput {
-    bytes: Vec<u8>,
-    truncated: bool,
+pub(crate) struct DrainOutput {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) truncated: bool,
 }
 
-fn spawn_drain<R>(reader: Option<R>, cap: usize) -> DrainHandle
+pub(crate) fn spawn_drain<R>(reader: Option<R>, cap: usize) -> DrainHandle
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -479,7 +481,7 @@ where
     DrainHandle { task, output }
 }
 
-async fn finish_drain(mut drain: DrainHandle) -> DrainOutput {
+pub(crate) async fn finish_drain(mut drain: DrainHandle) -> DrainOutput {
     if tokio::time::timeout(POST_EXIT_DRAIN, &mut drain.task)
         .await
         .is_err()
@@ -495,7 +497,7 @@ async fn finish_drain(mut drain: DrainHandle) -> DrainOutput {
         .unwrap_or_default()
 }
 
-async fn abort_drain(drain: DrainHandle) {
+pub(crate) async fn abort_drain(drain: DrainHandle) {
     drain.task.abort();
     let _ = drain.task.await;
 }

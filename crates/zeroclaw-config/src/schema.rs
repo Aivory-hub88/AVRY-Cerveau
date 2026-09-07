@@ -702,6 +702,12 @@ pub struct Config {
     #[group = "Tools"]
     pub shell_tool: ShellToolConfig,
 
+    /// Python code execution tool configuration (`[python_execute]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Tools"]
+    pub python_execute: PythonExecuteConfig,
+
     /// Escalation routing configuration (`[escalation]`).
     #[serde(default)]
     #[nested]
@@ -8252,6 +8258,81 @@ impl Default for ShellToolConfig {
     fn default() -> Self {
         Self {
             timeout_secs: default_shell_tool_timeout_secs(),
+        }
+    }
+}
+
+// ── Python execute tool ─────────────────────────────────────────
+
+/// Python code execution tool configuration (`[python_execute]` section).
+///
+/// `python_execute` runs a one-shot Python script in a fresh Docker
+/// container per call (no persistent kernel across calls). It is opt-in
+/// (`enabled = false` by default) and only registers when the active
+/// runtime is Docker — this tool never runs Python directly on the host.
+///
+/// Network access is hard-coded to `none` in the tool implementation and is
+/// deliberately NOT a field here: unlike `runtime.docker.network` (which the
+/// generic `shell` tool honours from `DockerRuntimeConfig`), this tool must
+/// never be reachable from a config value, to keep LLM-generated code from
+/// exfiltrating data or pulling packages at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "python_execute"]
+pub struct PythonExecuteConfig {
+    /// Enable the `python_execute` tool. Default: `false` (opt-in capability;
+    /// turn on per agent-type/tenant via risk-profile/skill-bundle config,
+    /// not globally).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Docker image to run the script in. Default: `python:3.12-slim`.
+    #[serde(default = "default_python_execute_image")]
+    pub image: String,
+    /// Maximum script execution time in seconds. Default: `120`.
+    #[serde(default = "default_python_execute_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Container memory limit in megabytes. Default: `512`.
+    #[serde(default = "default_python_execute_memory_limit_mb")]
+    pub memory_limit_mb: u64,
+    /// Maximum captured stdout+stderr size in bytes. Default: `1_048_576` (1MB),
+    /// same cap as the `shell` tool.
+    #[serde(default = "default_python_execute_max_output_bytes")]
+    pub max_output_bytes: usize,
+    /// Container CPU limit (`--cpus`), mirroring
+    /// `DockerRuntimeConfig::cpu_limit`. Default: `1.0`.
+    #[serde(default = "default_python_execute_cpu_limit")]
+    pub cpu_limit: f64,
+}
+
+fn default_python_execute_image() -> String {
+    "python:3.12-slim".to_string()
+}
+
+fn default_python_execute_timeout_secs() -> u64 {
+    120
+}
+
+fn default_python_execute_memory_limit_mb() -> u64 {
+    512
+}
+
+fn default_python_execute_max_output_bytes() -> usize {
+    1_048_576
+}
+
+fn default_python_execute_cpu_limit() -> f64 {
+    1.0
+}
+
+impl Default for PythonExecuteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            image: default_python_execute_image(),
+            timeout_secs: default_python_execute_timeout_secs(),
+            memory_limit_mb: default_python_execute_memory_limit_mb(),
+            max_output_bytes: default_python_execute_max_output_bytes(),
+            cpu_limit: default_python_execute_cpu_limit(),
         }
     }
 }
@@ -16980,6 +17061,7 @@ fn default_otp_gated_actions() -> Vec<String> {
         "browser_open".to_string(),
         "browser".to_string(),
         "memory_forget".to_string(),
+        "python_execute".to_string(),
     ]
 }
 
@@ -18567,6 +18649,7 @@ impl Default for Config {
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
+            python_execute: PythonExecuteConfig::default(),
             escalation: EscalationConfig::default(),
         }
     }
@@ -27261,6 +27344,7 @@ auto_save = true
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
+            python_execute: PythonExecuteConfig::default(),
             escalation: EscalationConfig::default(),
             env_overridden_paths: std::collections::HashSet::new(),
             pre_override_snapshots: std::collections::HashMap::new(),
@@ -28138,6 +28222,7 @@ default_temperature = 0.7
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
+            python_execute: PythonExecuteConfig::default(),
             escalation: EscalationConfig::default(),
             env_overridden_paths: std::collections::HashSet::new(),
             pre_override_snapshots: std::collections::HashMap::new(),
