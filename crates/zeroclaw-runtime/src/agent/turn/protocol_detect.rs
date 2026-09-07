@@ -145,16 +145,10 @@ pub(crate) fn detect_internal_protocol_without_tools(response: &str) -> Option<S
     })
 }
 
-pub(crate) fn detect_tool_call_parse_issue_for_known_tools(
-    response: &str,
-    parsed_calls: &[ParsedToolCall],
-    known_tool_names: &HashSet<String>,
-) -> Option<String> {
-    if !parsed_calls.is_empty() {
-        return None;
-    }
-
-    let trimmed = response.trim();
+/// Shared envelope heuristic behind both [`detect_tool_call_parse_issue_for_known_tools`]
+/// (no valid call parsed at all) and [`detect_residual_tool_protocol_issue`] (some valid
+/// calls parsed, but leftover text still looks like a botched tool-call attempt).
+fn detect_protocol_envelope_issue(trimmed: &str, known_tool_names: &HashSet<String>) -> Option<String> {
     if trimmed.is_empty() || looks_like_tool_protocol_example(trimmed) {
         return None;
     }
@@ -178,6 +172,48 @@ pub(crate) fn detect_tool_call_parse_issue_for_known_tools(
     looks_like_tool_protocol_envelope(trimmed).then(|| message.into())
 }
 
+pub(crate) fn detect_tool_call_parse_issue_for_known_tools(
+    response: &str,
+    parsed_calls: &[ParsedToolCall],
+    known_tool_names: &HashSet<String>,
+) -> Option<String> {
+    if !parsed_calls.is_empty() {
+        return None;
+    }
+
+    detect_protocol_envelope_issue(response.trim(), known_tool_names)
+}
+
+/// Detects a leftover, unparseable tool-call fragment for the *partial-parse* case: one or
+/// more tool calls were already successfully extracted from this response, and
+/// `residual_text` is whatever text `parse_tool_calls` left over after removing them (e.g. the
+/// unconsumed tail after its tag loop bailed out of a second, malformed `<tool_call>` block).
+///
+/// This deliberately does NOT reuse [`detect_protocol_envelope_issue`]: that heuristic
+/// classifies a *whole* zero-call response, and part of its logic (e.g.
+/// `looks_like_malformed_tagged_tool_protocol_envelope`) requires re-parsing the text to come
+/// back with no calls *and* no visible text — which is never true for a residual fragment,
+/// since by construction it already failed to parse into a call and therefore reads back as
+/// its own (non-empty) "visible text". Re-running that heuristic here would silently never
+/// fire. Instead this checks the much narrower, purpose-built signal used elsewhere in this
+/// module for streaming/incomplete fragments: does the residual still *start* with a
+/// recognizable tool-call tag or fence marker (`<tool_call`, `<invoke`, ```` ```tool ````, …)?
+///
+/// A hit here never gates execution of the valid calls — it exists purely so the caller can
+/// log/observe that part of the response was dropped, instead of the malformed fragment
+/// silently leaking into the model's assistant history with nothing recorded about it.
+pub(crate) fn detect_residual_tool_protocol_issue(residual_text: &str) -> Option<String> {
+    let trimmed = residual_text.trim();
+    if trimmed.is_empty() || looks_like_tool_protocol_example(trimmed) {
+        return None;
+    }
+
+    starts_suspicious_tag_or_fence_prefix(trimmed).then(|| {
+        "leftover fragment after a valid tool call still looks like an unparsed tool-call attempt"
+            .to_string()
+    })
+}
+
 pub(crate) fn json_fence_body(trimmed: &str) -> Option<&str> {
     let rest = trimmed.strip_prefix("```")?;
     let first_newline = rest.find('\n')?;
@@ -192,4 +228,52 @@ pub(crate) fn json_fence_body(trimmed: &str) -> Option<&str> {
         return None;
     }
     Some(body_with_close[..close_start].trim())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroclaw_tool_call_parser::parse_tool_calls;
+
+    #[test]
+    fn residual_issue_none_for_plain_leftover_narration() {
+        // A fully clean response: one valid tool call, ordinary trailing prose.
+        // Must never be flagged as a residual protocol issue (zero regression case).
+        let response = r#"<tool_call>{"name": "shell", "arguments": {"command": "ls"}}</tool_call>
+Done, let me know if you need anything else."#;
+        let (residual, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(detect_residual_tool_protocol_issue(&residual), None);
+    }
+
+    #[test]
+    fn residual_issue_detected_when_second_tool_call_is_malformed() {
+        // Two `<tool_call>` blocks: the first parses cleanly, the second is missing
+        // its closing tag (truncated mid-argument) — this is the "mixed valid +
+        // malformed" case the fix targets. The valid call must survive in `calls`,
+        // and the residual (which still starts with an open `<tool_call>` tag) must
+        // be flagged for observability.
+        let response = concat!(
+            r#"<tool_call>{"name": "shell", "arguments": {"command": "ls"}}</tool_call>"#,
+            "\n",
+            r#"<tool_call>{"name": "shell", "arguments": {"command": "pwd"#
+        );
+        let (residual, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1, "the well-formed first tool call must survive");
+        assert_eq!(calls[0].name, "shell");
+        let issue = detect_residual_tool_protocol_issue(&residual);
+        assert!(
+            issue.is_some(),
+            "leftover malformed tool-call fragment should be flagged, got residual={residual:?}"
+        );
+    }
+
+    #[test]
+    fn residual_issue_none_when_nothing_looks_like_a_tool_call() {
+        let response = r#"<tool_call>{"name": "shell", "arguments": {"command": "ls"}}</tool_call>
+By the way, brackets [1] and braces {like this} in prose aren't a tool call."#;
+        let (residual, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(detect_residual_tool_protocol_issue(&residual), None);
+    }
 }

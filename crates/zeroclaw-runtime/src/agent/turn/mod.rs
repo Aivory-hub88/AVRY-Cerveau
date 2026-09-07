@@ -923,6 +923,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             assistant_history_content,
             native_tool_calls,
             parse_issue_detected,
+            partial_parse_issue,
             protocol_suppressed,
             response_streamed_live,
             reported_input_tokens,
@@ -948,6 +949,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     interpreted.assistant_history_content,
                     interpreted.native_tool_calls,
                     interpreted.parse_issue_detected,
+                    interpreted.partial_parse_issue,
                     streamed_protocol_suppressed,
                     streamed_live_deltas,
                     interpreted.input_tokens,
@@ -1092,7 +1094,35 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // presentation state after parsing has accepted the response, so a
         // malformed fallback completion cannot leak a stale recovery notice.
         zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
-
+        // Partial-parse observability: unlike the branch above, this response DID yield
+        // one or more valid tool calls, so it never entered the malformed-protocol retry
+        // path — those calls still execute normally below. But the fallback text parser
+        // also found a residual fragment that still looks like a botched second tool-call
+        // attempt (e.g. an unclosed `<tool_call>` block after a valid one). Record that so
+        // a silently-dropped fragment is visible in logs, without spending a retry or
+        // touching the valid calls.
+        if !tool_calls.is_empty()
+            && let Some(ref issue) = partial_parse_issue
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Provider)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(serde_json::json!({
+                        "channel": channel_name,
+                        "model_provider": provider_name,
+                        "model": model,
+                        "trace_id": turn_id,
+                        "iteration": iteration + 1,
+                        "valid_tool_calls": tool_calls.len(),
+                        "issue": issue.as_str(),
+                        "note": "partial tool-call parse: valid call(s) still executed, \
+                                 residual malformed fragment ignored",
+                    })),
+                "tool_call_partial_parse_feedback"
+            );
+        }
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
             let llm_secs = llm_started_at.elapsed().as_secs();

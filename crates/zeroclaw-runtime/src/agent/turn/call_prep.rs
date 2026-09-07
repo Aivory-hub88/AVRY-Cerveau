@@ -111,6 +111,55 @@ pub(crate) async fn prepare_tool_calls(
     let mut prompt_approval_tool_signatures_this_round: HashSet<(String, String)> = HashSet::new();
 
     for (idx, call) in tool_calls.iter().enumerate() {
+        // ── Reject calls whose arguments failed to parse as JSON ────────
+        // The model emitted a tool call, but its `arguments` payload was not
+        // valid JSON. Silently substituting `{}` and running the tool anyway
+        // would execute it with arguments nobody actually sent — dangerous
+        // for any mutating tool (file write, delegate, etc). Report the
+        // failure back to the model instead, without ever entering the
+        // hook/approval/execution pipeline for this call.
+        if let Some(parse_error) = &call.arguments_parse_error {
+            let message = format!(
+                "Tool call '{}' was not executed: {parse_error}",
+                call.name
+            );
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "model": ctx.model,
+                        "iteration": iteration + 1,
+                        "tool": call.name,
+                        "result": message,
+                        "trace_id": ctx.turn_id,
+                    })),
+                "tool_call_result"
+            );
+            if let Some(tx) = ctx.on_delta {
+                let _ = tx
+                    .send(StreamDelta::Status(format!(
+                        "\u{274c} {}: {}\n",
+                        call.name, message
+                    )))
+                    .await;
+            }
+            let outcome = ToolExecutionOutcome {
+                output: message.clone(),
+                success: false,
+                error_reason: Some(message),
+                duration: Duration::ZERO,
+                receipt: None,
+                output_data: None,
+            };
+            if let Some(tx) = ctx.event_tx {
+                emit_tool_call_pair(tx, call, &outcome).await;
+            }
+            ordered_results[idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
+            continue;
+        }
+
         // ── Hook: before_tool_call (modifying) ──────────
         let mut tool_name = call.name.clone();
         let mut tool_args = call.arguments.clone();
@@ -386,6 +435,9 @@ pub(crate) async fn prepare_tool_calls(
             name: tool_name.clone(),
             arguments: tool_args.clone(),
             tool_call_id: call.tool_call_id.clone(),
+            // Calls with a parse error were already rejected and `continue`d
+            // above; everything reaching this point parsed successfully.
+            arguments_parse_error: None,
         });
         // Pin the resolved id onto the executable call so the pending ToolCall
         // and the terminal ToolResult (both emitted by the executor at dispatch
@@ -395,6 +447,7 @@ pub(crate) async fn prepare_tool_calls(
             name: tool_name,
             arguments: tool_args,
             tool_call_id: Some(call_id),
+            arguments_parse_error: None,
         });
         claimed_idem_keys.push(claimed_key);
     }
@@ -510,6 +563,7 @@ mod tests {
             name: tool_name.to_string(),
             arguments: serde_json::json!({"action": "run"}),
             tool_call_id: Some("call-1".to_string()),
+            arguments_parse_error: None,
         }];
         let mut seen = HashSet::new();
         let mut prompt_seen = HashSet::new();
@@ -614,5 +668,114 @@ mod tests {
             ],
             "the callable skill boundary, not its native target, controls both stream events"
         );
+    }
+
+    /// Regression for the "silent empty-object" bug: a tool call whose
+    /// `arguments` failed to parse as JSON (flagged via
+    /// `arguments_parse_error` by the response parser) must be rejected
+    /// outright — never executed with a substituted `{}` — and must report
+    /// an explicit failure back to the model, addressed to the original
+    /// tool_call_id so provider role-alternation stays valid.
+    #[tokio::test]
+    async fn prepare_tool_calls_rejects_call_with_unparsable_arguments_without_executing() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(4);
+        let ctx = test_ctx(&observer, &pacing, &tx);
+
+        let calls = vec![ParsedToolCall {
+            name: "file_write".to_string(),
+            arguments: serde_json::Value::Object(serde_json::Map::new()),
+            tool_call_id: Some("call_1".to_string()),
+            arguments_parse_error: Some(
+                "failed to parse tool arguments as JSON: EOF while parsing an object".to_string(),
+            ),
+        }];
+
+        let mut seen_tool_signatures = HashSet::new();
+        let mut prompt_approval_tool_signatures = HashSet::new();
+
+        let prepared = prepare_tool_calls(
+            &ctx,
+            &[],
+            None,
+            &calls,
+            &mut seen_tool_signatures,
+            &mut prompt_approval_tool_signatures,
+            0,
+            true,
+        )
+        .await
+        .expect("prepare_tool_calls should not error");
+
+        // The call must never become executable — it must not run with the
+        // substituted empty-object arguments.
+        assert!(
+            prepared.executable_indices.is_empty(),
+            "a call with unparsable arguments must not be scheduled for execution"
+        );
+        assert!(prepared.executable_calls.is_empty());
+
+        // It must instead carry an explicit failure result, addressed to the
+        // same tool_call_id, so a role=tool follow-up message still lines up
+        // with the assistant's claimed tool call.
+        let mut ordered_results = prepared.ordered_results;
+        let (name, tool_call_id, outcome) =
+            ordered_results.remove(0).expect("a result must be recorded");
+        assert_eq!(name, "file_write");
+        assert_eq!(tool_call_id.as_deref(), Some("call_1"));
+        assert!(!outcome.success, "the outcome must be a failure");
+        assert!(
+            outcome.output.contains("file_write"),
+            "failure output should name the tool: {}",
+            outcome.output
+        );
+        assert!(
+            outcome
+                .error_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("failed to parse tool arguments as JSON"),
+            "error_reason should carry the parse failure: {:?}",
+            outcome.error_reason
+        );
+    }
+
+    /// A normal, successfully-parsed call must be unaffected by the new
+    /// rejection branch and still reach the executable set.
+    #[tokio::test]
+    async fn prepare_tool_calls_still_executes_calls_with_valid_arguments() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(4);
+        let ctx = test_ctx(&observer, &pacing, &tx);
+
+        let calls = vec![ParsedToolCall {
+            name: "shell".to_string(),
+            arguments: serde_json::json!({"command": "echo hi"}),
+            tool_call_id: Some("call_2".to_string()),
+            arguments_parse_error: None,
+        }];
+
+        let mut seen_tool_signatures = HashSet::new();
+        let mut prompt_approval_tool_signatures = HashSet::new();
+
+        let prepared = prepare_tool_calls(
+            &ctx,
+            &[],
+            None,
+            &calls,
+            &mut seen_tool_signatures,
+            &mut prompt_approval_tool_signatures,
+            0,
+            true,
+        )
+        .await
+        .expect("prepare_tool_calls should not error");
+
+        assert_eq!(prepared.executable_indices, vec![0]);
+        assert_eq!(prepared.executable_calls.len(), 1);
+        assert_eq!(prepared.executable_calls[0].name, "shell");
+        assert!(prepared.ordered_results[0].is_none());
     }
 }

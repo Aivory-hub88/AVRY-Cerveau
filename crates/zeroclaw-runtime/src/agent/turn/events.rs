@@ -244,6 +244,7 @@ mod tests {
             name: "echo".into(),
             arguments: serde_json::json!({}),
             tool_call_id: id.map(str::to_string),
+            arguments_parse_error: None,
         }
     }
 
