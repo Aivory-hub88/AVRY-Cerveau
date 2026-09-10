@@ -240,7 +240,7 @@ Community open-skills loading is opt-in via the `skills` config. When enabled, Z
 
 ## Advanced config
 
-The default prompt injection mode is `full`, which includes full skill instructions in the system prompt. Use `compact` to keep only compact metadata in context and load skill details on demand:
+The default prompt injection mode is `compact`, which keeps skill metadata in context and loads skill instructions on demand through `read_skill`. Explicit `full` mode (all instructions inlined eagerly) remains supported, including as a runtime-profile override. Compact mode reduces prompt size; it is not an isolation boundary for untrusted skill sources. If `read_skill` is unavailable for a turn (e.g. filtered by policy), rendering falls back to `full` automatically so instructions are never silently dropped.
 
 ## Autonomous skill creation
 

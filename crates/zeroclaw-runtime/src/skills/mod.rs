@@ -1678,13 +1678,31 @@ fn display_skill_location(path: &Path) -> String {
     }
 }
 
-/// Build the "Available Skills" system prompt section with full skill instructions.
+/// Build the available-skills prompt when no tool-availability context exists.
+/// Full mode is the safe fallback because compact mode requires `read_skill`.
 pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
     skills_to_prompt_with_mode(
         skills,
         workspace_dir,
         zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
     )
+}
+
+/// Resolve compact skill prompting against the effective tool surface.
+/// Compact mode is only safe when `read_skill` is available for the turn.
+pub fn skills_prompt_mode_with_loader_fallback(
+    mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
+    read_skill_available: bool,
+) -> zeroclaw_config::schema::SkillsPromptInjectionMode {
+    if matches!(
+        mode,
+        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
+    ) && !read_skill_available
+    {
+        zeroclaw_config::schema::SkillsPromptInjectionMode::Full
+    } else {
+        mode
+    }
 }
 
 fn is_registered_skill_tool_kind(kind: &str) -> bool {
@@ -1701,10 +1719,13 @@ fn skill_tool_is_prompt_callable(tool: &SkillTool) -> bool {
     }
 }
 
-/// Build the "Available Skills" system prompt section with configurable verbosity.
+/// Build the available-skills prompt section with the requested verbosity.
 pub fn skills_to_prompt_with_mode(
     skills: &[Skill],
     workspace_dir: &Path,
+    // The caller supplies the resolved mode after applying any runtime-profile
+    // override over the global value. Full inlines instructions eagerly;
+    // Compact renders summaries whose instructions load via `read_skill`.
     mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
 ) -> String {
     use std::fmt::Write;
@@ -1713,44 +1734,42 @@ pub fn skills_to_prompt_with_mode(
         return String::new();
     }
 
-    let mut prompt = match mode {
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Full => String::from(
+    let is_full = matches!(
+        mode,
+        zeroclaw_config::schema::SkillsPromptInjectionMode::Full
+    );
+
+    let mut prompt = if is_full {
+        String::from(
             "## Available Skills\n\n\
              Skill instructions and tool metadata are preloaded below.\n\
              Follow these instructions directly; do not read skill files at runtime unless the user asks.\n\n\
              <available_skills>\n",
-        ),
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact => String::from(
+        )
+    } else {
+        String::from(
             "## Available Skills\n\n\
              Skill summaries are preloaded below to keep context compact.\n\
              Skill instructions are loaded on demand: call `read_skill(name)` with the skill's `<name>` when you need the full skill file.\n\
              The `location` field is included for reference.\n\n\
              <available_skills>\n",
-        ),
+        )
     };
 
     for skill in skills {
         let _ = writeln!(prompt, "  <skill>");
         write_xml_text_element(&mut prompt, 4, "name", &skill.name);
         write_xml_text_element(&mut prompt, 4, "description", &skill.description);
-        let location = render_skill_location(
-            skill,
-            workspace_dir,
-            matches!(
-                mode,
-                zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
-            ),
-        );
+        let location = render_skill_location(skill, workspace_dir, !is_full);
         write_xml_text_element(&mut prompt, 4, "location", &location);
 
-        // In Full mode, inline both instructions and tools.
-        // In Compact mode, skip instructions (loaded on demand) but keep tools
-        // so the LLM knows which skill tools are available.
-        if matches!(
-            mode,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Full
-        ) && !skill.prompts.is_empty()
-        {
+        // Full mode inlines both instructions and tools. Compact mode skips
+        // instructions (loaded on demand via `read_skill`) but keeps tools
+        // so the LLM knows which skill tools are available. No per-skill
+        // `always` override — Cerveau's `Skill` has no such field, and
+        // nothing here currently needs one; every skill follows the mode
+        // uniformly.
+        if is_full && !skill.prompts.is_empty() {
             let _ = writeln!(prompt, "    <instructions>");
             for instruction in &skill.prompts {
                 write_xml_text_element(&mut prompt, 6, "instruction", instruction);
