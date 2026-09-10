@@ -1422,10 +1422,6 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 /// consumers, and its own documentation says user-facing surfaces localize from
 /// the code and fall back to the message only for unknown codes. This is that
 /// mapping for the CLI.
-///
-/// An earlier version of this helper existed for the skills prompt-injection
-/// deprecation and was removed with that warning, so the withheld-capability
-/// notice is currently its only entry.
 fn localized_validation_warning_message(
     warning: &zeroclaw_config::validation_warnings::ValidationWarning,
 ) -> String {
@@ -1433,6 +1429,9 @@ fn localized_validation_warning_message(
         zeroclaw_config::validation_warnings::VERIFIABLE_INTENT_TOOL_WITHHELD => {
             crate::i18n::get_required_cli_string("cli-doctor-verifiable-intent-tool-withheld")
         }
+        "skills_prompt_injection_mode_full_deprecated" => crate::i18n::get_required_cli_string(
+            "cli-doctor-skills-prompt-injection-mode-full-deprecated",
+        ),
         _ => warning.message.clone(),
     }
 }
@@ -3069,6 +3068,25 @@ mod tests {
         // The diagnostic path is what an operator edits, so it stays the
         // config key rather than being folded into the localized sentence.
         assert_eq!(warning.path, "verifiable_intent.enabled");
+    }
+
+    #[test]
+    fn skills_prompt_deprecation_warning_uses_fluent() {
+        let warning = zeroclaw_config::validation_warnings::ValidationWarning::new(
+            "skills_prompt_injection_mode_full_deprecated",
+            "unlocalized fallback",
+            "skills.prompt_injection_mode",
+        );
+
+        let expected = crate::i18n::get_required_cli_string(
+            "cli-doctor-skills-prompt-injection-mode-full-deprecated",
+        );
+        assert_eq!(localized_validation_warning_message(&warning), expected);
+        assert_ne!(expected, "unlocalized fallback");
+        assert_ne!(
+            expected,
+            "{cli-doctor-skills-prompt-injection-mode-full-deprecated}"
+        );
     }
 
     #[test]
