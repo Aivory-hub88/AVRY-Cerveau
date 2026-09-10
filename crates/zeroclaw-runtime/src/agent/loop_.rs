@@ -820,6 +820,7 @@ pub async fn agent_turn(
         agent_alias,
         turn_id,
         None,
+        None, // event_tx — agent_turn has no streaming caller today
     )
     .await
 }
@@ -854,6 +855,12 @@ async fn agent_turn_with_sop_reassembly(
     agent_alias: Option<&str>,
     turn_id: Option<&str>,
     sop_reassembly: Option<SopStepReassembly<'_>>,
+    // Cerveau: live turn events (text chunks, tool calls, usage) for a
+    // streaming caller. `None` for every existing caller — bit-for-bit the
+    // same blocking behavior as before this parameter was added. Threaded
+    // straight through to `ToolLoop.event_tx`, the same field
+    // `Agent::turn_streamed` populates for `/ws/chat`.
+    event_tx: Option<tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
 ) -> Result<String> {
     let turn_id = turn_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
     #[cfg(test)]
@@ -920,7 +927,7 @@ async fn agent_turn_with_sop_reassembly(
         shared_budget: None, // no shared budget for agent_turn callers
         channel,
         collected_receipts: None,
-        event_tx: None,
+        event_tx,
         steering: None,
         new_messages_out: None,
         image_cache: None,
@@ -2800,12 +2807,16 @@ pub async fn run(
 
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
-pub async fn process_message(
+async fn process_message_impl(
     config: Config,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
     origin: TurnOrigin,
+    // Cerveau: live turn events for a streaming caller — see
+    // `agent_turn_with_sop_reassembly`'s `event_tx` doc. `None` reproduces
+    // `process_message`'s exact prior (blocking) behavior.
+    event_tx: Option<tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
     let agent = resolved_agent_for_turn(&config, agent_alias)?;
@@ -3432,6 +3443,7 @@ pub async fn process_message(
                     Some(agent_alias),
                     Some(&turn_id),
                     Some(SopStepReassembly { config: &config }),
+                    event_tx,
                 ),
             )
             .await;
@@ -3492,6 +3504,44 @@ pub async fn process_message(
         .instrument(__zc_scope_span)
         .instrument(__zc_attribution_span)
         .await
+}
+
+/// Process one turn to completion and return the final reply text.
+///
+/// Thin wrapper over [`process_message_impl`] with no live event stream —
+/// every pre-existing caller (webhook, peer messages, cron, etc.) keeps
+/// today's exact blocking behavior.
+pub async fn process_message(
+    config: Config,
+    agent_alias: &str,
+    message: &str,
+    session_id: Option<&str>,
+    origin: TurnOrigin,
+) -> Result<String> {
+    process_message_impl(config, agent_alias, message, session_id, origin, None).await
+}
+
+/// Streaming variant of [`process_message`].
+///
+/// Identical tenant resolution, memory jailing, tool/MCP scoping, cost
+/// tracking, SOP reassembly, and background consolidation — the only
+/// difference is that live [`zeroclaw_api::agent::TurnEvent`]s (text
+/// chunks, tool calls, usage) are forwarded to `event_tx` as the turn
+/// executes, in addition to the accumulated final text this still returns
+/// once the turn completes. Callers that don't care about the interim
+/// events can drop the receiver; sends are best-effort (a closed receiver
+/// just stops receiving, the turn itself is unaffected).
+///
+/// Added for Cerveau's tenant-aware Console streaming webhook (2026-09-10).
+pub async fn process_message_streamed(
+    config: Config,
+    agent_alias: &str,
+    message: &str,
+    session_id: Option<&str>,
+    origin: TurnOrigin,
+    event_tx: tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>,
+) -> Result<String> {
+    process_message_impl(config, agent_alias, message, session_id, origin, Some(event_tx)).await
 }
 
 #[cfg(test)]
