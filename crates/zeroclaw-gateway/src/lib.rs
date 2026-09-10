@@ -1800,6 +1800,7 @@ pub async fn run_gateway(
         .route("/pair/code", get(handle_pair_code))
         .route("/webhook", post(handle_webhook))
         .merge(sop_webhook_routes())
+        .route("/webhook/stream", post(handle_webhook_stream))
         .route(
             "/webhook/approvals",
             get(api_tenant_approvals::handle_webhook_approval_list),
@@ -2902,6 +2903,113 @@ pub(crate) async fn run_gateway_chat_with_tools(
     }
 }
 
+/// Streaming twin of [`run_gateway_chat_with_tools`] — identical tenant
+/// resolution, cost-tracking, turn-origin, and pending-approval scoping;
+/// the only change is that `event_tx` rides through to
+/// `zeroclaw_runtime::agent::process_message_streamed` so a caller gets
+/// live `TurnEvent`s (chunks, tool calls, usage) as the turn executes,
+/// instead of only the accumulated result once it finishes. Added for
+/// Cerveau's tenant-aware Console streaming webhook (2026-09-10).
+pub(crate) async fn run_gateway_chat_with_tools_streamed(
+    state: &AppState,
+    message: &str,
+    session_id: Option<&str>,
+    agent_override: Option<&str>,
+    tenant: Option<std::sync::Arc<zeroclaw_runtime::agent::tenant::TenantContext>>,
+    event_tx: tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>,
+) -> anyhow::Result<GatewayChatOutcome> {
+    if let Some(err) = needs_quickstart_for(&state.model) {
+        return Err(err);
+    }
+
+    #[cfg(test)]
+    {
+        let _ = (session_id, agent_override, tenant, event_tx);
+        let response = state
+            .model_provider
+            .chat_with_system(None, message, &state.model, state.temperature)
+            .await?;
+        Ok(GatewayChatOutcome {
+            response,
+            input_tokens: None,
+            output_tokens: None,
+            cost_usd: None,
+            pending_approval: None,
+        })
+    }
+
+    #[cfg(not(test))]
+    {
+        let config = state.config.read().clone();
+        let tenant_agent_type = tenant.as_ref().map(|t| t.agent_type.as_str());
+        let agent_alias =
+            require_gateway_chat_agent_alias(&config, agent_override, tenant_agent_type)?;
+
+        let cost_tracking_context = state.cost_tracker.as_ref().map(|tracker| {
+            let pricing = zeroclaw_runtime::agent::cost::build_model_provider_pricing(&config);
+            zeroclaw_runtime::agent::cost::ToolLoopCostTrackingContext::new(
+                tracker.clone(),
+                std::sync::Arc::new(pricing),
+            )
+            .with_agent_alias(&agent_alias)
+        });
+        let turn_usage = state.cost_tracker.as_ref().map(|_| {
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                zeroclaw_runtime::agent::cost::TurnUsage::default(),
+            ))
+        });
+        let turn_origin = std::sync::Arc::new(zeroclaw_runtime::agent::tenant::TurnOriginContext {
+            session_id: session_id.map(str::to_owned),
+            origin_message: message.to_owned(),
+            schedule_id: None,
+        });
+        let pending_approval_cell = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let response = Box::pin(zeroclaw_runtime::agent::tenant::TENANT_CONTEXT.scope(
+            tenant,
+            zeroclaw_runtime::agent::tenant::TURN_ORIGIN_CONTEXT.scope(
+                Some(turn_origin),
+                zeroclaw_runtime::agent::tenant::LAST_PENDING_APPROVAL.scope(
+                    Some(pending_approval_cell.clone()),
+                    zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
+                        turn_usage.clone(),
+                        zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                            cost_tracking_context,
+                            zeroclaw_runtime::agent::process_message_streamed(
+                                config,
+                                &agent_alias,
+                                message,
+                                session_id,
+                                zeroclaw_api::ingress::TurnOrigin::Interactive,
+                                event_tx,
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ))
+        .await?;
+        let usage = turn_usage
+            .map(|cell| *cell.lock())
+            .filter(|usage| usage.input_tokens > 0 || usage.output_tokens > 0);
+        let (input_tokens, output_tokens, cost_usd) = match usage {
+            Some(usage) => (
+                Some(usage.input_tokens),
+                Some(usage.output_tokens),
+                Some(usage.cost_usd),
+            ),
+            None => (None, None, None),
+        };
+        let pending_approval = pending_approval_cell.lock().take();
+        Ok(GatewayChatOutcome {
+            response,
+            input_tokens,
+            output_tokens,
+            cost_usd,
+            pending_approval,
+        })
+    }
+}
+
 fn resolve_gateway_chat_agent_alias(
     config: &Config,
     agent_override: Option<&str>,
@@ -3168,6 +3276,30 @@ async fn authorize_webhook_request(
     })
 }
 
+/// Everything decided before the actual LLM turn: auth (pairing + webhook
+/// secret), per-IP/per-tenant rate limiting, `?agent=` override validation,
+/// Cerveau tenant resolution (persona/toolkits/custom MCP), idempotency, and
+/// the admission-queue slot. Shared verbatim by the blocking `/webhook`
+/// handler and `/webhook/stream` so this security-sensitive logic has
+/// exactly one copy to review and patch — see `handle_webhook` /
+/// `handle_webhook_stream`.
+struct WebhookPrelude {
+    message: String,
+    session_id: Option<String>,
+    agent_override: Option<String>,
+    tenant_ctx: Option<std::sync::Arc<zeroclaw_runtime::agent::tenant::TenantContext>>,
+    model_label: String,
+    // RAII: holds the admission-queue slot (if any) for the caller's entire
+    // dispatch phase. Must stay alive until the LLM turn finishes — drop it
+    // early and another request can take this one's slot mid-turn.
+    _admission_permit: Option<admission_queue::AdmissionPermit>,
+}
+
+/// Runs the shared prelude. `Err` is a short-circuit the caller should
+/// return to the client as-is (wrapped in whatever response type it needs)
+/// without going on to call `run_gateway_chat_with_tools*` — this covers
+/// both genuine auth/validation/capacity errors and the (still HTTP 200)
+/// "duplicate idempotency key" reply.
 /// Build an injective storage key for the replay/idempotency store.
 ///
 /// Both the namespace (derived from a caller-controlled SOP path) and the
@@ -3276,16 +3408,25 @@ fn require_sop_dispatch_credentials(
 }
 
 /// POST /webhook — main webhook endpoint
-async fn handle_webhook(
-    State(state): State<AppState>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    Query(query): Query<WebhookQuery>,
-    headers: HeaderMap,
+/// Runs the shared prelude. `Err` is a short-circuit the caller should
+/// return to the client as-is (wrapped in whatever response type it needs)
+/// without going on to call `run_gateway_chat_with_tools*` — this covers
+/// both genuine auth/validation/capacity errors and the (still HTTP 200)
+/// "duplicate idempotency key" reply.
+///
+/// A handled SOP dispatch short-circuits through the same `Err` channel
+/// (its `WebhookJsonResponse` maps 1:1 onto it): SOP-first dispatch stays
+/// shared by both endpoints rather than living only in the blocking one.
+async fn webhook_prelude(
+    state: &AppState,
+    peer_addr: SocketAddr,
+    query: &WebhookQuery,
+    headers: &HeaderMap,
     body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    let auth_verdict = match authorize_webhook_request(&state, peer_addr, &headers).await {
+) -> Result<WebhookPrelude, (StatusCode, serde_json::Value)> {
+    let auth_verdict = match authorize_webhook_request(state, peer_addr, headers).await {
         Ok(verdict) => verdict,
-        Err(response) => return response,
+        Err((status, Json(err))) => return Err((status, err)),
     };
     let Json(webhook_body) = match body {
         Ok(b) => b,
@@ -3300,7 +3441,7 @@ async fn handle_webhook(
             let err = serde_json::json!({
                 "error": "Invalid JSON body. Expected: {\"message\": \"...\"}"
             });
-            return (StatusCode::BAD_REQUEST, Json(err));
+            return Err((StatusCode::BAD_REQUEST, err));
         }
     };
 
@@ -3310,22 +3451,22 @@ async fn handle_webhook(
     // the advertised contract is SOP dispatch first, chat fallback second,
     // so a chat-only param must never block a matching SOP.
     let sop_payload = serde_json::json!({ "message": &webhook_body.message }).to_string();
-    let has_matching_sop = match api_sop_webhook::has_matching_webhook_sop(&state, "/webhook") {
+    let has_matching_sop = match api_sop_webhook::has_matching_webhook_sop(state, "/webhook") {
         Ok(matches) => matches,
-        Err(response) => return response,
+        Err((status, Json(err))) => return Err((status, err)),
     };
 
     if has_matching_sop {
-        if let Err(response) = require_sop_dispatch_credentials(auth_verdict) {
-            return response;
+        if let Err((status, Json(err))) = require_sop_dispatch_credentials(auth_verdict) {
+            return Err((status, err));
         }
-        if let Some(response) = check_webhook_idempotency(&state, &headers, None) {
-            return response;
+        if let Some((status, Json(body))) = check_webhook_idempotency(state, headers, None) {
+            return Err((status, body));
         }
-        if let api_sop_webhook::SopWebhookOutcome::Handled(response) =
-            api_sop_webhook::dispatch_webhook_sop(&state, "/webhook", Some(&sop_payload)).await
+        if let api_sop_webhook::SopWebhookOutcome::Handled((status, Json(body))) =
+            api_sop_webhook::dispatch_webhook_sop(state, "/webhook", Some(&sop_payload)).await
         {
-            return response;
+            return Err((status, body));
         }
         // The engine reported no match after all (e.g. a trigger was
         // unloaded between the pre-check above and dispatch); fall through
@@ -3359,7 +3500,7 @@ async fn handle_webhook(
                     "Unknown agent `{alias}` — no [agents.{alias}] entry configured."
                 )
             });
-            return (StatusCode::BAD_REQUEST, Json(err));
+            return Err((StatusCode::BAD_REQUEST, err));
         }
     }
 
@@ -3373,7 +3514,7 @@ async fn handle_webhook(
     // caller's idempotency key.
     // (Parsed again here — `authorize_webhook_request` parsed the same
     // headers for its deferral decision but returns only the verdict.)
-    let tenant_selector = tenant::TenantSelector::from_headers(&headers);
+    let tenant_selector = tenant::TenantSelector::from_headers(headers);
     let tenant_ctx = match tenant_selector {
         Ok(None) => None,
         Ok(Some(sel)) => {
@@ -3394,7 +3535,7 @@ async fn handle_webhook(
                 let err = serde_json::json!({
                     "error": "Tenant-scoped requests require X-Webhook-Secret auth on this deployment"
                 });
-                return (StatusCode::UNAUTHORIZED, Json(err));
+                return Err((StatusCode::UNAUTHORIZED, err));
             }
             // Per-tenant rate limit — independent of the per-IP check above,
             // and checked before the Postgres persona lookup / LLM call so a
@@ -3413,7 +3554,7 @@ async fn handle_webhook(
                     "error": "Too many webhook requests for this tenant. Please retry later.",
                     "retry_after": RATE_LIMIT_WINDOW_SECS,
                 });
-                return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+                return Err((StatusCode::TOO_MANY_REQUESTS, err));
             }
             match tenant::TenantResolver::global().resolve(&sel).await {
                 Ok(persona) => {
@@ -3455,23 +3596,25 @@ async fn handle_webhook(
                     let err = serde_json::json!({
                         "error": "Tenant resolution unavailable; retry later"
                     });
-                    return (StatusCode::SERVICE_UNAVAILABLE, Json(err));
+                    return Err((StatusCode::SERVICE_UNAVAILABLE, err));
                 }
             }
         }
         Err(reason) => {
             let err = serde_json::json!({ "error": reason });
-            return (StatusCode::BAD_REQUEST, Json(err));
+            return Err((StatusCode::BAD_REQUEST, err));
         }
     };
 
     // ── Idempotency (optional, v0.8.5 helper with namespaced key) ──
-    if !has_matching_sop && let Some(response) = check_webhook_idempotency(&state, &headers, None) {
-        return response;
+    if !has_matching_sop
+        && let Some((status, Json(body))) = check_webhook_idempotency(state, headers, None)
+    {
+        return Err((status, body));
     }
 
     let message = &webhook_body.message;
-    let session_id = webhook_session_id(&headers);
+    let session_id = webhook_session_id(headers);
 
     // Cerveau: install-wide autosave is skipped for tenant turns — the
     // turn's own tenant-jailed memory handles conversation storage, and
@@ -3542,20 +3685,50 @@ async fn handle_webhook(
                     "error": "This instance is at capacity. Please retry shortly.",
                     "retry_after": retry_after,
                 });
-                return (StatusCode::SERVICE_UNAVAILABLE, Json(err));
+                return Err((StatusCode::SERVICE_UNAVAILABLE, err));
             }
         }
     } else {
         None
     };
 
+    Ok(WebhookPrelude {
+        message: message.clone(),
+        session_id,
+        agent_override: agent_override.map(str::to_string),
+        tenant_ctx,
+        model_label,
+        _admission_permit,
+    })
+}
+
+async fn handle_webhook(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<WebhookQuery>,
+    headers: HeaderMap,
+    body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    let prelude = match webhook_prelude(&state, peer_addr, &query, &headers, body).await {
+        Ok(p) => p,
+        Err((status, err)) => return (status, Json(err)),
+    };
+    let WebhookPrelude {
+        message,
+        session_id,
+        agent_override,
+        tenant_ctx,
+        model_label,
+        _admission_permit,
+    } = prelude;
+
     let started_at = Instant::now();
 
     match run_gateway_chat_with_tools(
         &state,
-        message,
+        &message,
         session_id.as_deref(),
-        agent_override,
+        agent_override.as_deref(),
         tenant_ctx,
     )
     .await
@@ -3630,6 +3803,125 @@ async fn handle_webhook(
             }
         }
     }
+}
+
+/// POST /webhook/stream — tenant-aware Server-Sent-Events variant of
+/// `/webhook`. Same auth, tenant resolution, rate limiting, idempotency, and
+/// admission queue (via `webhook_prelude`) — the only difference is that the
+/// reply streams as it's generated instead of arriving as one blocking JSON
+/// body. Frame shapes on the wire:
+///   `data: {"type":"chunk","content":"..."}`      (zero or more)
+///   `data: {"type":"done","model":"...","pending_approval":...}`
+///   `data: {"type":"error","message":"..."}`      (instead of "done", on failure)
+/// Added for Cerveau's tenant-aware Console streaming webhook (2026-09-10).
+async fn handle_webhook_stream(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<WebhookQuery>,
+    headers: HeaderMap,
+    body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let prelude = match webhook_prelude(&state, peer_addr, &query, &headers, body).await {
+        Ok(p) => p,
+        Err((status, err)) => return (status, Json(err)).into_response(),
+    };
+    let WebhookPrelude {
+        message,
+        session_id,
+        agent_override,
+        tenant_ctx,
+        model_label,
+        _admission_permit,
+    } = prelude;
+
+    // Two channels: `event_tx`/`event_rx` carry raw `TurnEvent`s out of the
+    // turn (same mechanism `Agent::turn_streamed` uses for `/ws/chat`);
+    // `frame_tx`/`frame_rx` carry the already-SSE-shaped JSON frames this
+    // handler's response body reads from. Kept separate so the background
+    // task below is the only place that has to know how a `TurnEvent` maps
+    // to a wire frame.
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+    let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
+
+    let state_bg = state.clone();
+    tokio::spawn(async move {
+        // Moved in, not dropped, until this task (i.e. the whole turn) ends —
+        // see `WebhookPrelude::_admission_permit`'s doc.
+        let _permit = _admission_permit;
+
+        let turn_fut = run_gateway_chat_with_tools_streamed(
+            &state_bg,
+            &message,
+            session_id.as_deref(),
+            agent_override.as_deref(),
+            tenant_ctx,
+            event_tx,
+        );
+
+        // Drains `event_rx` concurrently with the turn future, mirroring
+        // `ws.rs`'s `process_chat_message` forward loop — the turn holds the
+        // sender and only returns once it's fully done, so both futures
+        // must run together, not sequentially.
+        let forward_fut = async {
+            while let Some(event) = event_rx.recv().await {
+                if let zeroclaw_api::agent::TurnEvent::Chunk { delta } = event {
+                    let frame = serde_json::json!({ "type": "chunk", "content": delta });
+                    if frame_tx.send(frame).await.is_err() {
+                        // Client disconnected — stop forwarding, but let the
+                        // turn itself run to completion (same as `/ws/chat`,
+                        // which doesn't cancel on a dropped sink either).
+                        break;
+                    }
+                }
+                // Other `TurnEvent` variants (tool calls, thinking, usage,
+                // approval requests, plan): not surfaced to Console today —
+                // kept to a minimal superset of the blocking `/webhook`
+                // contract (`response` + `pending_approval`) rather than
+                // guessing at a richer wire format nothing consumes yet.
+            }
+        };
+
+        let (turn_result, ()) = tokio::join!(turn_fut, forward_fut);
+
+        let done = match turn_result {
+            Ok(GatewayChatOutcome {
+                pending_approval, ..
+            }) => serde_json::json!({
+                "type": "done",
+                "model": model_label,
+                "pending_approval": pending_approval,
+            }),
+            Err(e) => {
+                let sanitized = zeroclaw_providers::sanitize_api_error(&e.to_string());
+                if is_needs_quickstart_err(&e) {
+                    serde_json::json!({ "type": "error", "message": "needs_quickstart" })
+                } else {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": sanitized})),
+                        "webhook/stream model_provider error"
+                    );
+                    serde_json::json!({ "type": "error", "message": "LLM request failed" })
+                }
+            }
+        };
+        // Best-effort: if the receiver's gone (client disconnected), there's
+        // nothing left to notify.
+        let _ = frame_tx.send(done).await;
+    });
+
+    use tokio_stream::StreamExt as _;
+    let sse_stream = tokio_stream::wrappers::ReceiverStream::new(frame_rx).map(|frame| {
+        Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(frame.to_string()))
+    });
+
+    axum::response::sse::Sse::new(sse_stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 /// `WhatsApp` verification query params
