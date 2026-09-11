@@ -295,6 +295,46 @@ impl AgentTaskLedger {
         Ok(())
     }
 
+    /// Fetch one task by id, scoped to `tenant_id` so one tenant can never
+    /// read another's row by guessing a UUID. `None` if it doesn't exist or
+    /// belongs to a different tenant -- same not-found shape either way, so
+    /// this can't be used to probe for other tenants' task ids.
+    pub async fn get_task(&self, tenant_id: &str, task_id: &str) -> Result<Option<AgentTask>> {
+        let client = Arc::clone(self.client.get());
+        let schema = self.schema.clone();
+        let tenant_id = tenant_id.to_string();
+        let task_id = task_id.to_string();
+        run_on_os_thread(move || -> Result<Option<AgentTask>> {
+            let mut client = client.lock();
+            let row = client.query_opt(
+                &format!(
+                    r#"SELECT task_id, tenant_id, agent_type, session_id, title, status,
+                              priority, blocked_reason, created_at, updated_at
+                       FROM "{schema}".agent_tasks
+                       WHERE task_id = $1 AND tenant_id = $2"#
+                ),
+                &[&task_id, &tenant_id],
+            )?;
+            Ok(row.map(|row| {
+                let status_raw: String = row.get(5);
+                let priority_raw: String = row.get(6);
+                AgentTask {
+                    task_id: row.get(0),
+                    tenant_id: row.get(1),
+                    agent_type: row.get(2),
+                    session_id: row.get(3),
+                    title: row.get(4),
+                    status: TaskStatus::parse(&status_raw).unwrap_or(TaskStatus::Todo),
+                    priority: TaskPriority::parse(&priority_raw).unwrap_or(TaskPriority::Normal),
+                    blocked_reason: row.get(7),
+                    created_at: row.get(8),
+                    updated_at: row.get(9),
+                }
+            }))
+        })
+        .await
+    }
+
     /// List a tenant+agent-type's tasks, optionally filtered to one status.
     /// Ordered newest-updated-first so an agent's most recent state change
     /// surfaces first at session start.

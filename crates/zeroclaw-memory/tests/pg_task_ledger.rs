@@ -7,9 +7,10 @@
 //!
 //! Proven: create starts a task in `todo`; update_status moves it and
 //! stores `blocked_reason`; a status filter on `list_tasks` only returns
-//! matching rows; one tenant can never update another tenant's task even
-//! by guessing its id; a done task is never deleted (it just stops showing
-//! up under a `todo`/`in_progress`/`blocked` filter).
+//! matching rows; get_task fetches the same row by id, tenant-scoped; one
+//! tenant can never update or fetch another tenant's task even by
+//! guessing its id; a done task is never deleted (it just stops showing up
+//! under a `todo`/`in_progress`/`blocked` filter).
 
 #![cfg(feature = "memory-postgres")]
 
@@ -101,6 +102,26 @@ async fn task_ledger_end_to_end() {
     assert!(
         todo.is_empty(),
         "task moved out of todo must not still show up under a todo filter"
+    );
+
+    // ── Scenario 2b: get_task fetches the same row by id, tenant-scoped ──
+    let fetched = ledger
+        .get_task("tenant-a", &task_id)
+        .await
+        .expect("get_task")
+        .expect("task must exist");
+    assert_eq!(fetched.status, TaskStatus::Blocked);
+    assert_eq!(
+        fetched.blocked_reason.as_deref(),
+        Some("waiting on operator approval to send")
+    );
+    assert!(
+        ledger
+            .get_task("tenant-b", &task_id)
+            .await
+            .expect("get_task cross-tenant")
+            .is_none(),
+        "tenant-b must not be able to fetch tenant-a's task by id"
     );
 
     // ── Scenario 3: tenant isolation — another tenant can't touch this task ──

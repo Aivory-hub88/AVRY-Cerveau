@@ -141,8 +141,23 @@ impl Tool for TaskCreateTool {
 /// Move a tracked task to a new status. The only way a task's state
 /// changes -- there is no delete; a task reaching 'done' just stops
 /// showing up in a `todo`/`in_progress`/`blocked` listing.
+///
+/// **Notification, on transition into `blocked`/`done` only.** Posts to
+/// avry-backend's existing `/api/v1/agent-actions/internal` (the same
+/// endpoint `lead`/`ticket`/`invoice`/... already go through, action_type
+/// `"task"`) so the operator sees it in the dashboard's Agent Activity feed
+/// without reading a transcript. `notify` is the avry-backend
+/// `(base_url, token)` seam, resolved once by the caller the same way
+/// tenant identity is (see the module doc) -- `zeroclaw-tools` cannot read
+/// `zeroclaw_runtime::cron::tenant_sync::backend()` itself. `None` when the
+/// seam isn't configured on this host -- the tool still works, it just
+/// stays local like it always has. Fire-and-forget in spirit even though
+/// it's awaited inline: any failure (unreachable backend, non-2xx) is
+/// logged and swallowed, never turns a successful status update into a
+/// failed tool call.
 pub struct TaskUpdateStatusTool {
     ctx: TaskLedgerContext,
+    notify: Option<(String, String)>,
 }
 
 impl TaskUpdateStatusTool {
@@ -151,6 +166,7 @@ impl TaskUpdateStatusTool {
         tenant_id: String,
         agent_type: String,
         session_id: Option<String>,
+        notify: Option<(String, String)>,
     ) -> Self {
         Self {
             ctx: TaskLedgerContext {
@@ -159,6 +175,66 @@ impl TaskUpdateStatusTool {
                 agent_type,
                 session_id,
             },
+            notify,
+        }
+    }
+}
+
+fn notify_client() -> reqwest::Client {
+    zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+        "tool.task_update_status",
+        15,
+        5,
+    )
+}
+
+/// Best-effort report of one blocked/done transition to avry-backend's
+/// Agent Activity feed. `task` is the freshly-updated row (fetched by the
+/// caller right after the write, so the payload reflects what was actually
+/// stored, not just the raw tool args). Never returns an error -- see the
+/// struct doc for why a notify failure must not surface as a tool failure.
+async fn notify_agent_action(
+    base_url: &str,
+    token: &str,
+    ctx: &TaskLedgerContext,
+    task: &zeroclaw_memory::task_ledger::AgentTask,
+) {
+    let payload = json!({
+        "task_id": task.task_id,
+        "title": task.title,
+        "status": task.status.as_str(),
+        "blocked_reason": task.blocked_reason,
+    });
+    let body = json!({
+        "user_id": ctx.tenant_id,
+        "agent_type": ctx.agent_type,
+        "action_type": "task",
+        "payload": payload,
+        "session_id": ctx.session_id,
+    });
+    let res = notify_client()
+        .post(format!("{base_url}/api/v1/agent-actions/internal"))
+        .header("X-Internal-Token", token)
+        .json(&body)
+        .send()
+        .await;
+    match res {
+        Ok(r) if r.status().is_success() => {}
+        Ok(r) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_attrs(::serde_json::json!({ "status": r.status().as_u16() })),
+                "task_update_status: agent-actions notify rejected by avry-backend"
+            );
+        }
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_attrs(::serde_json::json!({ "error": e.to_string() })),
+                "task_update_status: could not reach avry-backend to notify agent-actions"
+            );
         }
     }
 }
@@ -242,14 +318,25 @@ impl Tool for TaskUpdateStatusTool {
             .update_status(&self.ctx.tenant_id, task_id, status, blocked_reason)
             .await
         {
-            Ok(()) => Ok(ToolResult {
-                success: true,
-                output: ToolOutput::text(format!(
-                    "Task {task_id} is now {}",
-                    status.as_str()
-                )),
-                error: None,
-            }),
+            Ok(()) => {
+                if matches!(status, TaskStatus::Blocked | TaskStatus::Done) {
+                    if let Some((base_url, token)) = &self.notify {
+                        if let Ok(Some(task)) =
+                            self.ctx.ledger.get_task(&self.ctx.tenant_id, task_id).await
+                        {
+                            notify_agent_action(base_url, token, &self.ctx, &task).await;
+                        }
+                    }
+                }
+                Ok(ToolResult {
+                    success: true,
+                    output: ToolOutput::text(format!(
+                        "Task {task_id} is now {}",
+                        status.as_str()
+                    )),
+                    error: None,
+                })
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
