@@ -726,6 +726,7 @@ pub fn all_tools_with_runtime(
             tenant.platform_user_id.clone(),
             tenant.agent_type.clone(),
             session_id.clone(),
+            crate::cron::tenant_sync::backend(),
         )));
         tool_arcs.push(Arc::new(TaskListTool::new(
             ledger,
