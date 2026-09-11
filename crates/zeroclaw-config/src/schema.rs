@@ -573,6 +573,12 @@ pub struct Config {
     #[group = "Tools"]
     pub capability_graph: CapabilityGraphConfig,
 
+    /// Agent Task Ledger: per-tenant task lifecycle tracking (`[agent_tasks]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Tools"]
+    pub agent_tasks: AgentTasksConfig,
+
     /// Dynamic node discovery configuration (`[nodes]`).
     #[serde(default)]
     #[nested]
@@ -5371,6 +5377,37 @@ pub struct CapabilityGraphConfig {
 impl Default for CapabilityGraphConfig {
     fn default() -> Self {
         Self { enabled: false }
+    }
+}
+
+/// Agent Task Ledger (`[agent_tasks]` section): a deterministic per-tenant
+/// task list (`task_create`/`task_update_status`/`task_list`) an agent
+/// keeps on itself, independent of conversation length or which session is
+/// currently open. See the Agent Task Ledger PRD/TRD for the full
+/// motivation. Requires `memory.backend = "postgres"` (the ledger reuses
+/// that same Postgres instance + schema, same as `[capability_graph]`);
+/// silently inert otherwise. Default `true` — unlike the capability graph
+/// (an experimental reranking signal), the task ledger is core session-
+/// recall infrastructure, safe to turn on everywhere Postgres memory is
+/// already active.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "agent_tasks"]
+pub struct AgentTasksConfig {
+    /// Enable the agent task ledger. Requires `memory.backend = "postgres"`;
+    /// silently inert otherwise. Default `true`.
+    #[tab(Settings)]
+    #[serde(default = "default_agent_tasks_enabled")]
+    pub enabled: bool,
+}
+
+fn default_agent_tasks_enabled() -> bool {
+    true
+}
+
+impl Default for AgentTasksConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -12288,6 +12325,13 @@ pub fn default_auto_approve() -> Vec<String> {
         "tool_search".into(),
         "browser".into(),
         "browser_open".into(),
+        // Agent Task Ledger: a task moving to 'blocked' is itself the
+        // safety mechanism (it stops and surfaces to the operator), not
+        // something that itself needs approval gating — see the Agent Task
+        // Ledger PRD/TRD's config-wiring section.
+        "task_create".into(),
+        "task_update_status".into(),
+        "task_list".into(),
     ]
 }
 
@@ -18631,6 +18675,7 @@ impl Default for Config {
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             capability_graph: CapabilityGraphConfig::default(),
+            agent_tasks: AgentTasksConfig::default(),
             nodes: NodesConfig::default(),
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
@@ -27419,6 +27464,7 @@ auto_save = true
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             capability_graph: CapabilityGraphConfig::default(),
+            agent_tasks: AgentTasksConfig::default(),
             nodes: NodesConfig::default(),
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
@@ -28297,6 +28343,7 @@ default_temperature = 0.7
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
             capability_graph: CapabilityGraphConfig::default(),
+            agent_tasks: AgentTasksConfig::default(),
             nodes: NodesConfig::default(),
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),

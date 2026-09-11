@@ -83,6 +83,8 @@ pub mod report_templates;
 pub mod screenshot;
 pub mod send_via;
 pub mod sessions;
+#[cfg(feature = "memory-postgres")]
+pub mod task_ledger;
 pub mod text_browser;
 pub mod tool_search;
 pub mod weather_tool;
@@ -98,6 +100,18 @@ pub const MEMORY_TOOL_NAMES: &[&str] = &[
     "memory_export",
     "memory_purge",
 ];
+
+/// Agent Task Ledger tool names (`task_ledger.rs`). Unlike
+/// `MEMORY_TOOL_NAMES`'s guard test below, these can't be construction-
+/// checked against a live `Tool::name()` call here: every task-ledger tool
+/// needs an `Arc<AgentTaskLedger>`, and `AgentTaskLedger::connect` is an
+/// async call against a real Postgres instance (no in-process no-op
+/// backend like `NoneMemory` exists for it) — see
+/// `crates/zeroclaw-memory/tests/pg_task_ledger.rs` for the tests that do
+/// exercise a live ledger. Keep this list in sync with `task_ledger.rs`'s
+/// three `Tool::name()` impls by hand.
+#[cfg(feature = "memory-postgres")]
+pub const TASK_TOOL_NAMES: &[&str] = &["task_create", "task_update_status", "task_list"];
 
 #[cfg(test)]
 mod memory_tool_names_guard {

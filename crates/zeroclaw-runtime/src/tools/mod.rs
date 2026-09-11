@@ -111,6 +111,8 @@ pub use zeroclaw_tools::sessions::{
     SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
     SessionsListTool, SessionsSendTool,
 };
+#[cfg(feature = "memory-postgres")]
+pub use zeroclaw_tools::task_ledger::{TaskCreateTool, TaskListTool, TaskUpdateStatusTool};
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
 pub use zeroclaw_tools::tool_search::ToolSearchTool;
 pub use zeroclaw_tools::weather_tool::WeatherTool;
@@ -696,6 +698,40 @@ pub fn all_tools_with_runtime(
             cognee_cfg,
             tenant.platform_user_id.clone(),
             tenant.agent_type.clone(),
+        )));
+    }
+
+    // Agent Task Ledger: task_create/task_update_status/task_list. Gated on
+    // BOTH an installed process-wide ledger (`[agent_tasks].enabled = true`
+    // AND a live Postgres memory backend — see `main.rs`'s startup install)
+    // AND a live tenant context, same shape as graph_remember/graph_recall
+    // just above — a task row is meaningless without a tenant+agent_type to
+    // scope it to. `current_task_ledger()`/`current_tenant()` are read
+    // here, not inside the tools, for the same crate-dependency-direction
+    // reason documented on `graph_memory.rs`.
+    #[cfg(feature = "memory-postgres")]
+    if let Some(ledger) = zeroclaw_memory::task_ledger::current_task_ledger()
+        && let Some(tenant) = crate::agent::tenant::current_tenant()
+    {
+        let session_id = crate::agent::tenant::current_turn_origin()
+            .and_then(|origin| origin.session_id.clone());
+        tool_arcs.push(Arc::new(TaskCreateTool::new(
+            ledger.clone(),
+            tenant.platform_user_id.clone(),
+            tenant.agent_type.clone(),
+            session_id.clone(),
+        )));
+        tool_arcs.push(Arc::new(TaskUpdateStatusTool::new(
+            ledger.clone(),
+            tenant.platform_user_id.clone(),
+            tenant.agent_type.clone(),
+            session_id.clone(),
+        )));
+        tool_arcs.push(Arc::new(TaskListTool::new(
+            ledger,
+            tenant.platform_user_id.clone(),
+            tenant.agent_type.clone(),
+            session_id,
         )));
     }
 

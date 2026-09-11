@@ -69,6 +69,8 @@ use crate::sessions::{
     SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
     SessionsListTool, SessionsSendTool,
 };
+#[cfg(feature = "memory-postgres")]
+use crate::task_ledger::{TaskCreateTool, TaskListTool, TaskUpdateStatusTool};
 use crate::text_browser::TextBrowserTool;
 use crate::tool_search::ToolSearchTool;
 use crate::weather_tool::WeatherTool;
@@ -141,6 +143,12 @@ tool_attribution!(SessionsCurrentTool, ToolKind::Plugin);
 tool_attribution!(SessionsHistoryTool, ToolKind::Plugin);
 tool_attribution!(SessionsListTool, ToolKind::Plugin);
 tool_attribution!(SessionsSendTool, ToolKind::Plugin);
+#[cfg(feature = "memory-postgres")]
+tool_attribution!(TaskCreateTool, ToolKind::Memory);
+#[cfg(feature = "memory-postgres")]
+tool_attribution!(TaskUpdateStatusTool, ToolKind::Memory);
+#[cfg(feature = "memory-postgres")]
+tool_attribution!(TaskListTool, ToolKind::Memory);
 tool_attribution!(TextBrowserTool, ToolKind::Plugin);
 tool_attribution!(ToolSearchTool, ToolKind::Search);
 tool_attribution!(WeatherTool, ToolKind::Plugin);

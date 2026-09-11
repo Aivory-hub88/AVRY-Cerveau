@@ -4544,6 +4544,57 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     }
                 }
 
+                // Agent Task Ledger: install the process-wide ledger when
+                // `[agent_tasks].enabled = true` (default) and the active
+                // memory backend is Postgres — same gating shape as the
+                // capability graph above, reusing that same db_url/schema.
+                // Idempotent (OnceLock inside `install_task_ledger`);
+                // absent or misconfigured, `task_create`/`task_update_status`/
+                // `task_list` simply never get constructed into a turn's
+                // tool set (see `all_tools_with_runtime`).
+                #[cfg(feature = "memory-postgres")]
+                if current_config.agent_tasks.enabled {
+                    match current_config.resolve_active_storage() {
+                        zeroclaw_config::schema::ActiveStorage::Postgres(pg)
+                            if pg.db_url.as_deref().is_some_and(|u| !u.trim().is_empty()) =>
+                        {
+                            let db_url = pg.db_url.clone().unwrap_or_default();
+                            let schema = pg.schema.clone();
+                            match zeroclaw_memory::task_ledger::AgentTaskLedger::connect(
+                                &db_url, &schema,
+                            )
+                            .await
+                            {
+                                Ok(ledger) => {
+                                    zeroclaw_memory::task_ledger::install_task_ledger(
+                                        std::sync::Arc::new(ledger),
+                                    );
+                                }
+                                Err(e) => {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Fail
+                                        )
+                                        .with_attrs(::serde_json::json!({ "error": e.to_string() })),
+                                        "agent_tasks.enabled=true but connecting failed; \
+                                         task_create/task_update_status/task_list stay off this boot"
+                                    );
+                                }
+                            }
+                        }
+                        _ => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip),
+                                "agent_tasks.enabled=true but memory.backend is not a \
+                                 configured Postgres storage; skipping"
+                            );
+                        }
+                    }
+                }
+
                 let exit = Box::pin(daemon::run(
                     current_config.clone(),
                     host.clone(),

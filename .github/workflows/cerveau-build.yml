@@ -82,6 +82,12 @@ jobs:
         run: |
           cargo test --locked -p zeroclaw-memory --features memory-postgres --test pg_capability_graph -- --test-threads=1
           cargo test --locked -p zeroclaw-memory --features memory-postgres capability_graph::
+      - name: Agent task ledger (Postgres) tests
+        env:
+          RUST_BACKTRACE: full
+        run: |
+          cargo test --locked -p zeroclaw-memory --features memory-postgres --test pg_task_ledger -- --test-threads=1
+          cargo test --locked -p zeroclaw-memory --features memory-postgres task_ledger::
 
   # ── Redis-dependent tests (ADR-005)
   redis-tests:

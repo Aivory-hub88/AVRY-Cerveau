@@ -42,6 +42,8 @@ pub mod retrieval;
 pub mod scanned;
 pub mod snapshot;
 pub mod sqlite;
+#[cfg(feature = "memory-postgres")]
+pub mod task_ledger;
 pub mod threat;
 pub mod traits;
 pub mod vector;
