@@ -110,6 +110,7 @@ pub use zeroclaw_tools::screenshot::ScreenshotTool;
 pub use zeroclaw_tools::send_via::{
     AgentPeerGroupResolver, SendViaTool, TURN_ROUTING, TurnRoutingHandle,
 };
+pub use zeroclaw_tools::session_search::SessionSearchTool;
 pub use zeroclaw_tools::sessions::{
     SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
     SessionsListTool, SessionsSendTool,
@@ -933,6 +934,7 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryExportTool::new(memory.clone())),
         Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone())),
+        Arc::new(SessionSearchTool::new(memory.clone())),
         Arc::new(ScheduleTool::new_with_runtime(
             security.clone(),
             root_config.clone(),

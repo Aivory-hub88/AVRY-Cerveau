@@ -65,6 +65,7 @@ use crate::reaction::ReactionTool;
 use crate::report_template_tool::ReportTemplateTool;
 use crate::screenshot::ScreenshotTool;
 use crate::send_via::SendViaTool;
+use crate::session_search::SessionSearchTool;
 use crate::sessions::{
     SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
     SessionsListTool, SessionsSendTool,
@@ -137,6 +138,7 @@ tool_attribution!(ReactionTool, ToolKind::Plugin);
 tool_attribution!(ReportTemplateTool, ToolKind::Plugin);
 tool_attribution!(ScreenshotTool, ToolKind::Plugin);
 tool_attribution!(SendViaTool, ToolKind::Plugin);
+tool_attribution!(SessionSearchTool, ToolKind::Memory);
 tool_attribution!(SessionDeleteTool, ToolKind::Plugin);
 tool_attribution!(SessionResetTool, ToolKind::Plugin);
 tool_attribution!(SessionsCurrentTool, ToolKind::Plugin);

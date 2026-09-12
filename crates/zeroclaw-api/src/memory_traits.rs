@@ -702,6 +702,37 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     async fn ensure_agent_uuid(&self, alias: &str) -> anyhow::Result<String> {
         Ok(alias.to_string())
     }
+
+    /// Search only raw conversation turns (autosaved user/assistant messages
+    /// stored under `MemoryCategory::Conversation`), verbatim -- not the
+    /// LLM-distilled episodic summaries `recall()` also returns.
+    ///
+    /// This exists because `recall()` mixes curated facts and raw turns
+    /// together with no way for a caller to ask for "just what was actually
+    /// said" -- useful when an exact phrase or figure (an invoice number, a
+    /// precise quote) needs to be found rather than gisted.
+    ///
+    /// Default impl: fetch broadly via `recall()` and filter client-side to
+    /// `MemoryCategory::Conversation`, so existing backends don't need to
+    /// implement anything to get correct (if less efficient) behavior.
+    /// Backends with an indexed `category` column (e.g. PostgresMemory)
+    /// should override this with a native, indexed query.
+    async fn recall_conversation(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        // Over-fetch before filtering client-side, since an unknown fraction
+        // of the unfiltered top-`limit` results won't be Conversation rows.
+        let over_fetch = limit.saturating_mul(4).max(limit).min(500);
+        let mut entries = self.recall(query, over_fetch, session_id, since, until).await?;
+        entries.retain(|e| matches!(e.category, MemoryCategory::Conversation));
+        entries.truncate(limit);
+        Ok(entries)
+    }
 }
 
 /// High-level memory lifecycle policy.
