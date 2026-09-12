@@ -25,7 +25,7 @@ impl Tool for MemoryStoreTool {
     }
 
     fn description(&self) -> &str {
-        "Store a fact, preference, or note in long-term memory. Use category 'core' for permanent facts, 'daily' for session notes, 'conversation' for chat context, or a custom category name."
+        "Store a fact, preference, or note in long-term memory. Use category 'core' for permanent facts, 'daily' for session notes, 'conversation' for chat context, or a custom category name. For a fact involving a relationship between people, organizations, or entities (e.g. 'who works with whom', 'who previously worked at X') that may need multi-hop lookup later, prefer graph_remember instead when it's available."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

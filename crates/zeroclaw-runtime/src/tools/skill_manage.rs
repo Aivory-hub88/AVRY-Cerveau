@@ -529,24 +529,58 @@ impl SkillManageTool {
                 // history for later multi-hop queries ("which skills changed
                 // because of a Stripe rate-limit issue"), not a requirement
                 // for the improvement to count.
-                if let Some((cognee_cfg, tenant_id, agent_type)) = &self.cognee {
-                    let text =
-                        format!("Skill '{slug}' was improved. Reason: {reason}");
-                    if let Err(e) = zeroclaw_tools::graph_memory::remember(
-                        cognee_cfg, tenant_id, agent_type, &text,
-                    )
-                    .await
-                    {
+                //
+                // Every outcome is logged (skip/success/failure), not just
+                // failure -- this path was previously unobservable end to
+                // end: there was no way to tell "graph logging never
+                // applies here" from "it should have fired but didn't".
+                match &self.cognee {
+                    None => {
                         ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
                                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                                 .with_attrs(::serde_json::json!({
                                     "slug": slug,
-                                    "error": e.to_string(),
+                                    "reason": "cognee_disabled_or_no_tenant_context",
                                 })),
-                            "skill improvement graph-log failed (non-fatal)"
+                            "skill improvement graph-log skipped: no cognee context"
                         );
+                    }
+                    Some((cognee_cfg, tenant_id, agent_type)) => {
+                        let text =
+                            format!("Skill '{slug}' was improved. Reason: {reason}");
+                        match zeroclaw_tools::graph_memory::remember(
+                            cognee_cfg, tenant_id, agent_type, &text,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                ::zeroclaw_log::record!(
+                                    INFO,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                                        .with_attrs(::serde_json::json!({
+                                            "slug": slug,
+                                            "agent_type": agent_type,
+                                        })),
+                                    "skill improvement graph-logged"
+                                );
+                            }
+                            Err(e) => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(::serde_json::json!({
+                                            "slug": slug,
+                                            "agent_type": agent_type,
+                                            "error": e.to_string(),
+                                        })),
+                                    "skill improvement graph-log failed (non-fatal)"
+                                );
+                            }
+                        }
                     }
                 }
 
