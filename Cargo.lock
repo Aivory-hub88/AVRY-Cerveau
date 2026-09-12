@@ -14284,6 +14284,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "filetime",
+ "flate2",
  "parking_lot",
  "pgvector",
  "postgres",
