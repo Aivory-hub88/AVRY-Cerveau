@@ -38,6 +38,65 @@ pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn T
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
 }
 
+/// ADR-013 Phase 1 cheap gate: record a tool-call failure or a successful
+/// `escalate_to_human` as a `skill_insights` row. This is the single
+/// chokepoint every tool call in a live turn passes through
+/// (`execute_one_tool`), so it doubles as the natural place to hook the
+/// gate rather than special-casing `escalate_to_human` with a second
+/// insertion point elsewhere.
+///
+/// Best-effort and fire-and-forget: absent ledger, absent tenant context
+/// (host/internal turns have none), or a write failure are all silent
+/// no-ops from the caller's point of view — this must never add latency or
+/// a failure mode to the tool loop it's observing.
+#[cfg(feature = "memory-postgres")]
+fn maybe_record_skill_insight(call_name: &str, outcome: &Result<ToolExecutionOutcome>) {
+    use zeroclaw_memory::skill_insight_ledger::InsightSource;
+
+    let Ok(out) = outcome else { return };
+    let source = if call_name == "escalate_to_human" && out.success {
+        InsightSource::Escalation
+    } else if !out.success {
+        InsightSource::ToolFailure
+    } else {
+        return;
+    };
+    let Some(ledger) = zeroclaw_memory::skill_insight_ledger::current_skill_insight_ledger()
+    else {
+        return;
+    };
+    let Some(tenant) = crate::agent::tenant::current_tenant() else {
+        return;
+    };
+    let session_id = super::tenant::current_turn_origin().and_then(|o| o.session_id.clone());
+    let signal = match source {
+        InsightSource::Escalation => "escalate_to_human invoked".to_string(),
+        InsightSource::ToolFailure => format!(
+            "tool '{call_name}' failed: {}",
+            out.error_reason.as_deref().unwrap_or("(no reason given)")
+        ),
+    };
+    let tenant_id = tenant.platform_user_id.clone();
+    let agent_type = tenant.agent_type.clone();
+    tokio::spawn(async move {
+        if let Err(e) = ledger
+            .create_insight(&tenant_id, &agent_type, session_id.as_deref(), source, &signal)
+            .await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "error": e.to_string() })),
+                "skill insight write failed (non-fatal)"
+            );
+        }
+    });
+}
+
+#[cfg(not(feature = "memory-postgres"))]
+fn maybe_record_skill_insight(_call_name: &str, _outcome: &Result<ToolExecutionOutcome>) {}
+
 // ── Hallucinated tool-name repair ───────────────────────────────────────
 //
 // Models occasionally emit a tool name that is close to, but not exactly,
@@ -586,6 +645,8 @@ pub(crate) async fn execute_one_tool(
             }
         }
     };
+
+    maybe_record_skill_insight(call_name, &outcome);
 
     if let Some(tx) = event_tx
         && let Ok(out) = &outcome

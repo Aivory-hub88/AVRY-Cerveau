@@ -579,6 +579,12 @@ pub struct Config {
     #[group = "Tools"]
     pub agent_tasks: AgentTasksConfig,
 
+    /// Skill Insight Ledger: tenant-facing self-evolution cheap gate (`[skill_insights]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Tools"]
+    pub skill_insights: SkillInsightsConfig,
+
     /// Dynamic node discovery configuration (`[nodes]`).
     #[serde(default)]
     #[nested]
@@ -5408,6 +5414,34 @@ fn default_agent_tasks_enabled() -> bool {
 impl Default for AgentTasksConfig {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+/// Skill Insight Ledger (`[skill_insights]` section) — ADR-013 Phase 1: the
+/// "cheap gate" of a tenant-facing self-evolution pipeline. Records one row
+/// per tool-call failure or `escalate_to_human` firing during a tenant
+/// turn, into its own `skill_insights` table (same Postgres instance as
+/// `[agent_tasks]`/`[capability_graph]`; silently inert otherwise). Phase 1
+/// is observation only — nothing yet reads these rows to synthesize a
+/// finding or generate a skill. Default `false`, unlike `[agent_tasks]`:
+/// this is a new, unproven signal, not core session-recall infrastructure,
+/// so it stays opt-in until Phase 1's real signal-frequency data says it's
+/// worth turning on broadly.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "skill_insights"]
+pub struct SkillInsightsConfig {
+    /// Enable the skill insight ledger's cheap-gate instrumentation.
+    /// Requires `memory.backend = "postgres"`; silently inert otherwise.
+    /// Default `false`.
+    #[tab(Settings)]
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Default for SkillInsightsConfig {
+    fn default() -> Self {
+        Self { enabled: false }
     }
 }
 
@@ -18676,6 +18710,7 @@ impl Default for Config {
             mcp: McpConfig::default(),
             capability_graph: CapabilityGraphConfig::default(),
             agent_tasks: AgentTasksConfig::default(),
+            skill_insights: SkillInsightsConfig::default(),
             nodes: NodesConfig::default(),
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
@@ -27465,6 +27500,7 @@ auto_save = true
             mcp: McpConfig::default(),
             capability_graph: CapabilityGraphConfig::default(),
             agent_tasks: AgentTasksConfig::default(),
+            skill_insights: SkillInsightsConfig::default(),
             nodes: NodesConfig::default(),
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
@@ -28344,6 +28380,7 @@ default_temperature = 0.7
             mcp: McpConfig::default(),
             capability_graph: CapabilityGraphConfig::default(),
             agent_tasks: AgentTasksConfig::default(),
+            skill_insights: SkillInsightsConfig::default(),
             nodes: NodesConfig::default(),
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),

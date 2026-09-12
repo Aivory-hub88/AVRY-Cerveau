@@ -41,6 +41,8 @@ pub mod response_cache;
 pub mod retrieval;
 pub mod scanned;
 pub mod snapshot;
+#[cfg(feature = "memory-postgres")]
+pub mod skill_insight_ledger;
 pub mod sqlite;
 #[cfg(feature = "memory-postgres")]
 pub mod task_ledger;

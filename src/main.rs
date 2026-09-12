@@ -4598,6 +4598,58 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     }
                 }
 
+                // Skill Insight Ledger (ADR-013 Phase 1): install the
+                // process-wide ledger when `[skill_insights].enabled = true`
+                // (default false) and the active memory backend is Postgres
+                // — same gating shape as the task ledger above, reusing that
+                // same db_url/schema. Idempotent (OnceLock inside
+                // `install_skill_insight_ledger`); absent or misconfigured,
+                // the cheap-gate write site in `tool_execution.rs` simply
+                // finds `current_skill_insight_ledger()` returning `None`
+                // and no-ops.
+                #[cfg(feature = "memory-postgres")]
+                if current_config.skill_insights.enabled {
+                    match current_config.resolve_active_storage() {
+                        zeroclaw_config::schema::ActiveStorage::Postgres(pg)
+                            if pg.db_url.as_deref().is_some_and(|u| !u.trim().is_empty()) =>
+                        {
+                            let db_url = pg.db_url.clone().unwrap_or_default();
+                            let schema = pg.schema.clone();
+                            match zeroclaw_memory::skill_insight_ledger::AgentSkillInsightLedger::connect(
+                                &db_url, &schema,
+                            )
+                            .await
+                            {
+                                Ok(ledger) => {
+                                    zeroclaw_memory::skill_insight_ledger::install_skill_insight_ledger(
+                                        std::sync::Arc::new(ledger),
+                                    );
+                                }
+                                Err(e) => {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Fail
+                                        )
+                                        .with_attrs(::serde_json::json!({ "error": e.to_string() })),
+                                        "skill_insights.enabled=true but connecting failed; \
+                                         cheap-gate instrumentation stays off this boot"
+                                    );
+                                }
+                            }
+                        }
+                        _ => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip),
+                                "skill_insights.enabled=true but memory.backend is not a \
+                                 configured Postgres storage; skipping"
+                            );
+                        }
+                    }
+                }
+
                 let exit = Box::pin(daemon::run(
                     current_config.clone(),
                     host.clone(),
