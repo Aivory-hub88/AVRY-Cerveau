@@ -4566,9 +4566,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             .await
                             {
                                 Ok(ledger) => {
-                                    zeroclaw_memory::task_ledger::install_task_ledger(
-                                        std::sync::Arc::new(ledger),
-                                    );
+                                    let ledger = std::sync::Arc::new(ledger);
+                                    // Archive-retention sweep (40 days, see
+                                    // task_ledger.rs) — one background loop
+                                    // for the process lifetime.
+                                    ledger.spawn_archive_sweep();
+                                    zeroclaw_memory::task_ledger::install_task_ledger(ledger);
                                 }
                                 Err(e) => {
                                     ::zeroclaw_log::record!(
