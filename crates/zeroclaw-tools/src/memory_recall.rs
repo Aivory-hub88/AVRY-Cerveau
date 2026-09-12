@@ -23,7 +23,7 @@ impl Tool for MemoryRecallTool {
     }
 
     fn description(&self) -> &str {
-        "Search long-term memory for relevant facts, preferences, or context. Returns scored results ranked by relevance. Supports keyword search, recent recall with omitted query or bare '*', time-only query (since/until), or both."
+        "Search long-term memory for relevant facts, preferences, or context. Returns scored results ranked by relevance. Supports keyword search, recent recall with omitted query or bare '*', time-only query (since/until), or both. For a relationship or multi-hop question (e.g. 'who previously worked with the person who designed X'), prefer graph_recall instead when it's available -- this tool does plain keyword/semantic lookup only."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
