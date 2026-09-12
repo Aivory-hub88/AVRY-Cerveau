@@ -82,6 +82,7 @@ pub mod report_template_tool;
 pub mod report_templates;
 pub mod screenshot;
 pub mod send_via;
+pub mod session_search;
 pub mod sessions;
 #[cfg(feature = "memory-postgres")]
 pub mod task_ledger;
@@ -99,6 +100,7 @@ pub const MEMORY_TOOL_NAMES: &[&str] = &[
     "memory_forget",
     "memory_export",
     "memory_purge",
+    "session_search",
 ];
 
 /// Agent Task Ledger tool names (`task_ledger.rs`). Unlike
@@ -141,6 +143,7 @@ mod memory_tool_names_guard {
                 memory.clone(),
                 security.clone(),
             )),
+            Box::new(session_search::SessionSearchTool::new(memory.clone())),
         ];
         let actual: BTreeSet<&str> = tools.iter().map(|t| t.name()).collect();
         let listed: BTreeSet<&str> = MEMORY_TOOL_NAMES.iter().copied().collect();

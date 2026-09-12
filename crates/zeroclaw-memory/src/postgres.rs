@@ -265,6 +265,11 @@ impl PostgresMemory {
             CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON {qualified_table}(updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_memories_content_fts ON {qualified_table} USING gin(to_tsvector('simple', content));
             CREATE INDEX IF NOT EXISTS idx_memories_key_fts ON {qualified_table} USING gin(to_tsvector('simple', key));
+            -- Partial index scoped to raw conversation turns, for
+            -- `recall_conversation`'s verbatim-transcript search -- keeps
+            -- that query fast without widening the general-purpose indexes
+            -- above to carry rows `recall()`'s normal callers rarely want.
+            CREATE INDEX IF NOT EXISTS idx_memories_conversation_fts ON {qualified_table} USING gin(to_tsvector('simple', content)) WHERE category = 'conversation';
             "
         ))?;
 
@@ -631,6 +636,69 @@ impl Memory for PostgresMemory {
                 );
                 client.query(&stmt, &[&query, &sid, &limit_i64, &since_owned, &until_owned])?
             };
+            rows.iter()
+                .map(Self::row_to_entry)
+                .collect::<Result<Vec<MemoryEntry>>>()
+        })
+        .await
+    }
+
+    // Cerveau: native, indexed override of `recall_conversation` -- keyword
+    // search restricted to `category = 'conversation'` (raw autosaved user/
+    // assistant turns), using the partial GIN index added alongside the
+    // other FTS indexes in `init_schema`. Keyword-only (no embedding
+    // blending): this path exists for verbatim phrase/figure lookup, not
+    // semantic recall, so pgvector similarity would work against the intent.
+    async fn recall_conversation(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        let query = normalize_recent_recall_query(query).trim().to_string();
+        let client = self.client.get().clone();
+        let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let sid = session_id.map(str::to_string);
+        let since_owned = since.map(str::to_string);
+        let until_owned = until.map(str::to_string);
+
+        run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
+            let mut client = client.lock();
+
+            #[allow(clippy::cast_possible_wrap)]
+            let limit_i64 = limit as i64;
+
+            let stmt = format!(
+                "
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id,
+                       CASE WHEN q.tsq IS NOT NULL AND to_tsvector('simple', m.content) @@ q.tsq
+                         THEN ts_rank_cd(to_tsvector('simple', m.content), q.tsq)
+                         ELSE 0.0 END AS score
+                FROM {qualified_table} m
+                LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                CROSS JOIN (
+                  SELECT CASE WHEN length(trim($1)) = 0 THEN NULL
+                    ELSE to_tsquery('simple',
+                      (SELECT string_agg(lex, ' | ')
+                         FROM unnest(tsvector_to_array(to_tsvector('simple', $1))) AS lex))
+                  END AS tsq
+                ) q
+                WHERE m.category = 'conversation'
+                  AND ($2::TEXT IS NULL OR m.session_id = $2)
+                  AND ($1 = '' OR (q.tsq IS NOT NULL AND to_tsvector('simple', m.content) @@ q.tsq))
+                  AND ($4::TEXT::TIMESTAMPTZ IS NULL OR m.created_at >= $4::TEXT::TIMESTAMPTZ)
+                  AND ($5::TEXT::TIMESTAMPTZ IS NULL OR m.created_at <= $5::TEXT::TIMESTAMPTZ)
+                ORDER BY score DESC, m.updated_at DESC
+                LIMIT $3
+                ",
+            );
+            let rows = client.query(
+                &stmt,
+                &[&query, &sid, &limit_i64, &since_owned, &until_owned],
+            )?;
             rows.iter()
                 .map(Self::row_to_entry)
                 .collect::<Result<Vec<MemoryEntry>>>()
