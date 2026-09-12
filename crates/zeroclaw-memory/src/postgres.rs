@@ -5,8 +5,8 @@ use super::traits::{Memory, MemoryCategory, MemoryEntry, normalize_recent_recall
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use parking_lot::Mutex;
 use postgres::{Client, NoTls, Row};
+use r2d2_postgres::PostgresConnectionManager;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -15,6 +15,14 @@ use zeroclaw_api::session_keys::sanitize_session_key;
 
 /// Maximum allowed connect timeout (seconds) to avoid unreasonable waits.
 const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
+
+/// Bounded pool size: each tenant sharing this backend (see the process-wide
+/// handle cache in `zeroclaw-memory/src/lib.rs`) can now run a query
+/// concurrently instead of queuing behind one physical connection — bounded
+/// so a burst of tenant traffic can't open unbounded connections against
+/// Postgres. Not exposed as config (yet): no deployment has needed to tune
+/// it, and adding the knob can wait until one does.
+const POSTGRES_POOL_MAX_SIZE: u32 = 8;
 
 struct DropOnThread<T: Send + 'static>(Option<T>);
 
@@ -61,7 +69,7 @@ impl<T: Send + 'static> Drop for DropOnThread<T> {
 /// to keyword-only recall and logs a warning at construction.
 pub struct PostgresMemory {
     alias: String,
-    client: DropOnThread<Arc<Mutex<Client>>>,
+    client: DropOnThread<r2d2::Pool<PostgresConnectionManager<NoTls>>>,
     qualified_table: String,
     qualified_agents: String,
     /// `true` only when `try_enable_pgvector` actually succeeded at
@@ -124,7 +132,7 @@ impl PostgresMemory {
 
         Ok(Self {
             alias: alias.to_string(),
-            client: DropOnThread::new(Arc::new(Mutex::new(client))),
+            client: DropOnThread::new(client),
             qualified_table,
             qualified_agents,
             pgvector_ready: pgvector_ext_ok,
@@ -192,44 +200,59 @@ impl PostgresMemory {
         table: String,
         pgvector_enabled: bool,
         pgvector_dimensions: usize,
-    ) -> Result<(Client, bool)> {
+    ) -> Result<(r2d2::Pool<PostgresConnectionManager<NoTls>>, bool)> {
         let init_handle = std::thread::Builder::new()
             .name("postgres-memory-init".to_string())
-            .spawn(move || -> Result<(Client, bool)> {
-                let mut config: postgres::Config = db_url
-                    .parse()
-                    .context("invalid PostgreSQL connection URL")?;
+            .spawn(
+                move || -> Result<(r2d2::Pool<PostgresConnectionManager<NoTls>>, bool)> {
+                    let mut config: postgres::Config = db_url
+                        .parse()
+                        .context("invalid PostgreSQL connection URL")?;
 
-                if let Some(timeout_secs) = connect_timeout_secs {
-                    let bounded = timeout_secs.min(POSTGRES_CONNECT_TIMEOUT_CAP_SECS);
-                    config.connect_timeout(Duration::from_secs(bounded));
-                }
+                    if let Some(timeout_secs) = connect_timeout_secs {
+                        let bounded = timeout_secs.min(POSTGRES_CONNECT_TIMEOUT_CAP_SECS);
+                        config.connect_timeout(Duration::from_secs(bounded));
+                    }
 
-                let mut client = config
-                    .connect(NoTls)
-                    .context("failed to connect to PostgreSQL memory backend")?;
+                    let manager = PostgresConnectionManager::new(config, NoTls);
+                    // `.build()` eagerly opens (and validates) the pool's
+                    // first connection, so a bad db_url/unreachable server
+                    // fails right here — same fail-fast behavior the
+                    // previous single `config.connect(NoTls)` call gave.
+                    let pool = r2d2::Pool::builder()
+                        .max_size(POSTGRES_POOL_MAX_SIZE)
+                        .build(manager)
+                        .context("failed to build PostgreSQL connection pool")?;
 
-                Self::init_schema(&mut client, &schema_ident, &qualified_table)?;
-                zeroclaw_config::schema::v2::migrate_postgres_memory_to_v3(
-                    &mut client,
-                    &schema_ident,
-                    &qualified_table,
-                    &schema,
-                    &table,
-                )?;
+                    let mut client = pool
+                        .get()
+                        .context("failed to check out PostgreSQL connection for schema init")?;
 
-                let pgvector_ext_ok = pgvector_enabled
-                    && Self::try_enable_pgvector(
+                    Self::init_schema(&mut client, &schema_ident, &qualified_table)?;
+                    zeroclaw_config::schema::v2::migrate_postgres_memory_to_v3(
                         &mut client,
+                        &schema_ident,
                         &qualified_table,
                         &schema,
                         &table,
-                        pgvector_dimensions,
-                    )
-                    .is_ok();
+                    )?;
 
-                Ok((client, pgvector_ext_ok))
-            })
+                    let pgvector_ext_ok = pgvector_enabled
+                        && Self::try_enable_pgvector(
+                            &mut client,
+                            &qualified_table,
+                            &schema,
+                            &table,
+                            pgvector_dimensions,
+                        )
+                        .is_ok();
+
+                    // Return the connection to the pool instead of holding
+                    // it — the caller gets the pool, not this connection.
+                    drop(client);
+                    Ok((pool, pgvector_ext_ok))
+                },
+            )
             .context("failed to spawn PostgreSQL initializer thread")?;
 
         init_handle.join().map_err(|_| {
@@ -542,7 +565,7 @@ impl Memory for PostgresMemory {
         let until_owned = until.map(str::to_string);
 
         run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
-            let mut client = client.lock();
+            let mut client = client.get()?;
 
             // Cerveau: recall is a ranked top-k search, so keyword matching
             // uses OR semantics (match ANY query term, rank by ts_rank_cd)
@@ -666,7 +689,7 @@ impl Memory for PostgresMemory {
         let until_owned = until.map(str::to_string);
 
         run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
-            let mut client = client.lock();
+            let mut client = client.get()?;
 
             #[allow(clippy::cast_possible_wrap)]
             let limit_i64 = limit as i64;
@@ -713,7 +736,7 @@ impl Memory for PostgresMemory {
         let key = key.to_string();
 
         run_on_os_thread(move || -> Result<Option<MemoryEntry>> {
-            let mut client = client.lock();
+            let mut client = client.get()?;
             let stmt = format!(
                 "
                 SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id
@@ -738,7 +761,7 @@ impl Memory for PostgresMemory {
         let agent_id = agent_id.to_string();
 
         run_on_os_thread(move || -> Result<Option<MemoryEntry>> {
-            let mut client = client.lock();
+            let mut client = client.get()?;
             let stmt = format!(
                 "
                 SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id
@@ -767,7 +790,7 @@ impl Memory for PostgresMemory {
         let sid = session_id.map(str::to_string);
 
         run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
-            let mut client = client.lock();
+            let mut client = client.get()?;
             let stmt = format!(
                 "
                 SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id
@@ -811,7 +834,7 @@ impl Memory for PostgresMemory {
         let agents = agent_ids.to_vec();
 
         run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
-            let mut client = client.lock();
+            let mut client = client.get()?;
             let stmt = format!(
                 "
                 SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id
@@ -840,7 +863,7 @@ impl Memory for PostgresMemory {
         let key = key.to_string();
 
         run_on_os_thread(move || -> Result<bool> {
-            let mut client = client.lock();
+            let mut client = client.get()?;
             let stmt = format!("DELETE FROM {qualified_table} WHERE key = $1");
             let deleted = client.execute(&stmt, &[&key])?;
             Ok(deleted > 0)
@@ -855,7 +878,7 @@ impl Memory for PostgresMemory {
         let agent_id = agent_id.to_string();
 
         run_on_os_thread(move || -> Result<bool> {
-            let mut client = client.lock();
+            let mut client = client.get()?;
             let stmt = format!("DELETE FROM {qualified_table} WHERE key = $1 AND agent_id = $2");
             let deleted = client.execute(&stmt, &[&key, &agent_id])?;
             Ok(deleted > 0)
@@ -870,7 +893,7 @@ impl Memory for PostgresMemory {
         let agent_id = agent_id.to_string();
 
         run_on_os_thread(move || -> Result<usize> {
-            let mut client = client.lock();
+            let mut client = client.get()?;
             let stmt =
                 format!("DELETE FROM {qualified_table} WHERE session_id = $1 AND agent_id = $2");
             let deleted = client.execute(&stmt, &[&session_id, &agent_id])?;
@@ -886,7 +909,7 @@ impl Memory for PostgresMemory {
         let alias = agent_alias.to_string();
 
         run_on_os_thread(move || -> Result<usize> {
-            let mut client = client.lock();
+            let mut client = client.get()?;
             let stmt = format!(
                 "DELETE FROM {qualified_table} WHERE agent_id = (SELECT id FROM {qualified_agents} WHERE alias = $1)"
             );
@@ -903,7 +926,7 @@ impl Memory for PostgresMemory {
         let alias = agent_alias.to_string();
 
         run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
-            let mut client = client.lock();
+            let mut client = client.get()?;
             let stmt = format!(
                 "
                 SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id
@@ -929,7 +952,7 @@ impl Memory for PostgresMemory {
         let to = to.to_string();
 
         run_on_os_thread(move || -> Result<usize> {
-            let mut client = client.lock();
+            let mut client = client.get()?;
             let mut tx = client.transaction()?;
             let to_rows: i64 = tx
                 .query_one(
@@ -964,7 +987,7 @@ impl Memory for PostgresMemory {
         let alias = agent_alias.to_string();
 
         run_on_os_thread(move || -> Result<usize> {
-            let mut client = client.lock();
+            let mut client = client.get()?;
             // Mirror `rename_agent`: it moves the `agents` row (alias -> id), so
             // residue is the presence of that alias row (0 or 1), NOT the memory-
             // row count (which would miss an agents-row-only lag).
@@ -981,7 +1004,7 @@ impl Memory for PostgresMemory {
         let qualified_table = self.qualified_table.clone();
 
         run_on_os_thread(move || -> Result<usize> {
-            let mut client = client.lock();
+            let mut client = client.get()?;
             let stmt = format!("SELECT COUNT(*) FROM {qualified_table}");
             let count: i64 = client.query_one(&stmt, &[])?.get(0);
             let count =
@@ -993,7 +1016,7 @@ impl Memory for PostgresMemory {
 
     async fn health_check(&self) -> bool {
         let client = self.client.get().clone();
-        run_on_os_thread(move || Ok(client.lock().simple_query("SELECT 1").is_ok()))
+        run_on_os_thread(move || Ok(client.get()?.simple_query("SELECT 1").is_ok()))
             .await
             .unwrap_or(false)
     }
@@ -1028,7 +1051,7 @@ impl Memory for PostgresMemory {
 
         run_on_os_thread(move || -> Result<()> {
             let now = Utc::now();
-            let mut client = client.lock();
+            let mut client = client.get()?;
             // `agent_id = COALESCE($8, default-agent-uuid)` so callers
             // without an agent context still satisfy the NOT NULL FK
             // by attributing to the synthesized default agent. The
@@ -1121,7 +1144,7 @@ impl Memory for PostgresMemory {
         let allowed: Vec<String> = allowed_agent_ids.iter().map(|s| (*s).to_string()).collect();
 
         run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
-            let mut client = client.lock();
+            let mut client = client.get()?;
 
             // The agent_id filter lives in the WHERE clause so the
             // backend never returns a foreign-agent row to the caller;
@@ -1224,7 +1247,7 @@ impl Memory for PostgresMemory {
         let qualified_agents = self.qualified_agents.clone();
         let alias = alias.to_string();
         run_on_os_thread(move || -> Result<String> {
-            let mut client = client.lock();
+            let mut client = client.get()?;
             let candidate = Uuid::new_v4().to_string();
             client.execute(
                 &format!(
@@ -1459,7 +1482,7 @@ impl PostgresMemory {
         let quota = self.qualified_tenant_quota();
         let table = self.qualified_table.clone();
         run_on_os_thread(move || -> Result<()> {
-            let mut client = client.lock();
+            let mut client = client.get()?;
             client.batch_execute(&format!(
                 "CREATE TABLE IF NOT EXISTS {quota} (
                      agent_id TEXT NOT NULL,
@@ -1489,7 +1512,7 @@ impl PostgresMemory {
         let agent_id = agent_id.to_string();
         let category = category.to_string();
         run_on_os_thread(move || -> Result<()> {
-            let mut client = client.lock();
+            let mut client = client.get()?;
             client.execute(
                 &format!(
                     "INSERT INTO {quota} (agent_id, category, max_rows) VALUES ($1, $2, $3)
@@ -1510,7 +1533,7 @@ impl PostgresMemory {
         let quota = self.qualified_tenant_quota();
         let cfg = cfg.clone();
         run_on_os_thread(move || -> Result<PgLifecycleReport> {
-            let mut client = client.lock();
+            let mut client = client.get()?;
             let mut report = PgLifecycleReport::default();
 
             // 1. Retention prune (conversation, daily). `core` is never

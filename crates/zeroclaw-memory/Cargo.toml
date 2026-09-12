@@ -29,12 +29,20 @@ postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
 # (crates/zeroclaw-memory/src/postgres.rs) — ToSql/FromSql for the sync
 # `postgres` crate's Client, binding pgvector's `vector` column type.
 pgvector = { version = "0.4", features = ["postgres"], optional = true }
+# Cerveau: real connection pooling for PostgresMemory. Replaces a single
+# Arc<Mutex<Client>> (every tenant serialized on one physical connection)
+# with a bounded pool of connections, checked out per operation. r2d2 is
+# thread-based (no tokio integration needed) — matches this crate's
+# existing pattern of running every blocking Postgres call on a dedicated
+# OS thread via `run_on_os_thread`, never on the async runtime.
+r2d2 = { version = "0.8", optional = true }
+r2d2_postgres = { version = "0.18", optional = true }
 # Agent Task Ledger: gzip-compress archived (done) tasks before storing them
 # as bytea — see task_ledger.rs's archive-on-done path.
 flate2 = "1"
 
 [features]
-memory-postgres = ["dep:postgres", "dep:pgvector", "zeroclaw-config/memory-postgres"]
+memory-postgres = ["dep:postgres", "dep:pgvector", "dep:r2d2", "dep:r2d2_postgres", "zeroclaw-config/memory-postgres"]
 
 [dev-dependencies]
 filetime = "0.2"
