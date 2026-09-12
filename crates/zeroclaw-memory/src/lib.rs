@@ -83,13 +83,58 @@ pub use traits::{
 };
 
 use anyhow::Context;
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 use zeroclaw_config::providers::ModelProviders;
 use zeroclaw_config::schema::{
     ActiveStorage, Config, EmbeddingRouteConfig, MemoryConfig, MemoryPolicyConfig,
     PostgresStorageConfig,
 };
+
+/// Process-wide cache of shared Postgres-backed memory handles, keyed by
+/// `db_url\0schema\0table`.
+///
+/// `create_memory_for_agent`/`create_memory_for_tenant` used to call
+/// `create_memory_from_config`/`create_memory_with_storage_and_routes` fresh
+/// on every turn (`zeroclaw-runtime/src/agent/loop_.rs`'s per-message setup),
+/// which for the Postgres backend meant a brand-new TCP connect plus
+/// `init_schema`/v3-migration/pgvector-probe queries before the agent loop's
+/// first LLM call — the dominant "cold start per request" cost identified
+/// while diagnosing Cerveau turn latency (2026-09-12). All tenants of a
+/// given host agent share one physical Postgres backend, so that handle is
+/// safe to build once and reuse — this cache does exactly that; the
+/// tenant/agent-scoping wrapper built on top of it (`AgentScopedMemory`) is
+/// still constructed fresh per call, so tenant isolation is unaffected.
+static POSTGRES_MEMORY_CACHE: OnceLock<RwLock<HashMap<String, Arc<dyn Memory>>>> = OnceLock::new();
+
+fn postgres_memory_cache_key(storage: &PostgresStorageConfig) -> Option<String> {
+    let db_url = storage.db_url.as_deref()?;
+    Some(format!("{db_url}\u{0}{}\u{0}{}", storage.schema, storage.table))
+}
+
+/// Return the cached shared backend for `key`, or build it via `build` and
+/// cache it. Races (two turns missing the cache simultaneously) resolve to
+/// whichever caller's `write()` lock lands first via `entry().or_insert()`;
+/// the loser's freshly-built handle is simply dropped, not double-registered.
+fn get_or_init_postgres_memory<F>(key: String, build: F) -> anyhow::Result<Arc<dyn Memory>>
+where
+    F: FnOnce() -> anyhow::Result<Arc<dyn Memory>>,
+{
+    if let Some(cached) = POSTGRES_MEMORY_CACHE
+        .get()
+        .and_then(|c| c.read().ok())
+        .and_then(|guard| guard.get(&key).cloned())
+    {
+        return Ok(cached);
+    }
+    let built = build()?;
+    let cache = POSTGRES_MEMORY_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    let mut guard = cache
+        .write()
+        .map_err(|_| anyhow::anyhow!("postgres memory cache lock poisoned"))?;
+    Ok(guard.entry(key).or_insert(built).clone())
+}
 
 /// `vector_weight`/`keyword_weight` come from `[memory]` (the same fields
 /// `build_sqlite_memory` reads via `config.vector_weight`/`config.keyword_weight`)
@@ -1053,8 +1098,15 @@ pub async fn create_memory_for_agent(
         )?));
     }
 
-    let inner = create_memory_from_config(config, api_key)?;
-    let inner_arc: Arc<dyn Memory> = Arc::from(inner);
+    let inner_arc: Arc<dyn Memory> = match config.resolve_active_storage() {
+        ActiveStorage::Postgres(storage) => match postgres_memory_cache_key(storage) {
+            Some(key) => get_or_init_postgres_memory(key, || {
+                Ok(Arc::from(create_memory_from_config(config, api_key)?))
+            })?,
+            None => Arc::from(create_memory_from_config(config, api_key)?),
+        },
+        _ => Arc::from(create_memory_from_config(config, api_key)?),
+    };
 
     let bound_id = inner_arc.ensure_agent_uuid(agent_alias).await?;
     let mut allowlist_ids = Vec::with_capacity(agent_cfg.workspace.read_memory_from.len());
@@ -1109,15 +1161,37 @@ pub async fn create_memory_for_tenant(
         );
     }
 
-    let inner = create_memory_with_storage_and_routes(
-        &config.memory,
-        &config.embedding_routes,
-        config.resolve_active_storage(),
-        &config.data_dir,
-        api_key,
-        Some(&config.providers.models),
-    )?;
-    let inner_arc: Arc<dyn Memory> = Arc::from(inner);
+    let active_storage = config.resolve_active_storage();
+    let inner_arc: Arc<dyn Memory> = match active_storage {
+        ActiveStorage::Postgres(storage) => match postgres_memory_cache_key(storage) {
+            Some(key) => get_or_init_postgres_memory(key, || {
+                Ok(Arc::from(create_memory_with_storage_and_routes(
+                    &config.memory,
+                    &config.embedding_routes,
+                    active_storage,
+                    &config.data_dir,
+                    api_key,
+                    Some(&config.providers.models),
+                )?))
+            })?,
+            None => Arc::from(create_memory_with_storage_and_routes(
+                &config.memory,
+                &config.embedding_routes,
+                active_storage,
+                &config.data_dir,
+                api_key,
+                Some(&config.providers.models),
+            )?),
+        },
+        _ => Arc::from(create_memory_with_storage_and_routes(
+            &config.memory,
+            &config.embedding_routes,
+            active_storage,
+            &config.data_dir,
+            api_key,
+            Some(&config.providers.models),
+        )?),
+    };
 
     let namespaced = format!("t_{tenant_id}");
     let bound_id = inner_arc.ensure_agent_uuid(&namespaced).await?;
@@ -1173,6 +1247,57 @@ mod tests {
     use tempfile::TempDir;
     use zeroclaw_config::schema::Config;
     use zeroclaw_config::schema::EmbeddingRouteConfig;
+
+    #[test]
+    fn postgres_memory_cache_reuses_handle_for_same_key_builds_fresh_for_new_key() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Unique per test invocation (a fresh, monotonically-increasing
+        // suffix) so this test is independent of ordering/parallelism with
+        // any other test touching the same process-wide cache.
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        let key_a = format!("cache-test-a-{id}");
+        let key_b = format!("cache-test-b-{id}");
+        let builds = AtomicUsize::new(0);
+
+        let first: Arc<dyn Memory> = get_or_init_postgres_memory(key_a.clone(), || {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(NoneMemory::new("none")))
+        })
+        .unwrap();
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "first call must build");
+
+        let second: Arc<dyn Memory> = get_or_init_postgres_memory(key_a.clone(), || {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(NoneMemory::new("none")))
+        })
+        .unwrap();
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "second call with the same key must hit the cache, not build again"
+        );
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "same key must return the exact same cached handle"
+        );
+
+        let third: Arc<dyn Memory> = get_or_init_postgres_memory(key_b, || {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(NoneMemory::new("none")))
+        })
+        .unwrap();
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            2,
+            "a different key must build its own handle"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "different keys must not share a cached handle"
+        );
+    }
 
     #[test]
     fn factory_sqlite() {
