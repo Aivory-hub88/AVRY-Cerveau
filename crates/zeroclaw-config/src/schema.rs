@@ -5303,6 +5303,20 @@ pub struct McpServerConfig {
     /// time.
     #[serde(default)]
     pub disabled_tools: Vec<String>,
+    /// Phase 3 of the MCP tool-result prompt-hardening plan
+    /// (`docs/CERVEAU-MCP-TOOL-RESULT-PROMPT-HARDENING-PLAN.md`): per-server
+    /// override for the prompt-injection guard action (`warn` | `block` |
+    /// `sanitize`) applied to this server's tool results before they reach
+    /// history. `None` inherits `[mcp].content_safety_action` (default
+    /// `warn`, matching every server's behavior before this field existed —
+    /// this is purely additive). Only set this to `block` or `sanitize` for
+    /// a server after tuning against real traffic from it — the plan doc's
+    /// synthetic corpus (§7.4-§7.6) found a real false-positive on ordinary
+    /// business prose ("per our new instructions from legal") at the
+    /// default sensitivity, so a blanket `block` risks rejecting a
+    /// legitimate answer, not just an attack.
+    #[serde(default)]
+    pub content_safety_action: Option<String>,
 }
 
 /// External MCP client configuration (`[mcp]` section).
@@ -5341,6 +5355,33 @@ pub struct McpConfig {
     #[nested]
     #[natural_key = "name"]
     pub servers: Vec<McpServerConfig>,
+    /// Phase 3 of the MCP tool-result prompt-hardening plan
+    /// (`docs/CERVEAU-MCP-TOOL-RESULT-PROMPT-HARDENING-PLAN.md`): the
+    /// default prompt-injection guard action (`warn` | `block` |
+    /// `sanitize`) applied to every MCP/web/browser tool result, for any
+    /// server that doesn't set its own `content_safety_action` override.
+    /// Default `warn` — identical to Phase 1's hardcoded behavior before
+    /// this config existed, so this field is purely additive; nothing
+    /// changes for an operator who never touches it.
+    #[tab(Settings)]
+    #[serde(default = "default_mcp_content_safety_action")]
+    pub content_safety_action: String,
+    /// Sensitivity threshold (0.0-1.0, higher = more strict) for the
+    /// prompt-injection guard applied to MCP/web/browser tool results.
+    /// Shared across every server (see `McpServerConfig::content_safety_action`
+    /// for the one field that *is* per-server) — the plan doc's synthetic
+    /// corpus (§7.4-§7.6) was tuned against this default.
+    #[tab(Settings)]
+    #[serde(default = "default_mcp_content_safety_sensitivity")]
+    pub content_safety_sensitivity: f64,
+    /// Byte cap applied to a tool result before it's scanned (matches the
+    /// SOP untrusted-payload cap's default and rationale — bound the scan
+    /// cost and the framing markers' displayed size, not a hard limit on
+    /// what reaches the model, which `max_tool_result_chars` already
+    /// truncates separately).
+    #[tab(Settings)]
+    #[serde(default = "default_mcp_content_safety_max_bytes")]
+    pub content_safety_max_bytes: usize,
 }
 
 fn default_mcp_enabled() -> bool {
@@ -5351,12 +5392,27 @@ fn default_deferred_loading() -> bool {
     false
 }
 
+fn default_mcp_content_safety_action() -> String {
+    "warn".to_string()
+}
+
+fn default_mcp_content_safety_sensitivity() -> f64 {
+    0.7
+}
+
+fn default_mcp_content_safety_max_bytes() -> usize {
+    8192
+}
+
 impl Default for McpConfig {
     fn default() -> Self {
         Self {
             enabled: default_mcp_enabled(),
             deferred_loading: default_deferred_loading(),
             servers: Vec::new(),
+            content_safety_action: default_mcp_content_safety_action(),
+            content_safety_sensitivity: default_mcp_content_safety_sensitivity(),
+            content_safety_max_bytes: default_mcp_content_safety_max_bytes(),
         }
     }
 }
