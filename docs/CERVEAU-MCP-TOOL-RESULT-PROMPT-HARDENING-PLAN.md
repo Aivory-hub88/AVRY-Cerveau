@@ -2,7 +2,7 @@
 
 > Written 2026-09-13 in response to the gap flagged in AVRY-Mail's [`MCP_ARCHITECTURE.md` §8](../../Aivory/AVRY-Mail-audit/docs/MCP_ARCHITECTURE.md): "Prompt hardening at the assistant/orchestration layer (Cerveau) is not implemented." This plan is scoped to that specific gap, not a general security audit.
 >
-> **Status (2026-09-13): Phase 1 shipped; Phase 2 first (synthetic) pass done.** See [§7](#7-phase-1-implementation-notes-2026-09-13) for what actually landed and how it differs from the design below — the intended hook point (`McpToolWrapper::execute`) turned out not to be reachable, and a second, independent untrusted-content marker was discovered already in place. §7.4 has the synthetic-corpus results, including a real finding: Indonesian-language injection attempts currently pass through undetected. Phase 3 is still open.
+> **Status (2026-09-13): Phase 1 shipped; Phase 2 first (synthetic) pass done, Indonesian pattern gap closed.** See [§7](#7-phase-1-implementation-notes-2026-09-13) for what actually landed and how it differs from the design below — the intended hook point (`McpToolWrapper::execute`) turned out not to be reachable, and a second, independent untrusted-content marker was discovered already in place. §7.4 found Indonesian-language injection attempts passing through undetected; §7.5 closes that specific gap same-day. A few English-language false negatives remain open (§7.5), and Phase 3 (flip to `Block` per-server) is still open.
 
 ## 1. The gap, precisely
 
@@ -109,6 +109,25 @@ Before any real AVRY-Mail traffic exists to tune against, a 20-entry synthetic c
 **Why this matters more than the raw numbers:** the false-negative pattern isn't random — `PromptGuard`'s regexes are English/ASCII-shaped (per §3.2's own warning, "tuned against SOP payloads"), and Aivory's stated target market is Indonesian enterprises. An Indonesian-phrased version of an attack Phase 1 already demonstrably catches in English currently passes through unflagged. Direct secret-extraction and command-injection asks that don't use override/roleplay language also slip past the `check_secret_extraction`/`check_command_injection` categories in this corpus, though with only 10 malicious samples this isn't a rigorous per-category read.
 
 **Before Phase 3 (flip any server to `Block`) can be responsible, at minimum:**
-1. Add Indonesian-language pattern coverage to `PromptGuard` (or a sibling check) — this is not optional for a product whose target market is Indonesian enterprises (see `aivory-target-market-enterprise` memory).
-2. Re-run this corpus (and a larger one, ideally with real traffic mixed in) after any pattern change, to confirm true-positive rate improves without regressing the false-positive rate.
-3. Treat the 10% false-positive rate on ordinary "ignore my previous X" business phrasing as the reason `Sanitize`/`Block` cannot go live yet even for a well-behaved MCP server — at `Warn` this only logs, but flipping to `Block` today would occasionally reject a legitimate email-derived answer over a sentence like "per our new instructions from legal."
+1. ~~Add Indonesian-language pattern coverage to `PromptGuard`~~ ✅ Done same day, 2026-09-13 — see §7.5.
+2. Re-run this corpus (and a larger one, ideally with real traffic mixed in) after any pattern change, to confirm true-positive rate improves without regressing the false-positive rate. Done for the Indonesian-coverage change (§7.5); still needed for the remaining false negatives.
+3. Treat the 10% false-positive rate on ordinary "ignore my previous X" business phrasing as the reason `Sanitize`/`Block` cannot go live yet even for a well-behaved MCP server — at `Warn` this only logs, but flipping to `Block` today would occasionally reject a legitimate email-derived answer over a sentence like "per our new instructions from legal." This is unchanged by §7.5 — the new patterns are additive to other categories, not to `system_prompt_override`, which is what the false positive triggers on.
+
+### 7.5 Indonesian-language pattern coverage added (2026-09-13)
+
+Added Indonesian equivalents to [`PromptGuard`](../crates/zeroclaw-runtime/src/security/prompt_guard.rs) in the same four categories the English patterns already cover — `check_system_override`, `check_role_confusion`, `check_secret_extraction`, `check_jailbreak_attempts` — same scoring, same regex-heuristic method (per §6's non-goal: this is reach, not a rewrite). 5 new unit tests added (4 detection + 1 "ordinary Indonesian business prose stays Safe" regression guard).
+
+Re-running the §7.4 corpus after the change:
+
+| | before | after |
+|---|---|---|
+| False positives | 10% (1/10) | 10% (1/10) — unchanged |
+| True positives | 60% (6/10) | **70% (7/10)** |
+| False negatives | 40% (4/10) — incl. the Indonesian sample | 30% (3/10) — `indonesian-forward-inbox-injection` now caught |
+
+The targeted gap (Indonesian version of an attack already caught in English) is closed with no new false positives. Three false negatives remain, and are **not** Indonesian-language gaps — they're English-language detection gaps orthogonal to this fix, out of scope for what was asked today:
+- `jailbreak-roleplay` — "ignore your previous instructions" (with "your" in between) doesn't match `check_system_override`'s regex, which requires "ignore" directly followed by previous/above/prior/all.
+- `secret-extraction-direct-ask` — "output your system prompt and API keys" doesn't match `check_secret_extraction`'s list/show/reveal/dump verb set.
+- `command-injection-embedded` — a plausible-admin-instruction framing around `rm -rf /` doesn't trip `check_command_injection`'s shell-metacharacter list (no backticks, `$()`, `&&`, etc. — just a plain English sentence naming the command).
+
+These are candidates for a future tuning pass, not blockers for what was asked in this session.
