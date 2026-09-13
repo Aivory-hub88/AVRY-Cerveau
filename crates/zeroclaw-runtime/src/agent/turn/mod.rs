@@ -529,6 +529,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         },
     );
 
+    // Phase 1 of the MCP tool-result prompt-hardening plan (see
+    // docs/CERVEAU-MCP-TOOL-RESULT-PROMPT-HARDENING-PLAN.md): scan/sanitize
+    // every MCP/web/browser tool result the same way SOP payloads already
+    // are, `Warn`-only. `None` on configless (test) paths, matching every
+    // other `config`-gated feature on this loop.
+    let mcp_content_safety = config.map(|c| {
+        crate::security::external_content::ContentSafety::for_mcp_tool_results(&c.sop)
+    });
+
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
     let mut malformed_tool_protocol_retries: usize = 0;
@@ -1392,6 +1401,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             model,
             iteration,
             turn_id,
+            mcp_content_safety.as_ref(),
         )?;
 
         if !cancelled_mid_batch {
