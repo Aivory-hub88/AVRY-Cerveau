@@ -529,13 +529,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         },
     );
 
-    // Phase 1 of the MCP tool-result prompt-hardening plan (see
+    // MCP tool-result prompt-hardening (see
     // docs/CERVEAU-MCP-TOOL-RESULT-PROMPT-HARDENING-PLAN.md): scan/sanitize
-    // every MCP/web/browser tool result the same way SOP payloads already
-    // are, `Warn`-only. `None` on configless (test) paths, matching every
+    // every MCP/web/browser tool result, honoring `[mcp].content_safety_action`
+    // and any per-server override (Phase 3) — defaults to `Warn` everywhere
+    // for an operator who has touched neither, identical to Phase 1's
+    // hardcoded behavior. `None` on configless (test) paths, matching every
     // other `config`-gated feature on this loop.
     let mcp_content_safety = config.map(|c| {
-        crate::security::external_content::ContentSafety::for_mcp_tool_results(&c.sop)
+        crate::security::external_content::McpContentSafetyRegistry::from_mcp_config(&c.mcp)
     });
 
     // Accumulated display text across all tool-loop calls.

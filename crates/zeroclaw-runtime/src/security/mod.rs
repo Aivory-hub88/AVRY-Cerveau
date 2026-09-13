@@ -45,9 +45,9 @@ pub use domain_matcher::DomainMatcher;
 pub use estop::{EstopLevel, EstopManager, EstopState, ResumeSelector};
 #[allow(unused_imports)]
 pub use external_content::{
-    ContentSafety, FramingPolicy, OutboundPolicy, ScanOutcome, ScanPolicy, ScreenVerdict,
-    cap_untrusted, frame_untrusted, new_marker_id, sanitize_untrusted, scan_untrusted,
-    scrub_outbound,
+    ContentSafety, FramingPolicy, McpContentSafetyRegistry, OutboundPolicy, ScanOutcome,
+    ScanPolicy, ScreenVerdict, cap_untrusted, frame_untrusted, new_marker_id, sanitize_untrusted,
+    scan_untrusted, scrub_outbound,
 };
 // Universal ingress policy front door.
 #[allow(unused_imports)]
