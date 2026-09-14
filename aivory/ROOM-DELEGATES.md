@@ -50,3 +50,31 @@ sudo systemctl restart zeroclaw-cerveau
 
 Mirror the 6 edits above for the new pair, keep depth 1,
 keep `delegate` out of `auto_approve` until its own staging trial.
+
+## Staging expansion trial (hub model + peer_groups)
+
+Staging daemon `:3101`, isolated DB `aivory_cerveau_staging`, trial tenant
+rows only — prod untouched. Staging-only extras vs prod: `delegate` briefly
+in `auto_approve` (trial 2), then reverted to approval-gated.
+
+Config: hub edges Geno↔Lex, Geno↔Finn, Geno↔Ofira (depth 1, policy allow,
+`delegate` in allowed_tools, NOT auto_approve) + `[peer_groups.room_team]`
+(`channel = "console"`, all 5 agents). Boots clean, `config migrate` clean.
+
+| Trial | Result |
+|---|---|
+| Teo room-style, no order | Text coordination, no delegate (6.7s) |
+| Teo explicit delegate order, auto-approve | Delegate fired 1×, full loop 13.2s / 44,547 tokens |
+| Lex explicit delegate order, approval-gated | NO delegate attempt — textual handoff instead (24.7s / 12.7k) |
+| Lex out-of-scope ticket task | Clean refusal + redirect, no delegate (7.4s) |
+| Teo room-style with peer_groups loaded | Peer-aware reply, no delegate fired (5.2s / 12.3k) |
+
+Findings:
+- Delegates are discretionary per turn, not forced routing — the agent
+  decides; approval-gating further suppresses attempts (fails closed).
+  No loops, no surprise spend observed in any trial.
+- `peer_groups.room_team` loads and boots clean; no dramatic effect on
+  webhook turns (it governs channel dispatch/pairing/session-send auth,
+  not LLM context). Enforcement surface needs channel-level tests.
+- Cost datum: normal room turn 5–7s / ~12k tokens; full delegated round
+  13s / ~45k tokens on the shared analyst key (deepseek-v4.1-flash).
