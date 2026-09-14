@@ -78,3 +78,23 @@ Findings:
   not LLM context). Enforcement surface needs channel-level tests.
 - Cost datum: normal room turn 5–7s / ~12k tokens; full delegated round
   13s / ~45k tokens on the shared analyst key (deepseek-v4.1-flash).
+
+## Prod hub promotion
+
+After the staging trial, the hub model is live in approval-gated mode:
+
+- Geno <-> Teo (existing canary), Geno <-> Lex, Geno <-> Finn, and Geno
+  <-> Ofira are bounded at depth 1.
+- `delegate` is allowed for all five product agents but is intentionally
+  absent from every product agent's `auto_approve` list. A delegate request
+  therefore parks at the existing F-1 approval surface before the child turn
+  runs.
+- `peer_groups.room_team` is enabled for the `console` channel with all five
+  product aliases mutually opted in.
+- Backup before promotion: `/home/ubuntu/.zeroclaw-cerveau/config.toml.bak-pre-room-hub-20260915-073334`.
+- Cerveau restarted cleanly and `/health` returned `status: ok` after the
+  promotion.
+
+Rollback: restore that backup and restart `zeroclaw-cerveau`; this removes the
+three new hub edges and the console peer group while retaining the earlier
+Geno/Teo canary only if the backup was taken after that canary promotion.
