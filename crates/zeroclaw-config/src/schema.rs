@@ -4643,6 +4643,7 @@ impl Config {
             .filter_map(|server| apply_tenant_workspace_scoping(server, tenant_platform_user_id))
             .filter_map(|server| apply_toolkit_connection_gate(server, tenant_connected_toolkits))
             .filter_map(|server| apply_toolkit_scope_gate(server, tenant_disabled_toolkits))
+            .filter_map(apply_composio_auth_header)
             .collect();
         // ADR-006 Part B: a tenant's own registered MCP servers are
         // appended after the gate chain above, not filtered through it —
@@ -13863,6 +13864,31 @@ pub fn apply_toolkit_scope_gate(
     } else {
         Some(server)
     }
+}
+
+/// Inject the Composio API key into a connection-gated MCP server at runtime.
+///
+/// Composio is the user's connected-tool surface, not the tenant's arbitrary
+/// MCP surface. Keep its operator credential in the service environment rather
+/// than duplicating it in `config.toml` and every dated config backup. Native
+/// and tenant-owned MCP servers do not set `requires_composio_toolkit` and are
+/// intentionally untouched, so Aivory Mail/Odoo/SAP headers keep their own
+/// auth path.
+///
+/// Missing credentials fail closed: the Composio server is omitted instead of
+/// connecting without auth or accidentally using a stale config value.
+#[must_use]
+pub fn apply_composio_auth_header(mut server: McpServerConfig) -> Option<McpServerConfig> {
+    if server.requires_composio_toolkit.is_none() {
+        return Some(server);
+    }
+
+    let key = std::env::var("CERVEAU_COMPOSIO_API_KEY")
+        .or_else(|_| std::env::var("COMPOSIO_API_KEY"))
+        .ok()
+        .filter(|value| !value.trim().is_empty())?;
+    server.headers.insert("x-api-key".to_string(), key);
+    Some(server)
 }
 
 /// Free-function core of [`Config::tool_risk_tier`], extracted so
