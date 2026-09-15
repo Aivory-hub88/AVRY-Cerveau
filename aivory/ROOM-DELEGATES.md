@@ -103,9 +103,21 @@ After the staging trial, the hub model is live in approval-gated mode:
 - Aira's direct tool surface is coordination-only: `delegate`, web research,
   calculator, read-only file access, memory/graph recall and internal task
   ledger tools. It has no specialist business integrations.
+- Phase 3A guardrails: Aira is capped at `12` actions/hour, `200` cents/day,
+  `8` tool iterations, and delegation depth `2`. These are native Cerveau
+  runtime controls; the global daily/monthly budget remains the backstop.
 - Backup before promotion: `/home/ubuntu/.zeroclaw-cerveau/config.toml.bak-pre-room-hub-20260915-073334`.
 - Cerveau restarted cleanly and `/health` returned `status: ok` after the
   promotion.
+
+### Phase 3A staging check
+
+The first staging request exposed a name/alias mismatch (`Geno` versus the
+runtime alias `autonomous`) and failed closed without a delegate call. The
+identity now documents the alias map explicitly. The corrected read-only
+trial delegated once to `autonomous`, completed in `~89k` reported tokens,
+and made no external business changes. This is still a high-cost path, so
+the native Aira caps remain enabled in production.
 
 Rollback: restore that backup and restart `zeroclaw-cerveau`; this removes the
 three new hub edges and the console peer group while retaining the earlier
