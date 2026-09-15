@@ -33,13 +33,23 @@ Product agents are mirrored under `agents/<type>/workspace/IDENTITY.md`:
 | Aira | `chief_of_staff` | Plan, delegate, track, and synthesize |
 | Geno | `autonomous` | Generalist execution and cross-domain support |
 | Teo | `customer_service` | Support and ticket operations |
-| Lex | `leads_qualifier` | Lead qualification and routing |
+| Lex | `leads_qualifier` | Sales and Lead: BANT qualification + outbound plays |
 | Finn | `finance_invoice_ops` | Invoice and finance operations |
 | Ofira | `office_assistant` | Meetings, tasks, and office operations |
 
 Aira is coordination-only. It can use delegation, research, memory, graph,
 and internal task tools, but it does not receive specialist business tools
 directly. External writes remain owned and approval-gated by the specialist.
+
+## Outbound sales skills (Lex)
+
+Tier 1 knowledge-only skills vendored byte-identical from
+`growthenginenowoslawski/coldoutboundskills` (MIT) under
+`skills/leads-qualifier/`: ICP onboarding, copywriting, spam-word checks,
+list-quality scorecards, lead magnets, campaign strategy, experiment design,
+kickoff, weekly rhythm, ICP prompt builder, personalization pattern.
+Anything spending money or sending externally (Tier 2: Smartlead, Prospeo,
+domains, inboxes) is intentionally excluded until tenant keys exist.
 
 ## Sync
 
