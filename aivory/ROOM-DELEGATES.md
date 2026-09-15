@@ -122,3 +122,31 @@ the native Aira caps remain enabled in production.
 Rollback: restore that backup and restart `zeroclaw-cerveau`; this removes the
 three new hub edges and the console peer group while retaining the earlier
 Geno/Teo canary only if the backup was taken after that canary promotion.
+
+## Observability (delegate + cost metrics)
+
+`:3100/metrics` already exposes everything; nothing is scraped yet (the
+monitoring stack isn't deployed — no prometheus/grafana containers running).
+When it is, add:
+
+```yaml
+- job_name: zeroclaw-cerveau
+  static_configs:
+    - targets: ['host.docker.internal:3100']
+```
+
+(prometheus service needs `extra_hosts: ["host.docker.internal:host-gateway"]`.
+`:3100` binds `0.0.0.0`, verified reachable.)
+
+Key queries:
+- Delegate fire rate: `sum(rate(zeroclaw_tool_calls_total{tool="delegate"}[5m]))`
+- Delegate failures: `sum(rate(zeroclaw_tool_calls_total{tool="delegate",success="false"}[5m]))`
+- Token burn (cumulative): `zeroclaw_tokens_input_total`, `zeroclaw_tokens_output_total`
+- Last-round cost: `zeroclaw_tokens_used_last`
+- Turn latency: `histogram_quantile(0.95, rate(zeroclaw_agent_duration_seconds_bucket[5m]))`
+
+Note: `zeroclaw_tool_calls_total` only appears after the first delegate
+fires in prod (Prometheus client registers counters lazily) — absence of
+the series means zero delegate turns so far, not a scrape failure.
+Approval-parked delegates surface separately in the dashboard Approvals
+feed + `GET /api/aira/tasks` (`status=blocked` with approver named).
