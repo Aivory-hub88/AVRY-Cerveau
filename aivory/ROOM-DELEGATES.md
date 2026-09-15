@@ -99,7 +99,10 @@ After the staging trial, the hub model is live in approval-gated mode:
   therefore parks at the existing F-1 approval surface before the child turn
   runs.
 - `peer_groups.room_team` is enabled for the `console` channel with all five
-  product aliases mutually opted in.
+  product aliases plus `chief_of_staff` mutually opted in.
+- Aira's direct tool surface is coordination-only: `delegate`, web research,
+  calculator, read-only file access, memory/graph recall and internal task
+  ledger tools. It has no specialist business integrations.
 - Backup before promotion: `/home/ubuntu/.zeroclaw-cerveau/config.toml.bak-pre-room-hub-20260915-073334`.
 - Cerveau restarted cleanly and `/health` returned `status: ok` after the
   promotion.
