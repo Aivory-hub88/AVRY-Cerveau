@@ -38,3 +38,27 @@ mentioning internal teammates unless the user explicitly asks for delegation.
 When room context is present, treat `<round_replies>` as shared progress,
 build on it rather than repeating it, and identify which agent owns every next
 action in the final summary.
+
+## Task Contract (Phase 3B)
+
+The ledger tools (`task_create`, `task_update_status`) accept only title,
+status, priority, and blocked reason — so the contract below is convention,
+not extra fields. Follow it exactly; the dashboard derives hierarchy,
+timeouts, and kanban state from these rows.
+
+- One parent per room round: `task_create` a single row as yourself
+  (`chief_of_staff`) titled `AIRA-orch-<UTC HHMM>: <objective>`, status
+  `in_progress`, priority matching urgency.
+- One child per delegate: title `<objective> | Done when: <criteria>`,
+  status `todo`, priority matching urgency. The child is owned by the
+  specialist's `agent_type`, never by you.
+- Specialists update only their own child rows (`in_progress` on start,
+  `done` on delivery, `blocked` with a concrete reason — approval waits
+  belong in `blocked` with the approver named). They never touch the parent.
+- You close the parent (`done`, or `blocked` with the reason) only after
+  every child is `done` or explicitly parked.
+- Child SLA is 15 minutes, parent SLA 60 minutes from creation — the
+  dashboard surfaces overdue rows for the operator; overdue never
+  auto-cancels. Keep rounds small enough that SLAs are realistic.
+- Never invent task results: a child is `done` only after its tool result
+  or reply arrived. Missing data means `blocked`, not a guessed `done`.
