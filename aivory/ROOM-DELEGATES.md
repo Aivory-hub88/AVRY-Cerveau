@@ -1,24 +1,33 @@
 # Room delegation canary — live prod state (Cerveau `:3100`)
 
-Canary pair only: `customer_service` (Teo) ↔ `autonomous` (Geno).
-Lex / Finn / Ofira intentionally unchanged (`max_delegation_depth = 0`,
-no delegates, policy default `forbidden`).
+The product team is Geno, Teo, Lex, Finn, and Ofira. Aira
+(`chief_of_staff`) is the supervisor and is intentionally documented
+separately from the specialist mesh.
 
 ## Applied to `/home/ubuntu/.zeroclaw-cerveau/config.toml`
 
 ```toml
-[[agents.customer_service.delegates]]
+[[agents.chief_of_staff.delegates]]
 agent = "autonomous"
 mode = "bounded"
 
-[[agents.autonomous.delegates]]
+[[agents.chief_of_staff.delegates]]
 agent = "customer_service"
 mode = "bounded"
 
-[risk_profiles.agent_customer_service.delegation_policy]
-mode = "allow"
+[[agents.chief_of_staff.delegates]]
+agent = "leads_qualifier"
+mode = "bounded"
 
-[risk_profiles.agent_autonomous.delegation_policy]
+[[agents.chief_of_staff.delegates]]
+agent = "finance_invoice_ops"
+mode = "bounded"
+
+[[agents.chief_of_staff.delegates]]
+agent = "office_assistant"
+mode = "bounded"
+
+[risk_profiles.agent_chief_of_staff.delegation_policy]
 mode = "allow"
 ```
 
