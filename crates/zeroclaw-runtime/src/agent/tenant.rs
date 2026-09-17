@@ -139,10 +139,12 @@ pub struct TenantCustomMcpServer {
     pub transport: String,
     pub auth_header_name: Option<String>,
     pub auth_header_value: Option<String>,
-    /// Always `"irreversible"` today (ADR-006 §B5: admin-only override,
-    /// never tenant-set) — carried through rather than hardcoded here so a
-    /// future Aivory-admin override doesn't require a wire-format change,
-    /// though nothing currently sets it to anything else.
+    /// Backend-declared tier (`product.tenant_custom_mcp_servers.risk_tier`):
+    /// `"safe"`/`"reversible"` execute without parking — the user's explicit
+    /// instruction is the approval. Anything else (including the historical
+    /// `"irreversible"` default) fails closed to `Irreversible` in
+    /// `ApprovalManager::risk_tier`, so an unexpected value can only
+    /// over-restrict, never silently un-gate.
     pub risk_tier: String,
     /// ADR-006 §B8: tool names on *this* server the tenant has turned off
     /// from the dashboard's per-tool checklist (`product.
@@ -229,13 +231,25 @@ impl TenantContext {
     }
 
     /// True if `tool_name` originates from one of this tenant's own custom
-    /// MCP servers — the non-bypassable check
-    /// `crate::approval::ApprovalManager::risk_tier` consults *before*
-    /// anything in `[tool_risk_tiers]`, so no config entry can ever
-    /// downgrade a tenant-supplied tool below `Irreversible` (ADR-006 §B5).
+    /// MCP servers (name-prefix check shared with
+    /// [`Self::custom_mcp_server_risk_tier`]).
     pub fn is_tenant_custom_mcp_tool(&self, tool_name: &str) -> bool {
-        self.tenant_custom_mcp_servers.iter().any(|server| {
-            tool_name.starts_with(&format!("{TENANT_CUSTOM_MCP_NAME_PREFIX}{}__", server.name))
+        self.custom_mcp_server_risk_tier(tool_name).is_some()
+    }
+
+    /// The backend-declared risk tier (`product.tenant_custom_mcp_servers.
+    /// risk_tier`) of the custom MCP server owning `tool_name`, if any.
+    /// `crate::approval::ApprovalManager::risk_tier` maps this to a tier
+    /// *before* anything in `[tool_risk_tiers]`; unknown values fail closed
+    /// to `Irreversible` there, so an unexpected backend value can only
+    /// over-restrict, never silently un-gate.
+    pub fn custom_mcp_server_risk_tier(&self, tool_name: &str) -> Option<&str> {
+        self.tenant_custom_mcp_servers.iter().find_map(|server| {
+            if tool_name.starts_with(&format!("{TENANT_CUSTOM_MCP_NAME_PREFIX}{}__", server.name)) {
+                Some(server.risk_tier.as_str())
+            } else {
+                None
+            }
         })
     }
 }

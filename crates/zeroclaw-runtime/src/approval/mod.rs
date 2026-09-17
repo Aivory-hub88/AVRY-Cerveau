@@ -244,17 +244,26 @@ impl ApprovalManager {
     /// with no `Safe` fast-path and no `Irreversible` hard floor.
     #[must_use]
     pub fn risk_tier(&self, tool_name: &str) -> ToolRiskTier {
-        // ADR-006 Part B (§B5): a tool from a tenant's own custom MCP
-        // server is always Irreversible, non-overridable by the tenant or
-        // by any `[tool_risk_tiers]` entry — checked FIRST, before
-        // consulting `self.risk_tiers` at all, so no config can ever
-        // downgrade it. The server is a black box Aivory never reviewed,
-        // and its tool `description`s are untrusted tenant-authored text
-        // flowing straight into LLM-visible tool metadata.
+        // Tenant custom MCP servers carry their own backend-declared risk
+        // tier (`product.tenant_custom_mcp_servers.risk_tier`, surfaced by
+        // avry-backend's internal route and plumbed through
+        // `TenantCustomMcpServer.risk_tier`) — checked FIRST, before
+        // consulting `self.risk_tiers` at all, so no `[tool_risk_tiers]`
+        // entry can silently re-gate a server the backend relaxed.
+        // "safe"/"reversible" execute without parking: the user's explicit
+        // instruction ("kirim", "send") IS the approval — the agent shows a
+        // draft and the user confirms in-conversation, no second ask from
+        // the gate. Unknown values fail closed to Irreversible, preserving
+        // the pre-removal behavior for anything the backend did not
+        // explicitly relax.
         if let Some(tenant) = crate::agent::tenant::current_tenant()
-            && tenant.is_tenant_custom_mcp_tool(tool_name)
+            && let Some(tier) = tenant.custom_mcp_server_risk_tier(tool_name)
         {
-            return ToolRiskTier::Irreversible;
+            return match tier {
+                "safe" => ToolRiskTier::Safe,
+                "reversible" => ToolRiskTier::Reversible,
+                _ => ToolRiskTier::Irreversible,
+            };
         }
         match &self.risk_tiers {
             Some(tiers) => zeroclaw_config::schema::resolve_tool_risk_tier(tiers, tool_name),
@@ -594,13 +603,10 @@ mod tests {
         assert_eq!(mgr.risk_tier("finalize_invoice"), ToolRiskTier::Reversible);
     }
 
-    #[tokio::test]
-    async fn tenant_custom_mcp_tool_is_irreversible_even_with_no_risk_taxonomy_opt_in() {
-        // ADR-006 §B5: this must win even for a manager that never called
-        // with_risk_taxonomy at all — a tenant custom MCP tool is never
-        // merely "Reversible by default", it's Irreversible unconditionally.
-        let mgr = ApprovalManager::for_non_interactive(&supervised_config());
-        let ctx = std::sync::Arc::new(crate::agent::tenant::TenantContext {
+    fn tenant_ctx_with_custom_server_tier(
+        tier: &str,
+    ) -> std::sync::Arc<crate::agent::tenant::TenantContext> {
+        std::sync::Arc::new(crate::agent::tenant::TenantContext {
             tenant_id: "u1:cs".to_string(),
             platform_user_id: "u1".to_string(),
             agent_type: "customer_service".to_string(),
@@ -613,18 +619,55 @@ mod tests {
                 transport: "streamable-http".to_string(),
                 auth_header_name: None,
                 auth_header_value: None,
-                risk_tier: "irreversible".to_string(),
+                risk_tier: tier.to_string(),
                 disabled_tools: Vec::new(),
             }],
-        });
+        })
+    }
+
+    #[tokio::test]
+    async fn tenant_custom_mcp_tool_honors_backend_risk_tier() {
+        // The backend-declared tier drives classification — even for a
+        // manager that never called with_risk_taxonomy. Unknown values fail
+        // closed to Irreversible (pre-removal behavior).
+        let mgr = ApprovalManager::for_non_interactive(&supervised_config());
+        for (tier, expected) in [
+            ("safe", ToolRiskTier::Safe),
+            ("reversible", ToolRiskTier::Reversible),
+            ("irreversible", ToolRiskTier::Irreversible),
+            ("bogus-value", ToolRiskTier::Irreversible),
+        ] {
+            let ctx = tenant_ctx_with_custom_server_tier(tier);
+            crate::agent::tenant::TENANT_CONTEXT
+                .scope(Some(ctx), async {
+                    assert_eq!(
+                        mgr.risk_tier("tenant_orders__refund"),
+                        expected,
+                        "backend tier {tier:?} must map to {expected:?}"
+                    );
+                    // A tool that merely happens to share a substring is unaffected.
+                    assert_eq!(mgr.risk_tier("some_other_tool"), ToolRiskTier::Reversible);
+                })
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn safe_custom_mcp_tool_needs_no_approval_end_to_end() {
+        // "safe" in the backend = the gate is gone for that server: an
+        // explicit user instruction executes with no Pending, no prompt.
+        let mgr = ApprovalManager::for_non_interactive(&supervised_config()).with_risk_taxonomy(
+            zeroclaw_config::schema::ToolRiskTiersConfig::default(),
+            None,
+            None,
+        );
+        let ctx = tenant_ctx_with_custom_server_tier("safe");
         crate::agent::tenant::TENANT_CONTEXT
             .scope(Some(ctx), async {
                 assert_eq!(
-                    mgr.risk_tier("tenant_orders__refund"),
-                    ToolRiskTier::Irreversible
+                    mgr.approval_requirement("tenant_orders__refund"),
+                    ApprovalRequirement::NotRequired
                 );
-                // A tool that merely happens to share a substring is unaffected.
-                assert_eq!(mgr.risk_tier("some_other_tool"), ToolRiskTier::Reversible);
             })
             .await;
     }
