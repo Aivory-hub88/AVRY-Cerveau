@@ -239,6 +239,196 @@ pub(crate) async fn finish_after_max_iterations(
     Ok(accumulated_display_text)
 }
 
+/// Graceful loop-break exit: the loop detector (or identical-output abort)
+/// stopped the turn mid-flight. Same tools-free summary machinery as the
+/// max-iteration exit, but the stop reason names the detector trip instead
+/// of the iteration cap — and unlike the cap path, this NEVER fails the
+/// turn: if the summary call itself fails, the caller still gets the
+/// partial work plus an honest note instead of a 500.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn finish_after_loop_break(
+    model_provider: &dyn ModelProvider,
+    history: &mut Vec<ChatMessage>,
+    provider_name: &str,
+    model: &str,
+    temperature: Option<f64>,
+    pacing: &PacingConfig,
+    cancellation_token: Option<&CancellationToken>,
+    break_message: &str,
+    mut accumulated_display_text: String,
+    turn_id: &str,
+    knobs: &LoopKnobs,
+    new_messages_out: Option<&mut Vec<ChatMessage>>,
+) -> Result<String> {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "model": model,
+                "break_message": break_message,
+                "trace_id": turn_id,
+            })),
+        "tool loop broken by detector, requesting graceful wrap-up"
+    );
+
+    // ErrorAtCap callers treat any cap as a control signal.
+    if knobs.max_iteration_behavior == MaxIterationBehavior::ErrorAtCap {
+        anyhow::bail!("Agent loop aborted by loop detector: {break_message}")
+    }
+
+    let tool_calls_stripped =
+        crate::agent::history_pruner::strip_orphaned_tool_calls_from_assistants(history);
+    let tool_messages_removed =
+        crate::agent::history_pruner::remove_orphaned_tool_messages(history).removed;
+    if tool_calls_stripped > 0 || tool_messages_removed > 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "tool_calls_stripped": tool_calls_stripped,
+                    "tool_messages_removed": tool_messages_removed,
+                })),
+            "Sanitised orphaned tool_use/tool_result pairing before graceful shutdown"
+        );
+    }
+
+    let summary_prompt = ChatMessage::user(
+        format!(
+            "The automated loop guard stopped the tool loop early: {break_message}. \
+             No more tool calls from here. Write your final user-facing answer now: \
+             what was accomplished, what is still pending, and what you need \
+             to continue. Be concrete and brief."
+        ),
+    );
+    let summary_prompt_mirror = summary_prompt.clone();
+    history.push(summary_prompt);
+
+    let stop_note = format!("Stopped early by the loop guard: {break_message}.");
+
+    enum SummaryCall {
+        Cancelled,
+        TimedOut(u64),
+        Done(Result<zeroclaw_providers::ChatResponse>),
+    }
+    let summary_call = {
+        let summary_request = zeroclaw_providers::ChatRequest {
+            messages: history,
+            tools: None, // No tools — force a text response
+            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                .try_with(Clone::clone)
+                .ok()
+                .flatten(),
+        };
+        let access = crate::agent::turn::execution::ResolvedModelAccess {
+            model_provider,
+            provider_name,
+            model,
+            temperature,
+        };
+        let summary_future = access.run_model_query(summary_request);
+        match pacing.step_timeout_secs {
+            Some(step_secs) if step_secs > 0 => {
+                let step_timeout = Duration::from_secs(step_secs);
+                if let Some(token) = cancellation_token {
+                    tokio::select! {
+                        () = token.cancelled() => SummaryCall::Cancelled,
+                        result = tokio::time::timeout(step_timeout, summary_future) => match result {
+                            Ok(inner) => SummaryCall::Done(inner),
+                            Err(_) => SummaryCall::TimedOut(step_secs),
+                        },
+                    }
+                } else {
+                    match tokio::time::timeout(step_timeout, summary_future).await {
+                        Ok(inner) => SummaryCall::Done(inner),
+                        Err(_) => SummaryCall::TimedOut(step_secs),
+                    }
+                }
+            }
+            _ => {
+                if let Some(token) = cancellation_token {
+                    tokio::select! {
+                        () = token.cancelled() => SummaryCall::Cancelled,
+                        result = summary_future => SummaryCall::Done(result),
+                    }
+                } else {
+                    SummaryCall::Done(summary_future.await)
+                }
+            }
+        }
+    };
+
+    // Unlike the cap path, a failed wrap-up must not fail the turn: the
+    // user keeps the partial work plus the stop reason.
+    let mut canned_fallback = || {
+        history.pop();
+        if !accumulated_display_text.is_empty() {
+            accumulated_display_text.push_str("\n\n");
+        }
+        accumulated_display_text.push_str(&stop_note);
+        accumulated_display_text.push_str(
+            " The closing summary could not be generated, but the work above stands.",
+        );
+        Ok(accumulated_display_text.clone())
+    };
+    let resp = match summary_call {
+        SummaryCall::Cancelled => return Err(ToolLoopCancelled.into()),
+        SummaryCall::TimedOut(step_secs) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Provider)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "model": model,
+                        "provider": provider_name,
+                        "trace_id": turn_id,
+                        "error": format!("wrap-up timed out after {step_secs}s"),
+                    })),
+                "loop-break wrap-up timed out; returning partial work"
+            );
+            return canned_fallback();
+        }
+        SummaryCall::Done(Err(e)) => {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Provider)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "model": model,
+                        "provider": provider_name,
+                        "trace_id": turn_id,
+                        "error": format!("{e}"),
+                    })),
+                "loop-break wrap-up call failed; returning partial work"
+            );
+            return canned_fallback();
+        }
+        SummaryCall::Done(Ok(resp)) => resp,
+    };
+
+    let text = resp.text.unwrap_or_default();
+    if text.is_empty() {
+        return canned_fallback();
+    }
+    let summary_msg = ChatMessage::assistant(text.clone());
+    if let Some(out) = new_messages_out {
+        out.push(summary_prompt_mirror);
+        out.push(summary_msg.clone());
+    }
+    history.push(summary_msg);
+    if !accumulated_display_text.is_empty() {
+        accumulated_display_text.push_str("\n\n");
+    }
+    accumulated_display_text.push_str(&text);
+    accumulated_display_text.push_str("\n\n");
+    accumulated_display_text.push_str(&stop_note);
+    Ok(accumulated_display_text)
+}
+
 #[cfg(test)]
 mod graceful_summary_metering_tests {
     use super::finish_after_max_iterations;
@@ -748,6 +938,169 @@ mod graceful_summary_metering_tests {
             !delta.contains("earlier narration"),
             "chunk must not re-send earlier narration: {delta}"
         );
+    }
+}
+
+#[cfg(test)]
+mod loop_break_wrap_up_tests {
+    use super::finish_after_loop_break;
+    use crate::agent::turn::LoopKnobs;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use zeroclaw_api::model_provider::{ChatRequest, ChatResponse};
+    use zeroclaw_config::schema::PacingConfig;
+    use zeroclaw_providers::{ChatMessage, ModelProvider};
+
+    struct HappyProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for HappyProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("wrap-up".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: Some("here is what got done".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl Attributable for HappyProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "happy-provider"
+        }
+    }
+
+    struct FailingProvider;
+
+    #[async_trait]
+    impl ModelProvider for FailingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("provider down")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("provider down")
+        }
+    }
+
+    impl Attributable for FailingProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "failing-provider"
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_break(
+        provider: &dyn ModelProvider,
+        history: &mut Vec<ChatMessage>,
+        accumulated: String,
+    ) -> anyhow::Result<String> {
+        finish_after_loop_break(
+            provider,
+            history,
+            "custom",
+            "test-model",
+            None,
+            &PacingConfig::default(),
+            None,
+            "tool 'create_lead' has succeeded 9 times this turn",
+            accumulated,
+            "trace-break-test",
+            &LoopKnobs::default(),
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn break_returns_summary_with_stop_note_not_an_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = HappyProvider {
+            calls: Arc::clone(&calls),
+        };
+        let mut history = vec![
+            ChatMessage::user("log the lead"),
+            ChatMessage::assistant("working on it"),
+        ];
+        let out = run_break(&provider, &mut history, "partial work".to_string())
+            .await
+            .expect("loop break must never fail the turn");
+        assert!(out.contains("here is what got done"), "summary missing: {out}");
+        assert!(out.contains("partial work"), "partial work lost: {out}");
+        assert!(
+            out.contains("Stopped early by the loop guard"),
+            "stop note missing: {out}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "provider called once");
+    }
+
+    #[tokio::test]
+    async fn break_with_dead_provider_returns_canned_partial_not_an_error() {
+        let provider = FailingProvider;
+        let mut history = vec![ChatMessage::user("log the lead")];
+        let out = run_break(&provider, &mut history, "partial work".to_string())
+            .await
+            .expect("dead provider on wrap-up must still not fail the turn");
+        assert!(out.contains("partial work"), "partial work lost: {out}");
+        assert!(
+            out.contains("Stopped early by the loop guard"),
+            "stop note missing: {out}"
+        );
+        assert!(
+            out.contains("could not be generated"),
+            "honest fallback note missing: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn break_error_downcasts_to_loop_break() {
+        let err: anyhow::Error = crate::agent::turn::results_collect::LoopBreak {
+            message: "boom".to_string(),
+        }
+        .into();
+        let b = err
+            .downcast_ref::<crate::agent::turn::results_collect::LoopBreak>()
+            .expect("turn loop must recognise the typed break");
+        assert_eq!(b.message, "boom");
+        assert!(err.to_string().contains("aborted by loop detector"));
     }
 }
 
