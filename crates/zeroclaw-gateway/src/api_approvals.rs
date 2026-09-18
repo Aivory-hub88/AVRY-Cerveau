@@ -176,6 +176,28 @@ pub async fn handle_resolve_approval(
         ));
     }
 
+    // Ownership: rows created with tenant context belong to that tenant.
+    // Loopback/pairing auth proves "this is the operator", never "this is
+    // the tenant that owns this row" — resolving them here would let any
+    // local process (or SSRF-to-localhost) approve AND execute another
+    // tenant's irreversible calls, or deny them (cross-tenant DoS).
+    // Tenant rows resolve exclusively via the tenant-scoped
+    // POST /webhook/approvals/{id}/resolve, which checks X-Tenant-Id
+    // against the row. Host rows (no tenant context: CLI-originated)
+    // keep working here exactly as before.
+    if row.tenant_id.is_some() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!(
+                    "pending approval {id} belongs to a tenant and cannot be \
+                     resolved via the operator endpoint — resolve it via \
+                     POST /webhook/approvals/{{id}}/resolve as the owning tenant"
+                ),
+            })),
+        ));
+    }
+
     match body.decision.as_str() {
         "deny" => {
             store

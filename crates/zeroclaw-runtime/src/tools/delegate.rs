@@ -1754,9 +1754,21 @@ impl DelegateTool {
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
         let __zc_delegate_alias = agent_name_owned.clone();
+        // Tenant isolation: `spawn` does not inherit task-locals, so without
+        // this the sub-turn runs tenant-less — host memory, vanilla MCP
+        // grants, no backend risk-tier floor. Capture the parent's overlays
+        // and re-scope them inside (same tenant, same turn origin).
+        let tenant_overlay = crate::agent::tenant::current_tenant();
+        let turn_origin_overlay = crate::agent::tenant::current_turn_origin();
 
         zeroclaw_spawn::spawn!(
             scope_delegate_session_key(parent_session_key, async move {
+                crate::agent::tenant::TENANT_CONTEXT
+                    .scope(
+                        tenant_overlay,
+                        crate::agent::tenant::TURN_ORIGIN_CONTEXT.scope(
+                            turn_origin_overlay,
+                            async move {
                 let inner = DelegateTool {
                     agents,
                     security,
@@ -1909,6 +1921,10 @@ impl DelegateTool {
                 Self::background_task_cancels()
                     .lock()
                     .remove(&task_id_clone);
+                            }
+                        )
+                    )
+                    .await
             })
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
