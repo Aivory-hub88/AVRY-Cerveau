@@ -3877,10 +3877,16 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         zeroclaw_gateway::tenant::ToolkitConnectionResolver::global()
                             .resolve(&sel.user_id)
                             .await;
+                    // Fail closed like persona `Err` above: an unresolvable
+                    // denylist must reject rather than run un-gated.
                     let disabled_toolkits =
-                        zeroclaw_gateway::tenant::AgentToolScopeResolver::global()
+                        match zeroclaw_gateway::tenant::AgentToolScopeResolver::global()
                             .resolve(&sel)
-                            .await;
+                            .await
+                        {
+                            Some(list) => list,
+                            None => return None,
+                        };
                     let tenant_custom_mcp_servers =
                         zeroclaw_gateway::tenant::TenantCustomMcpResolver::global()
                             .resolve(&sel)
