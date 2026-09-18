@@ -47,9 +47,9 @@ pub(crate) async fn gate_tool_approval(
         // out-of-band (see `pending_approvals`'s module doc). A row with no
         // tenant context (loopback/CLI-originated) still works exactly as
         // before — out-of-band execution only.
-        let pending_id = match ctx.approval.and_then(|mgr| mgr.pending_store()) {
-            Some(store) => store
-                .insert_with_context(
+        let pending_id: Option<String> = match ctx.approval.and_then(|mgr| mgr.pending_store()) {
+            Some(store) => {
+                let id = match store.insert_with_context(
                     &principal,
                     tool_name,
                     &tool_args.to_string(),
@@ -59,8 +59,91 @@ pub(crate) async fn gate_tool_approval(
                     turn_origin.as_ref().and_then(|o| o.session_id.as_deref()),
                     turn_origin.as_ref().map(|o| o.origin_message.as_str()),
                     turn_origin.as_ref().and_then(|o| o.schedule_id.as_deref()),
-                )
-                .ok(),
+                ) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "model": ctx.model,
+                                "iteration": iteration + 1,
+                                "tool": tool_name,
+                                "error": format!("{e:#}"),
+                                "trace_id": ctx.turn_id,
+                            })),
+                            "pending-approval insert failed — the request was NOT \
+                             recorded and cannot be resolved later"
+                        );
+                        return ApprovalGateOutcome::Deny(ToolExecutionOutcome {
+                            output: "Requires human approval before it can run (risk tier: irreversible), \
+                                     but recording the pending-approval request failed — \
+                                     the request was NOT recorded and cannot be resolved later."
+                                .to_string(),
+                            success: false,
+                            error_reason: Some(
+                                "pending-approval store insert failed".to_string(),
+                            ),
+                            duration: Duration::ZERO,
+                            receipt: None,
+                            output_data: None,
+                        });
+                    }
+                };
+                // Read-your-write guarantee: the id must already be durably
+                // readable from this same store instance before anything
+                // downstream (the `pending_approval` response field, the
+                // reply text, the task-local summary) surfaces it. On the
+                // current SQLite-backed store this is a single indexed PK
+                // lookup on the same `Mutex<Connection>` that just committed
+                // the insert, so it cannot fail spuriously — a miss here
+                // means the store backend itself is broken (e.g. a future
+                // pooled/remote backend serving a stale replica), and
+                // handing the id out anyway would produce exactly the
+                // "approve returns 404 for a real approval" symptom. Never
+                // surface an unverifiable id.
+                match store.get(&id) {
+                    Ok(Some(_)) => Some(id),
+                    Ok(None) | Err(_) => {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "model": ctx.model,
+                                "iteration": iteration + 1,
+                                "tool": tool_name,
+                                "pending_id": id,
+                                "trace_id": ctx.turn_id,
+                            })),
+                            "pending-approval insert not immediately readable — \
+                             the request was NOT surfaced and cannot be resolved later"
+                        );
+                        return ApprovalGateOutcome::Deny(ToolExecutionOutcome {
+                            output: "Requires human approval before it can run (risk tier: irreversible), \
+                                     but the pending-approval record could not be confirmed — \
+                                     the request was NOT recorded and cannot be resolved later."
+                                .to_string(),
+                            success: false,
+                            error_reason: Some(
+                                "pending-approval store verification read failed".to_string(),
+                            ),
+                            duration: Duration::ZERO,
+                            receipt: None,
+                            output_data: None,
+                        });
+                    }
+                }
+            }
             None => None,
         };
         if let Some(id) = &pending_id {
@@ -324,5 +407,143 @@ pub(crate) async fn gate_tool_approval(
 
     ApprovalGateOutcome::Proceed {
         approved: approval_requirement == ApprovalRequirement::Approved,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::tenant::{
+        LAST_PENDING_APPROVAL, TENANT_CONTEXT, TURN_ORIGIN_CONTEXT, TenantContext,
+        TurnOriginContext, take_pending_approval,
+    };
+    use crate::approval::ApprovalManager;
+    use crate::control_plane::pending_approvals::PendingApprovalsStore;
+    use crate::observability::NoopObserver;
+    use crate::security::AutonomyLevel;
+    use std::sync::Arc;
+    use zeroclaw_config::schema::{RiskProfileConfig, ToolRiskTiersConfig};
+
+    /// The read-your-write guarantee: an approval id produced by the exact
+    /// code path a real tool-call-needing-approval takes
+    /// (`gate_tool_approval` → `insert_with_context` → task-local summary →
+    /// response `output_data`) must already be durably readable via
+    /// `store.get(&id)` the instant it is handed out — never 404 on first
+    /// contact. Regression test for the 2026-09-17 production incident
+    /// where Approve clicked the instant a card appeared returned
+    /// `no pending approval with id ...` (that incident turned out to be
+    /// proxy fan-out 404s plus a 53s synchronous continuation, not a store
+    /// race — this test pins the store side regardless, so a future
+    /// backend swap can never reintroduce it silently).
+    #[tokio::test]
+    async fn gated_tool_approval_id_is_immediately_readable() {
+        let store = Arc::new(PendingApprovalsStore::new_in_memory().unwrap());
+        let profile = RiskProfileConfig {
+            level: AutonomyLevel::Supervised,
+            ..RiskProfileConfig::default()
+        };
+        let tiers = ToolRiskTiersConfig {
+            irreversible: vec!["finalize_invoice".to_string()],
+            reversible: vec![],
+        };
+        let mgr = ApprovalManager::for_non_interactive(&profile).with_risk_taxonomy(
+            tiers,
+            None,
+            Some(Arc::clone(&store)),
+        );
+
+        let tenant = Arc::new(TenantContext {
+            tenant_id: "u1.leads_qualifier".to_string(),
+            platform_user_id: "u1".to_string(),
+            agent_type: "leads_qualifier".to_string(),
+            persona: None,
+            connected_toolkits: Vec::new(),
+            disabled_toolkits: Vec::new(),
+            tenant_custom_mcp_servers: Vec::new(),
+        });
+        let turn_origin = Arc::new(TurnOriginContext {
+            session_id: Some("sess-1".to_string()),
+            origin_message: "please finalize invoice inv_123".to_string(),
+            schedule_id: None,
+        });
+        let pending_cell = Arc::new(parking_lot::Mutex::new(None));
+
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let empty_tools: Vec<String> = Vec::new();
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test",
+            model: "test-model",
+            temperature: None,
+            approval: Some(&mgr),
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &empty_tools,
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let tool_args = serde_json::json!({"invoice_id": "inv_123"});
+        let (pending_id, summary_id) = TENANT_CONTEXT
+            .scope(
+                Some(tenant),
+                TURN_ORIGIN_CONTEXT.scope(
+                    Some(turn_origin),
+                    LAST_PENDING_APPROVAL.scope(Some(pending_cell), async {
+                        let pending_id = match gate_tool_approval(
+                            &ctx,
+                            "finalize_invoice",
+                            &tool_args,
+                            0,
+                        )
+                        .await
+                        {
+                            ApprovalGateOutcome::Deny(outcome) => {
+                                assert!(!outcome.success);
+                                outcome
+                                    .output_data
+                                    .as_ref()
+                                    .and_then(|v| v.get("pending_id"))
+                                    .and_then(|v| v.as_str())
+                                    .expect("deny carries output_data.pending_id")
+                                    .to_string()
+                            }
+                            other => panic!(
+                                "irreversible tool on non-interactive must deny-pending, got {}",
+                                match other {
+                                    ApprovalGateOutcome::Proceed { .. } => "Proceed",
+                                    ApprovalGateOutcome::Deny(_) => "Deny",
+                                    ApprovalGateOutcome::Replace(_) => "Replace",
+                                }
+                            ),
+                        };
+                        // Still inside the scope: this is the only place the
+                        // summary is readable (it is taken, not copied).
+                        let summary = take_pending_approval().expect("summary recorded");
+                        (pending_id, summary.id)
+                    }),
+                ),
+            )
+            .await;
+
+        // The task-local summary handed to the response path names the same id.
+        assert_eq!(summary_id, pending_id);
+
+        // And that id is durably readable *right now* — this is the
+        // invariant the resolve endpoint depends on.
+        let row = store.get(&pending_id).unwrap().expect("row readable");
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.tool_name, "finalize_invoice");
+        assert_eq!(row.tenant_id.as_deref(), Some("u1.leads_qualifier"));
+        assert_eq!(row.agent_type.as_deref(), Some("leads_qualifier"));
     }
 }

@@ -28,8 +28,20 @@ use std::time::{Duration, Instant};
 /// Process-global sliding-window counters. Keyed by
 /// `(tenant_id, agent_type, tool_name)` so one tenant's bulk work never
 /// throttles another, and one agent's loop never throttles its teammates.
+///
+/// Turns with no tenant context share the `("", "", tool)` bucket on
+/// purpose: losing context narrows the budget (parks sooner), never widens
+/// it. The map itself is bounded (see `MAX_REGISTRY_KEYS`): evicting a key
+/// only resets that triple's count, which fails open toward availability
+/// (a few more calls) rather than toward silent execution — and the
+/// in-turn burst detector still bounds any single turn.
 static REGISTRY: LazyLock<Mutex<HashMap<(String, String, String), VecDeque<Instant>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Upper bound on tracked triples. Hit only under adversarial or pathological
+/// load (10k distinct tenant/agent/tool combos inside one window); normal
+/// fleets track dozens.
+const MAX_REGISTRY_KEYS: usize = 10_000;
 
 /// Check a would-be tool call against the velocity gate.
 ///
@@ -75,12 +87,28 @@ pub(crate) fn check_velocity_park(
     let now = Instant::now();
     let count = {
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = registry.entry(key).or_default();
-        while entry.front().is_some_and(|t| now.duration_since(*t) > window) {
-            entry.pop_front();
+        let len = {
+            let entry = registry.entry(key).or_default();
+            while entry.front().is_some_and(|t| now.duration_since(*t) > window) {
+                entry.pop_front();
+            }
+            entry.push_back(now);
+            entry.len()
+        };
+        if registry.len() > MAX_REGISTRY_KEYS {
+            // Shed load: drop fully-expired keys first, else one arbitrary
+            // key. Eviction only ever resets a count (fail-open toward a few
+            // more calls, never toward unlogged execution).
+            registry.retain(|_, times| {
+                times.front().is_some_and(|t| now.duration_since(*t) <= window)
+            });
+            if registry.len() > MAX_REGISTRY_KEYS
+                && let Some(victim) = registry.keys().next().cloned()
+            {
+                registry.remove(&victim);
+            }
         }
-        entry.push_back(now);
-        entry.len()
+        len
     };
     if count <= max_calls {
         return None;
@@ -132,27 +160,70 @@ fn park_as_pending(
         _ => "reversible",
     };
 
-    let pending_id: Option<String> = ctx
-        .approval
-        .and_then(|mgr| mgr.pending_store())
-        .and_then(|store| {
-            let id = store
-                .insert_with_context(
-                    &principal,
-                    tool_name,
-                    &tool_args.to_string(),
-                    tier_label,
-                    tenant.as_ref().map(|t| t.tenant_id.as_str()),
-                    tenant.as_ref().map(|t| t.agent_type.as_str()),
-                    turn_origin.as_ref().and_then(|o| o.session_id.as_deref()),
-                    turn_origin.as_ref().map(|o| o.origin_message.as_str()),
-                    turn_origin.as_ref().and_then(|o| o.schedule_id.as_deref()),
-                )
-                .ok()?;
-            // Read-your-write: never hand out an id the store cannot
-            // already serve back (mirrors the gate's own guarantee).
-            store.get(&id).ok().flatten().map(|_| id)
-        });
+    let store_opt = ctx.approval.and_then(|mgr| mgr.pending_store());
+    let Some(store) = store_opt else {
+        return deny_unrecorded(
+            ctx,
+            tool_name,
+            count,
+            "no pending-approval store is configured for this agent",
+            false,
+        );
+    };
+    let id = match store.insert_with_context(
+        &principal,
+        tool_name,
+        &tool_args.to_string(),
+        tier_label,
+        tenant.as_ref().map(|t| t.tenant_id.as_str()),
+        tenant.as_ref().map(|t| t.agent_type.as_str()),
+        turn_origin.as_ref().and_then(|o| o.session_id.as_deref()),
+        turn_origin.as_ref().map(|o| o.origin_message.as_str()),
+        turn_origin.as_ref().and_then(|o| o.schedule_id.as_deref()),
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "tool": tool_name,
+                        "error": format!("{e:#}"),
+                        "trace_id": ctx.turn_id,
+                    })),
+                "velocity-park insert failed — the request was NOT recorded"
+            );
+            return deny_unrecorded(
+                ctx,
+                tool_name,
+                count,
+                "recording the pending-approval request failed",
+                true,
+            );
+        }
+    };
+    // Read-your-write: never hand out an id the store cannot already serve
+    // back (mirrors the gate's own guarantee).
+    let pending_id: Option<String> = match store.get(&id) {
+        Ok(Some(_)) => Some(id),
+        Ok(None) | Err(_) => {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "tool": tool_name,
+                        "pending_id": id,
+                        "trace_id": ctx.turn_id,
+                    })),
+                "velocity-park insert not immediately readable — not surfacing the id"
+            );
+            None
+        }
+    };
 
     if let Some(id) = &pending_id {
         crate::agent::tenant::record_pending_approval(
@@ -170,10 +241,14 @@ fn park_as_pending(
              in the recent window (possible loop — see pending_id={id}). \
              Say 'ya' to run it anyway, 'batal' to stop."
         ),
+        // The row was inserted but the verification read failed: the id is
+        // deliberately withheld (same rule as the gate — never surface an
+        // unverifiable id), so report honestly instead of fake-parking.
         None => format!(
             "Not running '{tool_name}': it already ran {count} times in the \
-             recent window (possible loop), and no pending-approval store is \
-             configured so the request could not be recorded."
+             recent window (possible loop), and the pending-approval record \
+             could not be confirmed — the request was NOT recorded and cannot \
+             be resolved later."
         ),
     };
     if let Some(tx) = ctx.on_delta {
@@ -188,6 +263,51 @@ fn park_as_pending(
         duration: StdDuration::ZERO,
         receipt: None,
         output_data: pending_id.map(|id| serde_json::json!({"pending_id": id})),
+    })
+}
+
+/// Deny without a pending row, with an honest reason: either no store is
+/// configured, or recording failed. Never claims the call was parked.
+fn deny_unrecorded(
+    ctx: &TurnCtx<'_>,
+    tool_name: &str,
+    count: usize,
+    reason: &str,
+    log_error: bool,
+) -> ApprovalGateOutcome {
+    use crate::agent::tool_execution::ToolExecutionOutcome;
+    use std::time::Duration as StdDuration;
+
+    if log_error {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "tool": tool_name,
+                    "trace_id": ctx.turn_id,
+                })),
+            "velocity-park could not be recorded"
+        );
+    }
+    let message = format!(
+        "Not running '{tool_name}': it already ran {count} times in the \
+         recent window (possible loop), and {reason} — the request was NOT \
+         recorded and cannot be resolved later."
+    );
+    if let Some(tx) = ctx.on_delta {
+        let _ = tx.send(super::events::StreamDelta::Status(format!(
+            "\u{23f8}\u{fe0f} {tool_name}: {message}\n"
+        )));
+    }
+    ApprovalGateOutcome::Deny(ToolExecutionOutcome {
+        output: message.clone(),
+        success: false,
+        error_reason: Some(message),
+        duration: StdDuration::ZERO,
+        receipt: None,
+        output_data: None,
     })
 }
 
