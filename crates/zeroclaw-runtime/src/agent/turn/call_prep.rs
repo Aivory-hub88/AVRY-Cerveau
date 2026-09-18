@@ -255,6 +255,30 @@ pub(crate) async fn prepare_tool_calls(
             }
         }
 
+        // ── Cross-turn write-velocity gate ─────────────────
+        // Counts would-execute mutating calls per (tenant, agent, tool) in
+        // a sliding window that survives across turns. Past budget, the
+        // call parks as a pending approval (same F-1 row the irreversible
+        // tier produces) instead of executing — this is what stops a
+        // once-per-turn "successful" loop the in-turn detector can never
+        // see. Runs before the approval gate; denied/prompted/pending
+        // calls are untouched and unconsumed.
+        if let Some(parked) = super::velocity_gate::check_velocity_park(
+            ctx,
+            &tool_name,
+            &tool_args,
+            iteration,
+        ) {
+            if let super::approval_gate::ApprovalGateOutcome::Deny(outcome) = parked {
+                if let Some(tx) = ctx.event_tx {
+                    emit_tool_call_pair(tx, call, &outcome).await;
+                }
+                ordered_results[idx] =
+                    Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
+                continue;
+            }
+        }
+
         // ── Approval hook ────────────────────────────────
         let approved = match gate_tool_approval(ctx, &tool_name, &tool_args, iteration).await {
             ApprovalGateOutcome::Proceed { approved } => approved,
