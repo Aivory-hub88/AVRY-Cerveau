@@ -684,6 +684,39 @@ mod loop_break_wrap_up_tests {
 
     struct FailingProvider;
 
+    struct HangingProvider;
+
+    #[async_trait]
+    impl ModelProvider for HangingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            std::future::pending().await
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            std::future::pending().await
+        }
+    }
+
+    impl Attributable for HangingProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "hanging-provider"
+        }
+    }
+
     #[async_trait]
     impl ModelProvider for FailingProvider {
         async fn chat_with_system(
@@ -775,6 +808,38 @@ mod loop_break_wrap_up_tests {
         assert!(
             out.contains("could not be generated"),
             "honest fallback note missing: {out}"
+        );
+    }
+
+    /// The break wrap-up must honor step_timeout like the cap path: a hung
+    /// provider resolves to the canned partial answer, never hangs the turn.
+    /// (Guards the rebase: upstream rewrote this function's summary path.)
+    #[tokio::test]
+    async fn break_wrap_up_honors_step_timeout() {
+        let provider = HangingProvider;
+        let mut history = vec![ChatMessage::user("log the lead")];
+        let mut pacing = PacingConfig::default();
+        pacing.step_timeout_secs = Some(1);
+        let out = finish_after_loop_break(
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            None,
+            &pacing,
+            None,
+            "tool 'x' broke the loop",
+            "partial work".to_string(),
+            "trace-break-timeout",
+            &LoopKnobs::default(),
+            None,
+        )
+        .await
+        .expect("timed-out wrap-up must fall back, not fail");
+        assert!(out.contains("partial work"), "partial work lost: {out}");
+        assert!(
+            out.contains("Stopped early by the loop guard"),
+            "stop note missing: {out}"
         );
     }
 
