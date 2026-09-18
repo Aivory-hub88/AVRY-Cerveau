@@ -99,6 +99,28 @@ impl Tool for TaskCreateTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        // Orphan sweep first: park this tenant+agent's dead in-progress rows
+        // from other sessions before doing anything else. Never fails the
+        // call — a sweep error is logged, the requested operation proceeds.
+        if let Err(e) = self
+            .ctx
+            .ledger
+            .park_orphaned_tasks(
+                &self.ctx.tenant_id,
+                &self.ctx.agent_type,
+                self.ctx.session_id.as_deref(),
+            )
+            .await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{e:#}")})),
+                "orphan sweep failed; continuing with the requested ledger operation"
+            );
+        }
         let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
         if title.is_empty() {
             return Ok(ToolResult {
@@ -276,6 +298,27 @@ impl Tool for TaskUpdateStatusTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        // Orphan sweep first (see TaskCreateTool): park dead in_progress
+        // rows from other sessions. Never fails the call.
+        if let Err(e) = self
+            .ctx
+            .ledger
+            .park_orphaned_tasks(
+                &self.ctx.tenant_id,
+                &self.ctx.agent_type,
+                self.ctx.session_id.as_deref(),
+            )
+            .await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{e:#}")})),
+                "orphan sweep failed; continuing with the requested ledger operation"
+            );
+        }
         let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("").trim();
         if task_id.is_empty() {
             return Ok(ToolResult {
@@ -410,6 +453,27 @@ impl Tool for TaskListTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        // Orphan sweep first (see TaskCreateTool): park dead in_progress
+        // rows from other sessions. Never fails the call.
+        if let Err(e) = self
+            .ctx
+            .ledger
+            .park_orphaned_tasks(
+                &self.ctx.tenant_id,
+                &self.ctx.agent_type,
+                self.ctx.session_id.as_deref(),
+            )
+            .await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{e:#}")})),
+                "orphan sweep failed; continuing with the requested ledger operation"
+            );
+        }
         let status = match args.get("status").and_then(|v| v.as_str()) {
             Some(s) => match TaskStatus::parse(s) {
                 Some(status) => Some(status),

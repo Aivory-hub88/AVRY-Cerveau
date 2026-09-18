@@ -47,6 +47,12 @@ const ARCHIVE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_se
 /// operator/agent context, not a report; the newest ones are what matters.
 const ARCHIVE_LIST_LIMIT: i64 = 20;
 
+/// In-progress rows from another session older than this are orphans: no
+/// live turn can still own them (turns last minutes, capped at 10 tool
+/// iterations), while the dashboard flags stuck work much earlier — so the
+/// sweep never races a running turn, it only buries the dead.
+const ORPHAN_PARK_AFTER_MINUTES: i64 = 30;
+
 /// Lifecycle state of a task. Terminal state is `Done` — re-opening a done
 /// task is deliberately not supported; the clean way to correct a mistake
 /// after the fact is a new task referencing the old one, not mutating
@@ -204,8 +210,7 @@ impl AgentTaskLedger {
     /// same libpq key=value DSN every other Cerveau Postgres consumer uses
     /// (NOT a `postgresql://` URL — see CERVEAU-STATUS.md §7).
     pub async fn connect(db_url: &str, schema: &str) -> Result<Self> {
-        let db_url = db_url.to_string();
-        let schema_owned = schema.to_string();
+        let db_url = db_url.to_string();        let schema_owned = schema.to_string();
         // Connect AND create-table-if-missing on the SAME spawned OS thread,
         // in one continuous synchronous call chain — see
         // `PgCapabilityGraph::connect`'s doc comment for why splitting this
@@ -253,6 +258,59 @@ impl AgentTaskLedger {
     }
 
     /// Create a task in `todo`. Returns the generated `task_id`.
+    /// Orphan sweep: park `in_progress` rows whose turn is gone.
+    ///
+    /// A row is orphaned when it belongs to a DIFFERENT session than the
+    /// calling turn and hasn't moved for longer than
+    /// `ORPHAN_PARK_AFTER_MINUTES`. Same-session rows are never touched
+    /// (the owner may still be running or about to continue), `todo` rows
+    /// are plans not orphans, and `blocked` rows already surface in Waiting
+    /// with the operator Stop button — only `in_progress` can lie about
+    /// running. Parked rows keep their history; the operator or a resumed
+    /// turn can still finish them.
+    ///
+    /// Called piggyback on every ledger tool execution (create/list/update),
+    /// so no turn needs to remember it — and turns that never touch the
+    /// ledger cannot orphan anything. Returns the number parked.
+    ///
+    /// [`ORPHAN_PARK_AFTER_MINUTES`] bounds the sweep: well under the
+    /// dashboard's stuck flag, well over any single turn's lifetime, so a
+    /// live turn's rows (same session, or minutes fresh) can never match.
+    pub async fn park_orphaned_tasks(
+        &self,
+        tenant_id: &str,
+        agent_type: &str,
+        current_session: Option<&str>,
+    ) -> Result<u64> {
+        let Some(session) = current_session else {
+            return Ok(0);
+        };
+        let client = Arc::clone(self.client.get());
+        let schema = self.schema.clone();
+        let tenant_id = tenant_id.to_string();
+        let agent_type = agent_type.to_string();
+        let session = session.to_string();
+        let older_than_minutes = ORPHAN_PARK_AFTER_MINUTES.to_string();
+        run_on_os_thread(move || -> Result<u64> {
+            let mut client = client.lock();
+            let rows = client.execute(
+                &format!(
+                    r#"UPDATE "{schema}".agent_tasks
+                       SET status = 'blocked',
+                           blocked_reason = 'Orphaned: its turn ended without closing it; parked automatically. Reply in this thread to resume it, or Stop it from Mission Control.',
+                           updated_at = NOW()
+                       WHERE tenant_id = $1 AND agent_type = $2
+                         AND status = 'in_progress'
+                         AND session_id IS DISTINCT FROM $3
+                         AND updated_at < NOW() - ($4 || ' minutes')::interval"#
+                ),
+                &[&tenant_id, &agent_type, &session, &older_than_minutes],
+            )?;
+            Ok(rows)
+        })
+        .await
+    }
+
     pub async fn create_task(
         &self,
         tenant_id: &str,

@@ -184,5 +184,71 @@ async fn task_ledger_end_to_end() {
         "a stopped task stays stopped even when the agent writes late"
     );
 
+    // ── Scenario 6: orphan sweep parks dead in_progress rows ──
+    // A new turn in session-2 must park session-1's stale in_progress row
+    // (older than the sweep threshold) but leave same-session and fresh
+    // rows alone.
+    let orphan_id = ledger
+        .create_task(
+            "tenant-a",
+            "finance_invoice_ops",
+            Some("session-1"),
+            "Old turn that died",
+            TaskPriority::Normal,
+        )
+        .await
+        .expect("create orphan probe");
+    let live_id = ledger
+        .create_task(
+            "tenant-a",
+            "finance_invoice_ops",
+            Some("session-2"),
+            "Current turn work",
+            TaskPriority::Normal,
+        )
+        .await
+        .expect("create live probe");
+    ledger
+        .update_status("tenant-a", &orphan_id, TaskStatus::InProgress, None)
+        .await
+        .expect("orphan to in_progress");
+    ledger
+        .update_status("tenant-a", &live_id, TaskStatus::InProgress, None)
+        .await
+        .expect("live to in_progress");
+    exec(&format!(
+        "UPDATE {SCHEMA}.agent_tasks SET updated_at = NOW() - INTERVAL '2 hours' \
+         WHERE task_id = '{orphan_id}';"
+    ))
+    .await;
+    let parked = ledger
+        .park_orphaned_tasks("tenant-a", "finance_invoice_ops", Some("session-2"))
+        .await
+        .expect("sweep");
+    assert_eq!(parked, 1, "exactly the stale foreign-session row parks");
+    let orphan = ledger
+        .get_task("tenant-a", &orphan_id)
+        .await
+        .expect("get orphan")
+        .expect("orphan row still exists");
+    assert_eq!(orphan.status, TaskStatus::Blocked);
+    assert!(
+        orphan.blocked_reason.as_deref().unwrap_or("").contains("Orphaned"),
+        "park reason must say orphaned: {:?}",
+        orphan.blocked_reason
+    );
+    let live = ledger
+        .get_task("tenant-a", &live_id)
+        .await
+        .expect("get live")
+        .expect("live row still exists");
+    assert_eq!(live.status, TaskStatus::InProgress);
+    // No session scope → no sweep (cannot tell dead from alive).
+    let noscope = ledger
+        .park_orphaned_tasks("tenant-a", "finance_invoice_ops", None)
+        .await
+        .expect("unscoped sweep");
+    assert_eq!(noscope, 0);
+
     exec(&format!("DROP SCHEMA IF EXISTS {SCHEMA} CASCADE;")).await;
 }
