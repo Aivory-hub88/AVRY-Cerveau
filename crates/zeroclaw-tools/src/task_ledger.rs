@@ -302,6 +302,18 @@ impl Tool for TaskUpdateStatusTool {
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
+        if status == TaskStatus::Cancelled {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(
+                    "only the operator stops tasks (Mission Control Stop button) — \
+                     mark 'blocked' with a reason instead"
+                        .to_string(),
+                ),
+            });
+        }
+
         if status == TaskStatus::Blocked && blocked_reason.is_none() {
             return Ok(ToolResult {
                 success: false,

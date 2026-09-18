@@ -58,6 +58,13 @@ pub enum TaskStatus {
     InProgress,
     Blocked,
     Done,
+    /// Operator-stopped via the dashboard Stop button (dashboard writes it
+    /// directly — no agent tool accepts it). Terminal like `done`, but means
+    /// "abandoned" rather than "delivered": the board hides it, the DB keeps
+    /// it, and late agent writes to it are a silent no-op (see
+    /// `update_status`). Reads surface it instead of mistaking it for
+    /// `todo` — an agent that sees `cancelled` must not redo the work.
+    Cancelled,
 }
 
 impl TaskStatus {
@@ -67,6 +74,7 @@ impl TaskStatus {
             TaskStatus::InProgress => "in_progress",
             TaskStatus::Blocked => "blocked",
             TaskStatus::Done => "done",
+            TaskStatus::Cancelled => "cancelled",
         }
     }
 
@@ -76,6 +84,7 @@ impl TaskStatus {
             "in_progress" => Some(TaskStatus::InProgress),
             "blocked" => Some(TaskStatus::Blocked),
             "done" => Some(TaskStatus::Done),
+            "cancelled" => Some(TaskStatus::Cancelled),
             _ => None,
         }
     }
@@ -311,13 +320,19 @@ impl AgentTaskLedger {
         let task_id_for_error = task_id_owned.clone();
         let status_str = status.as_str().to_string();
         let blocked_reason = blocked_reason.map(str::to_string);
+        // Clones for the cancelled-row probe below (the update closure moves
+        // the originals onto its OS thread).
+        let tenant_probe = tenant_id.clone();
+        let task_probe = task_id_owned.clone();
+        let schema_probe = schema.clone();
+        let client_probe = Arc::clone(self.client.get());
         let rows = run_on_os_thread(move || -> Result<u64> {
             let mut client = client.lock();
             let rows = client.execute(
                 &format!(
                     r#"UPDATE "{schema}".agent_tasks
                        SET status = $1, blocked_reason = $2, updated_at = NOW()
-                       WHERE task_id = $3 AND tenant_id = $4"#
+                       WHERE task_id = $3 AND tenant_id = $4 AND status <> 'cancelled'"#
                 ),
                 &[&status_str, &blocked_reason, &task_id_owned, &tenant_id],
             )?;
@@ -325,6 +340,24 @@ impl AgentTaskLedger {
         })
         .await?;
         if rows == 0 {
+            // A task the operator stopped stays stopped: a late agent write
+            // is a silent no-op, never a resurrection. Only genuinely
+            // missing rows are an error.
+            let cancelled = run_on_os_thread(move || -> Result<bool> {
+                let mut client = client_probe.lock();
+                let row = client.query_opt(
+                    &format!(
+                        r#"SELECT 1 FROM "{schema_probe}".agent_tasks
+                           WHERE task_id = $1 AND tenant_id = $2 AND status = 'cancelled'"#
+                    ),
+                    &[&task_probe, &tenant_probe],
+                )?;
+                Ok(row.is_some())
+            })
+            .await?;
+            if cancelled {
+                return Ok(());
+            }
             anyhow::bail!("task {task_id_for_error} not found for this tenant");
         }
         Ok(())
@@ -654,6 +687,7 @@ mod tests {
             TaskStatus::InProgress,
             TaskStatus::Blocked,
             TaskStatus::Done,
+            TaskStatus::Cancelled,
         ] {
             assert_eq!(TaskStatus::parse(s.as_str()), Some(s));
         }
