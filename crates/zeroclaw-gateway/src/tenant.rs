@@ -311,9 +311,10 @@ pub fn render_persona_block(persona: &TenantPersona) -> Option<String> {
 /// fail-closed-on-grant rationale).
 ///
 /// `disabled_toolkits` — Composio toolkit slugs resolved by
-/// [`AgentToolScopeResolver`], same fail-open-on-availability shape but the
-/// opposite grant direction (a denylist, not an allowlist — see
-/// `TenantContext::disabled_toolkits`'s doc).
+/// [`AgentToolScopeResolver`]. By the time this runs, resolution has
+/// already succeeded (possibly from stale cache) — an unresolvable
+/// denylist fails the turn upstream instead of arriving here as "nothing
+/// disabled" (see that resolver's fail-closed contract).
 pub fn build_tenant_context(
     sel: &TenantSelector,
     persona: Option<&TenantPersona>,
@@ -483,12 +484,20 @@ fn query_connected_toolkits(db_url: &str, user_id: &str) -> anyhow::Result<Vec<S
 /// user and shared across every agent type.
 ///
 /// Deliberately does not return `Result`, same reasoning as
-/// `ToolkitConnectionResolver::resolve` — see that doc comment. The
-/// opposite grant-direction of the result (a denylist here, an allowlist
-/// there) makes fail-open-on-availability doubly safe for this resolver
-/// specifically: an inconclusive read can only ever under-restrict back to
-/// "as if the tenant never opened the Tools tab", never over-grant beyond
-/// what was already unconditionally true before this feature existed.
+/// `ToolkitConnectionResolver::resolve` — see that doc comment.
+///
+/// RETURN CONTRACT (fail-closed, 2026-09-18): `Some(list)` means the
+/// denylist was positively resolved (possibly empty — the tenant disabled
+/// nothing); `None` means resolution failed AND no usable cache entry
+/// exists, and the caller must fail the turn (503) rather than run it
+/// un-gated. On a DB error with a cached entry, the stale entry is served
+/// (a denylist that is minutes old still restricts; an empty one still
+/// means "nothing was disabled at last read").
+///
+/// This intentionally differs from the sibling resolvers: they resolve
+/// *grants* (fail-open under-grants — safe), while this resolves a
+/// *denylist* (fail-open over-grants — a transient DB blip would silently
+/// re-enable toolkits the tenant explicitly switched off).
 pub struct AgentToolScopeResolver {
     db_url: Option<String>,
     cache: Mutex<LruCache<String, ToolkitCacheEntry>>,
@@ -516,18 +525,19 @@ impl AgentToolScopeResolver {
     }
 
     /// Resolve the disabled-toolkit slugs for one tenant (`user_id` +
-    /// `agent_type`), consulting the cache first. See the struct doc for
-    /// why this never propagates a hard error.
-    pub async fn resolve(&self, sel: &TenantSelector) -> Vec<String> {
+    /// `agent_type`), consulting the cache first. Returns `None` only when
+    /// resolution failed and no cached entry (fresh or stale) exists — the
+    /// caller must fail closed (see the struct doc).
+    pub async fn resolve(&self, sel: &TenantSelector) -> Option<Vec<String>> {
         let key = sel.tenant_id();
         {
             let mut cache = self.cache.lock();
             match cache.get(&key) {
                 Some(ToolkitCacheEntry::Hit(at, toolkits)) if at.elapsed() < TTL_HIT => {
-                    return (**toolkits).clone();
+                    return Some((**toolkits).clone());
                 }
                 Some(ToolkitCacheEntry::Miss(at)) if at.elapsed() < TTL_MISS => {
-                    return Vec::new();
+                    return Some(Vec::new());
                 }
                 _ => {}
             }
@@ -539,11 +549,9 @@ impl AgentToolScopeResolver {
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                 "agent tool-scope resolution unavailable: CERVEAU_TENANT_DB_URL/DATABASE_URL \
-                 not set — treating as no disabled toolkits for this turn"
+                 not set — failing closed (no cached denylist to serve)"
             );
-            let mut cache = self.cache.lock();
-            cache.put(key, ToolkitCacheEntry::Miss(Instant::now()));
-            return Vec::new();
+            return self.stale_or_none(&key);
         };
         let user_id = sel.user_id.clone();
         let agent_type = sel.agent_type.clone();
@@ -560,9 +568,9 @@ impl AgentToolScopeResolver {
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"error": format!("{e:#}")})),
-                    "agent tool-scope query failed — treating as no disabled toolkits for this turn"
+                    "agent tool-scope query failed — serving stale cache or failing closed"
                 );
-                Vec::new()
+                return self.stale_or_none(&key);
             }
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -570,9 +578,9 @@ impl AgentToolScopeResolver {
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"error": format!("{e}")})),
-                    "agent tool-scope resolver task panicked — treating as no disabled toolkits for this turn"
+                    "agent tool-scope resolver task panicked — serving stale cache or failing closed"
                 );
-                Vec::new()
+                return self.stale_or_none(&key);
             }
         };
 
@@ -585,7 +593,21 @@ impl AgentToolScopeResolver {
                 ToolkitCacheEntry::Hit(Instant::now(), Arc::new(toolkits.clone())),
             );
         }
-        toolkits
+        Some(toolkits)
+    }
+
+    /// Stale-while-error: serve any cached entry regardless of TTL (a
+    /// minutes-old denylist still restricts), or `None` when the key was
+    /// never successfully resolved. Error paths deliberately do NOT write
+    /// a fresh `Miss` — that would poison the cache into "nothing disabled"
+    /// for the next minute.
+    fn stale_or_none(&self, key: &str) -> Option<Vec<String>> {
+        let mut cache = self.cache.lock();
+        match cache.get(key) {
+            Some(ToolkitCacheEntry::Hit(_, toolkits)) => Some((**toolkits).clone()),
+            Some(ToolkitCacheEntry::Miss(_)) => Some(Vec::new()),
+            None => None,
+        }
     }
 }
 
@@ -856,6 +878,63 @@ mod tests {
         assert_eq!(ctx.platform_user_id, "user_d09");
         assert_eq!(ctx.tenant_id, "user_d09.cs");
         assert_ne!(ctx.platform_user_id, ctx.tenant_id);
+    }
+
+    fn scope_resolver_without_db() -> AgentToolScopeResolver {
+        AgentToolScopeResolver {
+            db_url: None,
+            cache: Mutex::new(LruCache::new(NonZeroUsize::new(CACHE_CAP).unwrap())),
+        }
+    }
+
+    fn scope_selector() -> TenantSelector {
+        TenantSelector {
+            user_id: "scope-probe".to_string(),
+            agent_type: "cs".to_string(),
+        }
+    }
+
+    /// Fail-closed contract: with no DB and a cold cache, resolution
+    /// returns None (the caller 503s) instead of "nothing disabled".
+    #[tokio::test]
+    async fn scope_resolve_fails_closed_on_cold_cache() {
+        let resolver = scope_resolver_without_db();
+        assert_eq!(resolver.resolve(&scope_selector()).await, None);
+    }
+
+    /// Stale-while-error: a cached denylist is still served when the DB
+    /// goes away afterwards — even past its TTL.
+    #[tokio::test]
+    async fn scope_resolve_serves_stale_hits_on_db_loss() {
+        let resolver = scope_resolver_without_db();
+        let sel = scope_selector();
+        {
+            let mut cache = resolver.cache.lock();
+            cache.put(
+                sel.tenant_id(),
+                ToolkitCacheEntry::Hit(
+                    Instant::now() - Duration::from_secs(3600),
+                    Arc::new(vec!["crm-hubspot".to_string()]),
+                ),
+            );
+        }
+        assert_eq!(
+            resolver.resolve(&sel).await,
+            Some(vec!["crm-hubspot".to_string()])
+        );
+    }
+
+    /// A cached Miss ("positively resolved: nothing disabled") is also
+    /// served as empty — only a never-resolved key yields None.
+    #[tokio::test]
+    async fn scope_resolve_serves_cached_miss_as_empty() {
+        let resolver = scope_resolver_without_db();
+        let sel = scope_selector();
+        {
+            let mut cache = resolver.cache.lock();
+            cache.put(sel.tenant_id(), ToolkitCacheEntry::Miss(Instant::now()));
+        }
+        assert_eq!(resolver.resolve(&sel).await, Some(Vec::new()));
     }
 
     #[test]

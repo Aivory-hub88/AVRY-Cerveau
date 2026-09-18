@@ -408,7 +408,14 @@ async fn run_continuation(
     let connected_toolkits = ToolkitConnectionResolver::global()
         .resolve(&sel.user_id)
         .await;
-    let disabled_toolkits = AgentToolScopeResolver::global().resolve(&sel).await;
+    // Fail closed: never resume a parked irreversible call when the
+    // tenant's denylist cannot be resolved — the grant picture is unknown.
+    let disabled_toolkits = AgentToolScopeResolver::global()
+        .resolve(&sel)
+        .await
+        .ok_or_else(|| {
+            anyhow::anyhow!("tool-scope resolution unavailable; retry the approval later")
+        })?;
     let tenant_custom_mcp_servers = TenantCustomMcpResolver::global().resolve(&sel).await;
     let tenant_ctx = build_tenant_context(
         &sel,

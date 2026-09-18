@@ -3238,11 +3238,30 @@ async fn webhook_prelude(
                     let connected_toolkits = tenant::ToolkitConnectionResolver::global()
                         .resolve(&sel.user_id)
                         .await;
-                    // Part C: the dashboard Tools-tab denylist, resolved the
-                    // same non-rejecting way — see
-                    // `AgentToolScopeResolver::resolve`'s doc comment.
+                    // Part C: the dashboard Tools-tab denylist. Unlike the
+                    // grant resolvers above, an UNRESOLVED denylist must fail
+                    // the turn, not run it un-gated: a transient DB failure
+                    // would otherwise silently re-enable toolkits the tenant
+                    // explicitly switched off.
                     let disabled_toolkits =
-                        tenant::AgentToolScopeResolver::global().resolve(&sel).await;
+                        match tenant::AgentToolScopeResolver::global().resolve(&sel).await {
+                            Some(list) => list,
+                            None => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                    "webhook: tool-scope resolution unavailable"
+                                );
+                                let err = serde_json::json!({
+                                    "error": "Tool-scope resolution unavailable; retry later"
+                                });
+                                return Err((StatusCode::SERVICE_UNAVAILABLE, err));
+                            }
+                        };
                     // ADR-006 Part B: this tenant's own registered MCP
                     // servers, resolved the same non-rejecting way — see
                     // `TenantCustomMcpResolver::resolve`'s doc comment.

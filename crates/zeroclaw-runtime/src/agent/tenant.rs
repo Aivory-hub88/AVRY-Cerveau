@@ -99,12 +99,11 @@ pub struct TenantContext {
     /// list is a denylist, not an allowlist — a server is granted UNLESS
     /// its slug appears here, matching the dashboard's own "default
     /// enabled" contract. Empty means "the tenant hasn't disabled
-    /// anything" in both the genuine case and the resolution-failed case
-    /// (fail-open on availability, same reasoning as `connected_toolkits`,
-    /// but here fail-open on availability also happens to be fail-open on
-    /// the grant — an inconclusive read here can only ever under-restrict,
-    /// never over-grant beyond what was already unconditionally true
-    /// before this feature existed).
+    /// anything" as positively resolved (or served from stale cache); an
+    /// unresolvable denylist fails the turn upstream instead of arriving
+    /// here (fail-closed on the grant since 2026-09-18 — a transient DB
+    /// failure must not silently re-enable toolkits the tenant switched
+    /// off).
     pub disabled_toolkits: Vec<String>,
     /// ADR-006 Part B: this tenant's own registered MCP servers
     /// (`avry-backend`'s `product.tenant_custom_mcp_servers`, `status =
