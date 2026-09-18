@@ -41,6 +41,24 @@ fn is_untrusted_source_tool(tool_name: &str) -> bool {
     matches!(name, "web_search_tool" | "web_fetch") || name.contains("browser")
 }
 
+/// Typed loop-abort signal: the loop detector circuit breaker (or the
+/// identical-output abort) stopped the turn. Carried as a typed error — not
+/// a stringly `anyhow::bail!` — so the turn loop can downcast it and run
+/// the graceful wrap-up (`finish_after_loop_break`) instead of failing the
+/// turn into a 500.
+#[derive(Debug)]
+pub(crate) struct LoopBreak {
+    pub message: String,
+}
+
+impl std::fmt::Display for LoopBreak {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Agent loop aborted by loop detector: {}", self.message)
+    }
+}
+
+impl std::error::Error for LoopBreak {}
+
 /// One round's collected tool results.
 pub(crate) struct CollectedResults {
     /// Per-call `(tool_call_id, output)` so native-mode history can emit one
@@ -142,7 +160,7 @@ pub(crate) fn collect_tool_results(
                             })),
                         "loop_detector_circuit_breaker"
                     );
-                    anyhow::bail!("Agent loop aborted by loop detector: {msg}");
+                    anyhow::bail!(LoopBreak { message: msg });
                 }
             }
         }
@@ -309,10 +327,12 @@ pub(crate) fn check_identical_output_abort(
                     })),
                 "tool_loop_identical_output_abort"
             );
-            anyhow::bail!(
-                "Agent loop aborted: identical tool output detected {} consecutive times",
-                *consecutive_identical_outputs
-            );
+            anyhow::bail!(LoopBreak {
+                message: format!(
+                    "identical tool output detected {} consecutive times",
+                    *consecutive_identical_outputs
+                ),
+            });
         }
     }
     Ok(())

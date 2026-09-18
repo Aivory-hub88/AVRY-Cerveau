@@ -37,6 +37,7 @@ pub use execution::{
 pub(crate) use history_window::preflight_history_maintenance;
 pub use knobs::{LoopKnobs, MaxIterationBehavior};
 pub(crate) use max_iter::finish_after_max_iterations;
+pub(crate) use max_iter::finish_after_loop_break;
 pub(crate) use outcome::StreamCancelledAfterOutput;
 pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,
@@ -54,7 +55,7 @@ pub(crate) use provider_call::{
 };
 pub use redact::scrub_credentials;
 pub(crate) use results_collect::{
-    CollectedResults, check_identical_output_abort, collect_tool_results,
+    CollectedResults, LoopBreak, check_identical_output_abort, collect_tool_results,
 };
 pub use steering::drain_steering_messages;
 #[cfg(test)]
@@ -1170,7 +1171,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             individual_results,
             tool_results,
             detection_relevant_output,
-        } = collect_tool_results(
+        } = match collect_tool_results(
             ordered_results,
             &tool_calls,
             turn_state.history,
@@ -1182,10 +1183,36 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             iteration,
             turn_id,
             mcp_content_safety.as_ref(),
-        )?;
+        ) {
+            Ok(collected) => collected,
+            // The detector stopped the turn: wrap up gracefully with a
+            // tools-free summary instead of failing into a 500. Any other
+            // collection error still bails.
+            Err(e) => match e.downcast_ref::<LoopBreak>() {
+                Some(break_) => {
+                    let message = break_.message.clone();
+                    return finish_after_loop_break(
+                        model_provider,
+                        turn_state.history,
+                        provider_name,
+                        model,
+                        temperature,
+                        pacing,
+                        cancellation_token.as_ref(),
+                        &message,
+                        accumulated_display_text,
+                        turn_id,
+                        knobs,
+                        turn_state.canonical.as_deref_mut(),
+                    )
+                    .await;
+                }
+                None => return Err(e),
+            },
+        };
 
         if !cancelled_mid_batch {
-            check_identical_output_abort(
+            if let Err(e) = check_identical_output_abort(
                 &detection_relevant_output,
                 loop_started_at,
                 pacing,
@@ -1194,7 +1221,28 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 model,
                 iteration,
                 turn_id,
-            )?;
+            ) {
+                // Same graceful exit as the detector break above.
+                if let Some(break_) = e.downcast_ref::<LoopBreak>() {
+                    let message = break_.message.clone();
+                    return finish_after_loop_break(
+                        model_provider,
+                        turn_state.history,
+                        provider_name,
+                        model,
+                        temperature,
+                        pacing,
+                        cancellation_token.as_ref(),
+                        &message,
+                        accumulated_display_text,
+                        turn_id,
+                        knobs,
+                        turn_state.canonical.as_deref_mut(),
+                    )
+                    .await;
+                }
+                return Err(e);
+            }
         }
 
         turn_state.append_tool_round(
