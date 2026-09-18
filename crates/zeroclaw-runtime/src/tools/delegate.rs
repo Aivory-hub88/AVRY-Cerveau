@@ -1634,7 +1634,37 @@ impl DelegateTool {
         // this the sub-turn runs tenant-less — host memory, vanilla MCP
         // grants, no backend risk-tier floor. Capture the parent's overlays
         // and re-scope them inside (same tenant, same turn origin).
-        let tenant_overlay = crate::agent::tenant::current_tenant();
+        //
+        // Attribution: when the target is one of the six product agent
+        // types, the overlay's `agent_type` is relabelled to the TARGET so
+        // ledger rows, skill bundles, and velocity budgets attribute to the
+        // specialist doing the work (the dashboard matches rows by exact
+        // agent_type). `tenant_id`/`platform_user_id` stay parental —
+        // memory dimension and principal continuity must not split.
+        // Host-brain targets keep the parent overlay unchanged.
+        const PRODUCT_AGENT_TYPES: [&str; 6] = [
+            "autonomous",
+            "customer_service",
+            "leads_qualifier",
+            "finance_invoice_ops",
+            "office_assistant",
+            "chief_of_staff",
+        ];
+        let tenant_overlay = crate::agent::tenant::current_tenant().map(|t| {
+            if PRODUCT_AGENT_TYPES.contains(&agent_name_owned.as_str()) {
+                std::sync::Arc::new(crate::agent::tenant::TenantContext {
+                    tenant_id: t.tenant_id.clone(),
+                    platform_user_id: t.platform_user_id.clone(),
+                    agent_type: agent_name_owned.clone(),
+                    persona: t.persona.clone(),
+                    connected_toolkits: t.connected_toolkits.clone(),
+                    disabled_toolkits: t.disabled_toolkits.clone(),
+                    tenant_custom_mcp_servers: t.tenant_custom_mcp_servers.clone(),
+                })
+            } else {
+                t
+            }
+        });
         let turn_origin_overlay = crate::agent::tenant::current_turn_origin();
 
         zeroclaw_spawn::spawn!(
