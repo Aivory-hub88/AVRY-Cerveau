@@ -172,6 +172,19 @@ pub struct TenantCustomMcpServer {
 /// Aivory server uses this prefix.
 pub const TENANT_CUSTOM_MCP_NAME_PREFIX: &str = "tenant_";
 
+/// True for Aivory's own first-party Aivory Mail MCP server URL — checked
+/// by exact host, not by substring/prefix, so a lookalike host (e.g.
+/// `mail.aivory.uk.evil.example`) can't borrow the exemption. Used only to
+/// scope the [`TenantContext::is_tenant_custom_mcp_tool`] hard-floor
+/// carve-out; a tenant that registers a *different* MCP server under the
+/// name `"aivory-mail"` still gets the full hard floor because its url
+/// won't match here.
+fn is_aivory_mail_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .is_some_and(|parsed| parsed.scheme() == "https" && parsed.host_str() == Some("mail.aivory.uk"))
+}
+
 /// Synthesizes a real `McpServerConfig` per registered server, always with
 /// `guarded_transport: true` (SSRF-guarded DNS-pinned transport — see
 /// `zeroclaw_tools::guarded_resolve`'s module docs) and a name prefixed with
@@ -243,8 +256,22 @@ impl TenantContext {
     /// *before* anything in `[tool_risk_tiers]`; unknown values fail closed
     /// to `Irreversible` there, so an unexpected backend value can only
     /// over-restrict, never silently un-gate.
+    ///
+    /// Carve-out (2026-09-17, operator decision after the approval-click
+    /// round-trip proved to be a hard UX blocker on live sends): Aivory Mail
+    /// is Aivory's own first-party MCP server, not an arbitrary tenant-
+    /// registered "black box" — the §B5 rationale (untrusted server,
+    /// untrusted tool descriptions) doesn't apply to it, so it's excluded
+    /// from this hard floor and instead falls through to the normal
+    /// `[tool_risk_tiers]`/auto_approve path like any other reviewed tool.
+    /// Matched on name *and* url host (not name alone) so a tenant can't get
+    /// the same exemption for their own custom server just by naming it
+    /// "aivory-mail".
     pub fn custom_mcp_server_risk_tier(&self, tool_name: &str) -> Option<&str> {
         self.tenant_custom_mcp_servers.iter().find_map(|server| {
+            if server.name == "aivory-mail" && is_aivory_mail_url(&server.url) {
+                return None;
+            }
             if tool_name.starts_with(&format!("{TENANT_CUSTOM_MCP_NAME_PREFIX}{}__", server.name)) {
                 Some(server.risk_tier.as_str())
             } else {
@@ -638,6 +665,53 @@ mod tests {
         // "orders_evil" and colliding with "tenant_orders__..." by prefix
         // alone.
         assert!(!ctx.is_tenant_custom_mcp_tool("tenant_orders_evil__whatever"));
+    }
+
+    #[test]
+    fn is_tenant_custom_mcp_tool_exempts_first_party_aivory_mail_only() {
+        let aivory_mail = TenantCustomMcpServer {
+            name: "aivory-mail".to_string(),
+            url: "https://mail.aivory.uk/mcp".to_string(),
+            transport: "streamable-http".to_string(),
+            auth_header_name: Some("Authorization".to_string()),
+            auth_header_value: Some("Bearer avry_mcp_x".to_string()),
+            risk_tier: "irreversible".to_string(),
+            disabled_tools: Vec::new(),
+        };
+        let ctx = TenantContext {
+            tenant_id: "u1:cs".to_string(),
+            platform_user_id: "u1".to_string(),
+            agent_type: "customer_service".to_string(),
+            persona: None,
+            connected_toolkits: Vec::new(),
+            disabled_toolkits: Vec::new(),
+            tenant_custom_mcp_servers: vec![aivory_mail],
+        };
+        // The real thing: exempt from the hard floor.
+        assert!(!ctx.is_tenant_custom_mcp_tool("tenant_aivory-mail__send_mail"));
+        assert!(!ctx.is_tenant_custom_mcp_tool("tenant_aivory-mail__search_mail"));
+
+        // A tenant's own arbitrary MCP server can't borrow the exemption by
+        // reusing the name alone — the url has to match too.
+        let lookalike = TenantCustomMcpServer {
+            name: "aivory-mail".to_string(),
+            url: "https://mail.aivory.uk.evil.example/mcp".to_string(),
+            transport: "streamable-http".to_string(),
+            auth_header_name: None,
+            auth_header_value: None,
+            risk_tier: "irreversible".to_string(),
+            disabled_tools: Vec::new(),
+        };
+        let ctx = TenantContext {
+            tenant_id: "u1:cs".to_string(),
+            platform_user_id: "u1".to_string(),
+            agent_type: "customer_service".to_string(),
+            persona: None,
+            connected_toolkits: Vec::new(),
+            disabled_toolkits: Vec::new(),
+            tenant_custom_mcp_servers: vec![lookalike],
+        };
+        assert!(ctx.is_tenant_custom_mcp_tool("tenant_aivory-mail__send_mail"));
     }
 
     #[tokio::test]

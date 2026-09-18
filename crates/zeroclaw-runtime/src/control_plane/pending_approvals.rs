@@ -479,9 +479,22 @@ impl PendingApprovalsStore {
 /// use, reused for the life of the daemon, one `<data_dir>/control_plane.db`
 /// per process.
 static SHARED: OnceLock<Arc<PendingApprovalsStore>> = OnceLock::new();
+/// Serializes first-time initialization of [`SHARED`] so two threads racing
+/// the first [`PendingApprovalsStore::shared`] call open exactly one
+/// `Connection` instead of two (a hand-rolled `get()`-then-`get_or_init()`
+/// check can open a second connection to the same WAL file on the losing
+/// side of the race — harmless for SQLite visibility since the loser is
+/// dropped and every caller ends up on the winner, but pointless work and
+/// a second source of open failures). Only ever contended once per
+/// process; all later calls hit the lock-free fast path above it.
+static SHARED_INIT_LOCK: Mutex<()> = Mutex::new(());
 
 impl PendingApprovalsStore {
     pub fn shared(data_dir: &Path) -> Result<Arc<PendingApprovalsStore>> {
+        if let Some(existing) = SHARED.get() {
+            return Ok(Arc::clone(existing));
+        }
+        let _guard = SHARED_INIT_LOCK.lock();
         if let Some(existing) = SHARED.get() {
             return Ok(Arc::clone(existing));
         }
