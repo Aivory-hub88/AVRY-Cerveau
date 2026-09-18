@@ -16,6 +16,14 @@ pub struct LoopDetectorConfig {
     pub window_size: usize,
     /// How many consecutive exact-repeat calls before escalation starts.
     pub max_repeats: usize,
+    /// How many successful calls to the SAME tool inside the window before
+    /// escalation starts, regardless of arguments or results. Catches the
+    /// "successful write, repeated with slightly different data" loop
+    /// (e.g. `create_lead` firing once per round with a new lead each
+    /// time) that exact-repeat and no-progress both miss: args differ, so
+    /// exact-repeat never fires; results differ (new ids/timestamps), so
+    /// no-progress never fires. `0` disables this pattern.
+    pub success_burst_threshold: usize,
 }
 
 impl Default for LoopDetectorConfig {
@@ -24,6 +32,7 @@ impl Default for LoopDetectorConfig {
             enabled: true,
             window_size: 20,
             max_repeats: 3,
+            success_burst_threshold: 6,
         }
     }
 }
@@ -197,6 +206,9 @@ impl LoopDetector {
         if let Some(result) = self.detect_no_progress() {
             return result;
         }
+        if let Some(result) = self.detect_success_burst() {
+            return result;
+        }
 
         LoopDetectionResult::Ok
     }
@@ -351,6 +363,46 @@ impl LoopDetector {
             )))
         }
     }
+
+    /// Pattern 4: Same tool succeeding again and again inside the window,
+    /// no matter the arguments or the results. This is the "successful
+    /// loop": every call works (a lead gets created, a deal gets updated),
+    /// so exact-repeat (args differ) and no-progress (results differ — new
+    /// ids, new timestamps) both stay silent while side effects pile up.
+    /// Counted across the whole window so interleaved calls do not reset
+    /// the streak. Escalation is one step looser than exact-repeat
+    /// (warn T, block T+1, break T+3) because a same-tool burst can be a
+    /// legitimate bulk operation — the Warning nudge is the common case.
+    fn detect_success_burst(&self) -> Option<LoopDetectionResult> {
+        let threshold = self.config.success_burst_threshold;
+        if threshold == 0 {
+            return None;
+        }
+
+        let last = self.window.back()?;
+        let count = self.window.iter().filter(|r| r.name == last.name).count();
+        if count < threshold {
+            return None;
+        }
+
+        if count >= threshold + 3 {
+            Some(LoopDetectionResult::Break(format!(
+                "Circuit breaker: tool '{}' has succeeded {} times this turn with no terminal step — stopping before more side effects accumulate",
+                last.name, count
+            )))
+        } else if count > threshold {
+            Some(LoopDetectionResult::Block(format!(
+                "Blocked: tool '{}' has succeeded {} times this turn. Confirm the repetition is intentional before continuing",
+                last.name, count
+            )))
+        } else {
+            Some(LoopDetectionResult::Warning(format!(
+                "Warning: tool '{}' has succeeded {} times this turn. \
+                 If the job is done, stop calling tools and answer instead.",
+                last.name, count
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -367,6 +419,8 @@ mod tests {
             enabled: true,
             window_size: 20,
             max_repeats,
+            // Burst disabled here so these tests isolate exact-repeat behavior.
+            success_burst_threshold: 0,
         }
     }
 
@@ -563,7 +617,10 @@ mod tests {
     fn no_progress_not_triggered_when_results_differ() {
         let mut det = LoopDetector::new(default_config());
 
-        for i in 0..8 {
+        // 5 calls stay under the success-burst threshold (6) so this test
+        // keeps isolating no-progress behavior: distinct results must not
+        // trip any detector.
+        for i in 0..5 {
             let args = json!({"q": format!("v{i}")});
             let result = det.record("search", &args, &format!("result_{i}"));
             assert_eq!(result, LoopDetectionResult::Ok, "iteration {i}");
@@ -622,6 +679,118 @@ mod tests {
         }
     }
 
+    // ── Success-burst tests ────────────────────────────────
+
+    #[test]
+    fn burst_warning_at_threshold_with_varying_args_and_results() {
+        // The Lex loop shape: every call succeeds with different data, so
+        // exact-repeat (args differ) and no-progress (results differ) stay
+        // silent. Burst must catch it.
+        let mut det = LoopDetector::new(default_config());
+
+        for i in 0..6 {
+            let args = json!({"lead": format!("lead_{i}")});
+            let result = det.record("create_lead", &args, &format!("created id_{i}"));
+            if i < 5 {
+                assert_eq!(result, LoopDetectionResult::Ok, "iteration {i}");
+            } else {
+                match result {
+                    LoopDetectionResult::Warning(msg) => {
+                        assert!(msg.contains("create_lead"), "got: {msg}");
+                        assert!(msg.contains("6 times"), "got: {msg}");
+                    }
+                    other => panic!("expected Warning at 6th success, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn burst_escalates_to_block_and_break() {
+        let mut det = LoopDetector::new(default_config());
+
+        for i in 0..7 {
+            det.record("update_deal", &json!({"id": i}), &format!("ok {i}"));
+        }
+        // 8th success (count=8 > threshold 6, i.e. threshold+2): still Block.
+        let r8 = det.record("update_deal", &json!({"id": 7}), "ok 7");
+        match r8 {
+            LoopDetectionResult::Block(msg) => {
+                assert!(msg.contains("update_deal"), "got: {msg}");
+            }
+            other => panic!("expected Block at 8th success, got {other:?}"),
+        }
+        // 9th success (count=9 >= threshold+3): Break.
+        let r9 = det.record("update_deal", &json!({"id": 8}), "ok 8");
+        match r9 {
+            LoopDetectionResult::Break(msg) => {
+                assert!(msg.contains("Circuit breaker"), "got: {msg}");
+                assert!(msg.contains("update_deal"), "got: {msg}");
+            }
+            other => panic!("expected Break at 9th success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn burst_counts_across_interleaved_calls() {
+        // Interleaved unrelated tools must not reset the burst count —
+        // room turns interleave task_list/memory calls between writes.
+        // Two different interleave tools (not strict A-B alternation) so
+        // ping-pong stays quiet and this isolates the burst pattern.
+        let mut det = LoopDetector::new(default_config());
+
+        let mut last = LoopDetectionResult::Ok;
+        for i in 0..6 {
+            last = det.record("create_lead", &json!({"n": i}), &format!("id_{i}"));
+            let probe = if i % 2 == 0 { "task_list" } else { "memory_recall" };
+            det.record(probe, &json!({}), "rows");
+        }
+        match last {
+            LoopDetectionResult::Warning(msg) => {
+                assert!(msg.contains("create_lead"), "got: {msg}");
+                assert!(msg.contains("6 times"), "got: {msg}");
+            }
+            other => panic!("expected burst Warning despite interleaves, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn burst_disabled_at_zero() {
+        let config = LoopDetectorConfig {
+            success_burst_threshold: 0,
+            ..Default::default()
+        };
+        let mut det = LoopDetector::new(config);
+
+        for i in 0..12 {
+            let r = det.record("create_lead", &json!({"n": i}), &format!("id_{i}"));
+            assert_eq!(r, LoopDetectionResult::Ok, "iteration {i}");
+        }
+    }
+
+    #[test]
+    fn burst_yields_to_exact_repeat() {
+        // Identical args must still escalate as exact-repeat (checked first),
+        // not as a burst.
+        let mut det = LoopDetector::new(default_config());
+        let args = json!({"q": "same"});
+
+        for _ in 0..5 {
+            det.record("s", &args, "r");
+        }
+        // 6th call: exact-repeat already at Break (3+2); burst must not win.
+        let r = det.record("s", &args, "r");
+        match r {
+            LoopDetectionResult::Break(msg) => {
+                assert!(
+                    msg.contains("identical arguments"),
+                    "should be exact-repeat Break, got: {msg}"
+                );
+            }
+            other => panic!("expected exact-repeat Break, got {other:?}"),
+        }
+    }
+
     // ── Disabled / config tests ──────────────────────────────────
 
     #[test]
@@ -644,6 +813,7 @@ mod tests {
             enabled: true,
             window_size: 5,
             max_repeats: 3,
+            success_burst_threshold: 0,
         };
         let mut det = LoopDetector::new(config);
         let args = json!({"x": 1});
@@ -695,6 +865,7 @@ mod tests {
             enabled: true,
             window_size: 6,
             max_repeats: 3,
+            success_burst_threshold: 0,
         };
         let mut det = LoopDetector::new(config);
         let args = json!({"x": 1});

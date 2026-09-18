@@ -6605,7 +6605,7 @@ pub struct PacingConfig {
     pub message_timeout_scale_max: Option<u64>,
 
     /// Enable pattern-based loop detection (exact repeat, ping-pong,
-    /// no-progress). Defaults to `true`.
+    /// no-progress, success-burst). Defaults to `true`.
     #[serde(default = "default_loop_detection_enabled")]
     pub loop_detection_enabled: bool,
 
@@ -6618,6 +6618,27 @@ pub struct PacingConfig {
     /// escalation (Warning). Defaults to 3.
     #[serde(default = "default_loop_detection_max_repeats")]
     pub loop_detection_max_repeats: usize,
+
+    /// Number of successful calls to the same tool inside the detector
+    /// window before the first escalation (Warning). Catches loops where
+    /// every call succeeds with slightly different data (e.g. repeated
+    /// CRM writes), which exact-repeat and no-progress both miss.
+    /// Defaults to 6. `0` disables this pattern.
+    #[serde(default = "default_loop_success_burst_threshold")]
+    pub loop_success_burst_threshold: usize,
+
+    /// Sliding window (seconds) for the cross-turn write-velocity gate:
+    /// how many approved mutating calls the same (tenant, agent, tool)
+    /// triple may execute before further calls park for human approval.
+    /// Defaults to 600.
+    #[serde(default = "default_write_velocity_window_secs")]
+    pub write_velocity_window_secs: u64,
+
+    /// Budget inside the velocity window. Past this many approved mutating
+    /// calls, the next call is parked as a pending approval instead of
+    /// executing. Defaults to 8. `0` disables the gate.
+    #[serde(default = "default_write_velocity_max_calls")]
+    pub write_velocity_max_calls: usize,
 }
 
 fn default_loop_detection_enabled() -> bool {
@@ -6632,6 +6653,18 @@ fn default_loop_detection_max_repeats() -> usize {
     3
 }
 
+fn default_loop_success_burst_threshold() -> usize {
+    6
+}
+
+fn default_write_velocity_window_secs() -> u64 {
+    600
+}
+
+fn default_write_velocity_max_calls() -> usize {
+    8
+}
+
 impl Default for PacingConfig {
     fn default() -> Self {
         Self {
@@ -6642,6 +6675,9 @@ impl Default for PacingConfig {
             loop_detection_enabled: default_loop_detection_enabled(),
             loop_detection_window_size: default_loop_detection_window_size(),
             loop_detection_max_repeats: default_loop_detection_max_repeats(),
+            loop_success_burst_threshold: default_loop_success_burst_threshold(),
+            write_velocity_window_secs: default_write_velocity_window_secs(),
+            write_velocity_max_calls: default_write_velocity_max_calls(),
         }
     }
 }
@@ -38208,11 +38244,26 @@ url = "http://localhost:8080/mcp"
             from_toml.loop_detection_max_repeats,
             manual.loop_detection_max_repeats
         );
+        assert_eq!(
+            from_toml.loop_success_burst_threshold,
+            manual.loop_success_burst_threshold
+        );
+        assert_eq!(
+            from_toml.write_velocity_window_secs,
+            manual.write_velocity_window_secs
+        );
+        assert_eq!(
+            from_toml.write_velocity_max_calls,
+            manual.write_velocity_max_calls
+        );
 
         // Verify concrete values so a silent change to the defaults is caught.
         assert!(from_toml.loop_detection_enabled, "default should be true");
         assert_eq!(from_toml.loop_detection_window_size, 20);
         assert_eq!(from_toml.loop_detection_max_repeats, 3);
+        assert_eq!(from_toml.loop_success_burst_threshold, 6);
+        assert_eq!(from_toml.write_velocity_window_secs, 600);
+        assert_eq!(from_toml.write_velocity_max_calls, 8);
     }
 
     // ── Docker baked config template ────────────────────────────

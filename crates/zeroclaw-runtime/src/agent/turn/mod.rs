@@ -23,6 +23,7 @@ pub(crate) mod steering;
 pub(crate) mod stream_consume;
 pub(crate) mod stream_guard;
 pub(crate) mod tool_specs;
+pub(crate) mod velocity_gate;
 pub(crate) mod vision_route;
 
 pub(crate) use call_prep::{PreparedToolCalls, prepare_tool_calls};
@@ -526,6 +527,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             enabled: pacing.loop_detection_enabled,
             window_size: pacing.loop_detection_window_size,
             max_repeats: pacing.loop_detection_max_repeats,
+            success_burst_threshold: pacing.loop_success_burst_threshold,
         },
     );
 
