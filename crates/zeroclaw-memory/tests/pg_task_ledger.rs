@@ -145,5 +145,44 @@ async fn task_ledger_end_to_end() {
     assert_eq!(all.len(), 1, "done tasks stay in the ledger, never deleted");
     assert_eq!(all[0].status, TaskStatus::Done);
 
+    // ── Scenario 5: operator-cancelled rows resist late agent writes ──
+    // `cancelled` is a dashboard-only terminal state (the Stop button writes
+    // it directly — the tool schema has no Cancelled variant). A late
+    // task_update_status from a still-running turn must be a silent no-op,
+    // never a resurrection.
+    let cancelled_id = ledger
+        .create_task(
+            "tenant-a",
+            "finance_invoice_ops",
+            Some("session-1"),
+            "Stuck verification the operator stopped",
+            TaskPriority::Normal,
+        )
+        .await
+        .expect("create cancelled probe");
+    exec(&format!(
+        "UPDATE {SCHEMA}.agent_tasks SET status = 'cancelled', updated_at = NOW() \
+         WHERE task_id = '{cancelled_id}';"
+    ))
+    .await;
+    ledger
+        .update_status(
+            "tenant-a",
+            &cancelled_id,
+            TaskStatus::InProgress,
+            None,
+        )
+        .await
+        .expect("late write to a cancelled row must succeed quietly, not error");
+    let fetched = ledger
+        .get_task("tenant-a", &cancelled_id)
+        .await
+        .expect("get_task cancelled")
+        .expect("cancelled row must still exist");
+    assert_eq!(
+        fetched.status, TaskStatus::Cancelled,
+        "a stopped task stays stopped even when the agent writes late"
+    );
+
     exec(&format!("DROP SCHEMA IF EXISTS {SCHEMA} CASCADE;")).await;
 }
