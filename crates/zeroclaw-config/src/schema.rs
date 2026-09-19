@@ -516,6 +516,12 @@ pub struct Config {
     #[group = "Agent"]
     pub tool_concurrency: ToolConcurrencyConfig,
 
+    /// Cerveau: latency fast paths (`[fast_path]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Agent"]
+    pub fast_path: FastPathConfig,
+
     /// Named runtime/LLM execution profiles (`[runtime_profiles.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -6348,7 +6354,16 @@ impl Default for LocalWhisperTranscriptionProviderConfig {
 #[serde(rename_all = "snake_case")]
 pub enum ToolFilterGroupMode {
     /// Tools in this group are always included in every turn.
+    ///
+    /// NOTE: `always` and `dynamic` groups are a WHITELIST: as soon as any such
+    /// group exists, every MCP tool not matched by one is excluded from the turn.
     Always,
+    /// Pre-activate these tools at assembly so they are live on the FIRST model
+    /// call (no `tool_search` round trip), and do nothing else: unlike `always`
+    /// and `dynamic` this never restricts any other tool, so a profile with only
+    /// `preload` groups keeps every MCP tool it had. Only meaningful under
+    /// `[mcp] deferred_loading = true` (otherwise all MCP tools are already live).
+    Preload,
     /// Tools in this group are included only when the user message contains
     /// at least one of the configured `keywords` (case-insensitive substring match).
     #[default]
@@ -13785,6 +13800,25 @@ pub enum ToolRiskTier {
     Irreversible,
 }
 
+/// Latency fast paths (`[fast_path]`).
+///
+/// Measured on production traces: a turn that needs no tools already costs one
+/// LLM call (~4 s), of which ~1 s is the per-turn memory/graph recall injection.
+/// A greeting or a thank-you gains nothing from recalled memory.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "fast_path"]
+#[serde(default)]
+pub struct FastPathConfig {
+    /// When the WHOLE user message is small talk (a greeting, thanks or
+    /// farewell -- see `agent::smalltalk`), skip the per-turn memory and graph
+    /// recall and the post-turn consolidation. Tools stay available, so a
+    /// misclassification costs only recalled context, never a capability.
+    /// Confirmations such as "ya" / "oke" are deliberately NOT small talk: in
+    /// Cerveau they continue a pending action. Default off.
+    pub smalltalk: bool,
+}
+
 /// Tool-concurrency policy (`[tool_concurrency]`).
 ///
 /// When a model emits several tool calls in one response, only tools that are
@@ -20423,6 +20457,7 @@ impl Default for Config {
             agent_type_mcp_bundles: HashMap::new(),
             tool_risk_tiers: ToolRiskTiersConfig::default(),
             tool_concurrency: ToolConcurrencyConfig::default(),
+            fast_path: FastPathConfig::default(),
             peer_groups: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
@@ -30398,6 +30433,7 @@ auto_save = true
             agent_type_mcp_bundles: HashMap::new(),
             tool_risk_tiers: ToolRiskTiersConfig::default(),
             tool_concurrency: ToolConcurrencyConfig::default(),
+            fast_path: FastPathConfig::default(),
             peer_groups: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
@@ -31365,6 +31401,7 @@ default_temperature = 0.7
             agent_type_mcp_bundles: HashMap::new(),
             tool_risk_tiers: ToolRiskTiersConfig::default(),
             tool_concurrency: ToolConcurrencyConfig::default(),
+            fast_path: FastPathConfig::default(),
             peer_groups: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
@@ -45908,5 +45945,22 @@ mod tool_concurrency_tests {
         // "*" alone must not become "everything is parallel-safe".
         assert!(!cfg(&["*"]).declares_parallel_safe("anything"));
         assert!(!cfg(&[]).declares_parallel_safe("memory_recall"));
+    }
+}
+
+#[cfg(test)]
+mod fast_path_tests {
+    use super::{Config, FastPathConfig};
+
+    #[test]
+    fn small_talk_fast_path_is_off_by_default() {
+        assert!(!FastPathConfig::default().smalltalk);
+        assert!(!Config::default().fast_path.smalltalk);
+    }
+
+    #[test]
+    fn small_talk_fast_path_parses_from_a_config_section() {
+        let cfg: FastPathConfig = toml::from_str("smalltalk = true\n").unwrap();
+        assert!(cfg.smalltalk);
     }
 }

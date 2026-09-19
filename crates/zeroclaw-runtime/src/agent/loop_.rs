@@ -347,7 +347,7 @@ pub(crate) fn preactivate_always_filter_groups(
     let mut activated_names: HashSet<String> = HashSet::new();
     let always_patterns: Vec<&str> = groups
         .iter()
-        .filter(|group| matches!(group.mode, ToolFilterGroupMode::Always))
+        .filter(|group| matches!(group.mode, ToolFilterGroupMode::Always | ToolFilterGroupMode::Preload))
         .flat_map(|group| group.tools.iter().map(String::as_str))
         .collect();
     if always_patterns.is_empty() {
@@ -423,6 +423,23 @@ fn mcp_tool_included_for_turn(
 ) -> bool {
     use zeroclaw_config::schema::ToolFilterGroupMode;
 
+    // `preload` groups only pre-activate; they never restrict. If no group
+    // restricts, every MCP tool stays available exactly as without groups.
+    if groups
+        .iter()
+        .all(|group| matches!(group.mode, ToolFilterGroupMode::Preload))
+    {
+        return true;
+    }
+    // A preloaded tool stays included even beside `always`/`dynamic` groups that
+    // do not name it.
+    if groups.iter().any(|group| {
+        matches!(group.mode, ToolFilterGroupMode::Preload)
+            && group.tools.iter().any(|pat| glob_match(pat, name))
+    }) {
+        return true;
+    }
+
     groups.iter().any(|group| {
         let pattern_matches = group.tools.iter().any(|pat| glob_match(pat, name));
         if !pattern_matches {
@@ -430,6 +447,7 @@ fn mcp_tool_included_for_turn(
         }
         match group.mode {
             ToolFilterGroupMode::Always => true,
+            ToolFilterGroupMode::Preload => true,
             ToolFilterGroupMode::Dynamic => group
                 .keywords
                 .iter()
@@ -3402,6 +3420,21 @@ async fn process_message_impl(
             system_prompt = format!("{prefix}\n\n{system_prompt}");
         }
 
+        // Deterministic small-talk fast path (`[fast_path] smalltalk`): a message
+        // that is ONLY a greeting / thanks / farewell skips per-turn recall and
+        // post-turn consolidation. Never a confirmation ("ya"/"oke"): those
+        // continue a pending action.
+        let smalltalk =
+            config.fast_path.smalltalk && crate::agent::smalltalk::is_smalltalk(&effective_message);
+        if smalltalk {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent),
+                "smalltalk fast path: skipping recall and consolidation for this turn"
+            );
+        }
+
         let effective_msg_ref = effective_message.as_str();
         let runtime_capability_names: Vec<&str> = effective_tool_names.iter().copied().collect();
         if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
@@ -3512,7 +3545,9 @@ async fn process_message_impl(
                         handle: mem.as_ref(),
                         query: effective_message.clone(),
                         sessions: vec![session_id.map(str::to_string)],
-                        suppress: false,
+                        // A greeting / thank-you gains nothing from recalled
+                        // memory (~1 s per turn); tools stay available.
+                        suppress: smalltalk,
                         cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
                             &config.memory,
                             crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
@@ -3545,6 +3580,7 @@ async fn process_message_impl(
             && config.memory.auto_save
             && config.memory.consolidation_enabled
             && consolidation_sampled_in
+            && !smalltalk
             && crate::agent::tenant::current_tenant().is_some()
         {
             let mem_bg = Arc::clone(&mem);
@@ -14637,6 +14673,69 @@ Let me check the result."#;
             &mcp_set(&["browser__navigate", "files__read_file"]),
         );
         assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn preload_only_groups_never_exclude_any_mcp_tool() {
+        use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+
+        // The trap this mode exists to avoid: a single `always` group with the mail
+        // tools would have hidden every OTHER MCP tool (CRM, Slack, ...) from the
+        // turn. `preload` must leave the rest exactly as it was.
+        let registry_names = ["crm__create_lead", "mail__search_mail", "slack__post"];
+        let groups = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Preload,
+            tools: vec!["mail__*".into()],
+            keywords: vec![],
+        }];
+        let mcp = mcp_set(&registry_names);
+        for name in registry_names {
+            assert!(
+                mcp_tool_included_for_turn(name, &groups, "anything"),
+                "{name} must stay available under a preload-only profile"
+            );
+        }
+        // ...whereas the same list as `always` is a whitelist and hides the rest.
+        let always = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Always,
+            tools: vec!["mail__*".into()],
+            keywords: vec![],
+        }];
+        assert!(mcp_tool_included_for_turn("mail__search_mail", &always, "x"));
+        assert!(!mcp_tool_included_for_turn("crm__create_lead", &always, "x"));
+        let _ = mcp;
+    }
+
+    #[test]
+    fn preloaded_tool_survives_beside_a_restricting_group_that_omits_it() {
+        use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+
+        let groups = vec![
+            ToolFilterGroup {
+                mode: ToolFilterGroupMode::Preload,
+                tools: vec!["mail__*".into()],
+                keywords: vec![],
+            },
+            ToolFilterGroup {
+                mode: ToolFilterGroupMode::Dynamic,
+                tools: vec!["browser__*".into()],
+                keywords: vec!["website".into()],
+            },
+        ];
+        assert!(mcp_tool_included_for_turn("mail__search_mail", &groups, "hello"));
+        assert!(!mcp_tool_included_for_turn("browser__open", &groups, "hello"));
+        assert!(mcp_tool_included_for_turn("browser__open", &groups, "open this website"));
+        assert!(!mcp_tool_included_for_turn("crm__create_lead", &groups, "hello"));
+    }
+
+    #[test]
+    fn preload_group_parses_from_config() {
+        let group: zeroclaw_config::schema::ToolFilterGroup =
+            toml::from_str("mode = \"preload\"\ntools = [\"mail__*\"]\n").unwrap();
+        assert!(matches!(
+            group.mode,
+            zeroclaw_config::schema::ToolFilterGroupMode::Preload
+        ));
     }
 
     #[test]
