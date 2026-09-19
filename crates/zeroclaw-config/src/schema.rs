@@ -13761,6 +13761,13 @@ pub struct ToolRiskTiersConfig {
 
 /// Names classified `Safe` by default when not overridden in config:
 /// read-only, no side effects, never gated or idempotency-checked.
+///
+/// Network egress is deliberately NOT here: `http_request` and `web_fetch`
+/// used to be `Safe`, which put outbound HTTP outside approval, velocity,
+/// and idempotency entirely. They now fall through to `Reversible` like
+/// every other unclassified tool — profiles that need them list them in
+/// `auto_approve` explicitly (all five product profiles plus the brain
+/// profiles already do).
 const DEFAULT_SAFE_TOOLS: &[&str] = &[
     "tool_search",
     "memory_recall",
@@ -13768,9 +13775,7 @@ const DEFAULT_SAFE_TOOLS: &[&str] = &[
     "content_search",
     "glob_search",
     "web_search_tool",
-    "web_fetch",
     "calculator",
-    "http_request",
 ];
 
 /// Apply a tenant's entity id to one `[[mcp.servers]]` entry, if it's
@@ -27593,6 +27598,12 @@ untrusted_outbound_redact = false
             config.tool_risk_tier("file_write"),
             ToolRiskTier::Reversible
         );
+        // Network egress is never Safe: profiles must grant it explicitly.
+        assert_eq!(
+            config.tool_risk_tier("http_request"),
+            ToolRiskTier::Reversible
+        );
+        assert_eq!(config.tool_risk_tier("web_fetch"), ToolRiskTier::Reversible);
     }
 
     #[test]

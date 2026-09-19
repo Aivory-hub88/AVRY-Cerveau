@@ -2982,7 +2982,9 @@ mod sop_step_reassembly_tests {
             crate::approval::ApprovalRequirement::Prompt,
             "a live approval back-channel must survive delegation"
         );
-        // The plain non-interactive parent keeps the auto-deny shape.
+        // The plain non-interactive parent derives a plain non-interactive
+        // child — and since C1, shell Prompts there too (auto-deny
+        // headless) instead of short-circuiting to NotRequired.
         let plain_parent = crate::approval::ApprovalManager::for_non_interactive(
             &zeroclaw_config::schema::RiskProfileConfig::default(),
         );
@@ -2990,7 +2992,7 @@ mod sop_step_reassembly_tests {
             .derive_for_risk_profile(&zeroclaw_config::schema::RiskProfileConfig::default());
         assert_eq!(
             plain_child.approval_requirement("shell"),
-            crate::approval::ApprovalRequirement::NotRequired,
+            crate::approval::ApprovalRequirement::Prompt,
             "a plain non-interactive parent derives a plain non-interactive child"
         );
     }

@@ -148,7 +148,11 @@ impl ApprovalManager {
             always_ask: risk_profile.always_ask.iter().cloned().collect(),
             autonomy_level: risk_profile.level,
             non_interactive: true,
-            non_interactive_shell_requires_approval: false,
+            // C1: shell never auto-passes on a headless path. A profile that
+            // genuinely needs it lists it in auto_approve (none of the
+            // product profiles do); everything else prompts, which
+            // auto-denies where no channel can approve.
+            non_interactive_shell_requires_approval: true,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
             risk_tiers: None,
@@ -313,14 +317,27 @@ impl ApprovalManager {
             return ApprovalRequirement::Pending;
         }
 
+        // H6: a tenant-owned tool (`tenant_*`) with no tenant context has no
+        // identity to bill the side effect to and no backend tier to consult
+        // — fail to Prompt (asks on CLI, auto-denies on headless channels),
+        // placed above Full autonomy so no autonomy level can override it.
+        if crate::agent::tenant::current_tenant().is_none()
+            && tool_name.starts_with(crate::agent::tenant::TENANT_CUSTOM_MCP_NAME_PREFIX)
+        {
+            return ApprovalRequirement::Prompt;
+        }
+
         // Full autonomy never prompts.
         if self.autonomy_level == AutonomyLevel::Full {
             return ApprovalRequirement::Approved;
         }
 
-        // ReadOnly blocks everything — handled elsewhere; no prompt needed.
+        // ReadOnly agents must not execute: Prompt asks on CLI and
+        // auto-denies on headless channels. The old NotRequired split the
+        // decision across "handled elsewhere", so any new consumer reading
+        // only this gate inherited default-allow.
         if self.autonomy_level == AutonomyLevel::ReadOnly {
-            return ApprovalRequirement::NotRequired;
+            return ApprovalRequirement::Prompt;
         }
 
         // always_ask overrides everything.
@@ -859,13 +876,31 @@ mod tests {
     }
 
     #[test]
-    fn readonly_never_prompts() {
+    fn readonly_prompts() {
         let config = RiskProfileConfig {
             level: AutonomyLevel::ReadOnly,
             ..RiskProfileConfig::default()
         };
         let mgr = ApprovalManager::from_risk_profile(&config);
-        assert!(!mgr.needs_approval("shell"));
+        // ReadOnly must deny-by-default at the gate itself, never rely on
+        // enforcement "elsewhere": Prompt asks on CLI, auto-denies headless.
+        assert!(mgr.needs_approval("shell"));
+        assert!(mgr.needs_approval("file_read"));
+    }
+
+    #[test]
+    fn shell_needs_approval_on_plain_non_interactive() {
+        let mgr = ApprovalManager::for_non_interactive(&supervised_config());
+        // C1: no silent shell on headless paths, even without always_ask.
+        assert!(mgr.needs_approval("shell"));
+    }
+
+    #[test]
+    fn tenant_tool_without_tenant_context_prompts_even_at_full_autonomy() {
+        let mgr = ApprovalManager::for_non_interactive(&full_config());
+        // H6: tenant_* with nobody to bill it to — Prompt (auto-deny
+        // headless), and Full autonomy must not override it.
+        assert!(mgr.needs_approval("tenant_aivory-mail__send_mail"));
     }
 
     // ── session allowlist ────────────────────────────────────
@@ -1028,9 +1063,11 @@ mod tests {
     }
 
     #[test]
-    fn non_interactive_shell_skips_outer_approval_by_default() {
+    fn non_interactive_shell_requires_outer_approval_by_default() {
         let mgr = ApprovalManager::for_non_interactive(&RiskProfileConfig::default());
-        assert!(!mgr.needs_approval("shell"));
+        // C1: no silent shell on headless paths — a profile that genuinely
+        // needs it lists shell in auto_approve explicitly.
+        assert!(mgr.needs_approval("shell"));
     }
 
     #[test]
@@ -1067,14 +1104,15 @@ mod tests {
     }
 
     #[test]
-    fn non_interactive_readonly_never_needs_approval() {
+    fn non_interactive_readonly_needs_approval() {
         let config = RiskProfileConfig {
             level: AutonomyLevel::ReadOnly,
             ..RiskProfileConfig::default()
         };
         let mgr = ApprovalManager::for_non_interactive(&config);
-        // ReadOnly blocks execution elsewhere; approval manager does not prompt.
-        assert!(!mgr.needs_approval("shell"));
+        // H7: ReadOnly denies at the gate itself (Prompt → auto-deny
+        // headless), never relies on enforcement "elsewhere".
+        assert!(mgr.needs_approval("shell"));
     }
 
     #[test]
