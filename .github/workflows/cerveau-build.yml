@@ -97,6 +97,8 @@ jobs:
           RUST_BACKTRACE: full
         run: |
           cargo test --locked -p zeroclaw-runtime --features memory-postgres --lib ledger_link_e2e -- --test-threads=1
+          # task_list scope=session: an orchestrator must see the specialists' rows in its session
+          cargo test --locked -p zeroclaw-tools --features memory-postgres --lib task_ledger::task_list_scope_tests
 
   # ── Redis-dependent tests (ADR-005)
   redis-tests:

@@ -75,6 +75,19 @@ pub enum StatusUpdate {
 /// snapshot carry; the full text stays in the delegate result file.
 const RESULT_SUMMARY_MAX_CHARS: usize = 2000;
 
+/// How many of a tenant's newest archive rows [`AgentTaskLedger::list_session_tasks`]
+/// decodes when looking for one session's finished work.
+const SESSION_ARCHIVE_SCAN: i64 = 200;
+
+/// Decode one archive payload (gzip JSON of an [`AgentTask`]). A payload that does
+/// not decode is skipped by callers: one corrupt row must never hide the others.
+fn decode_archived(payload: &[u8]) -> Option<AgentTask> {
+    let mut decoder = GzDecoder::new(payload);
+    let mut json = Vec::new();
+    decoder.read_to_end(&mut json).ok()?;
+    serde_json::from_slice::<AgentTask>(&json).ok()
+}
+
 fn truncate_summary(text: &str) -> String {
     if text.chars().count() <= RESULT_SUMMARY_MAX_CHARS {
         return text.to_string();
@@ -807,18 +820,85 @@ impl AgentTaskLedger {
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
                 let payload: Vec<u8> = row.get(0);
-                let mut decoder = GzDecoder::new(payload.as_slice());
-                let mut json = Vec::new();
-                if decoder.read_to_end(&mut json).is_err() {
-                    continue;
-                }
-                if let Ok(task) = serde_json::from_slice::<AgentTask>(&json) {
+                if let Some(task) = decode_archived(&payload) {
                     out.push(task);
                 }
             }
             Ok(out)
         })
         .await
+    }
+
+    /// Every agent's tasks in one session, for one tenant: open rows plus recently
+    /// finished ones. This is how an orchestrator checks whether the work it
+    /// delegated is done -- `list_tasks` only ever shows an agent its own rows.
+    ///
+    /// Finished work lives gzip-compressed in the archive, which has no session
+    /// column, so the tenant's newest [`SESSION_ARCHIVE_SCAN`] archive rows are
+    /// decoded and filtered by the session stored inside the payload. Always scoped
+    /// to `tenant_id`: one tenant can never read another's rows.
+    pub async fn list_session_tasks(
+        &self,
+        tenant_id: &str,
+        session_id: &str,
+        status: Option<TaskStatus>,
+    ) -> Result<Vec<AgentTask>> {
+        let client = Arc::clone(self.client.get());
+        let schema = self.schema.clone();
+        let tenant_id = tenant_id.to_string();
+        let session_id = session_id.to_string();
+        let status_str = status.map(|s| s.as_str().to_string());
+        let include_archive = matches!(status, None | Some(TaskStatus::Done));
+        let mut out = run_on_os_thread(move || -> Result<Vec<AgentTask>> {
+            let mut live = client.lock();
+            let client = live.ready()?;
+            let mut out = Vec::new();
+            if status != Some(TaskStatus::Done) {
+                let rows = match &status_str {
+                    Some(s) => client.query(
+                        &format!(
+                            r#"SELECT {TASK_COLUMNS} FROM "{schema}".agent_tasks
+                               WHERE tenant_id = $1 AND session_id = $2 AND status = $3
+                               ORDER BY updated_at DESC"#
+                        ),
+                        &[&tenant_id, &session_id, s],
+                    )?,
+                    None => client.query(
+                        &format!(
+                            r#"SELECT {TASK_COLUMNS} FROM "{schema}".agent_tasks
+                               WHERE tenant_id = $1 AND session_id = $2
+                               ORDER BY updated_at DESC"#
+                        ),
+                        &[&tenant_id, &session_id],
+                    )?,
+                };
+                out.extend(rows.iter().map(task_from_row));
+            }
+            if include_archive {
+                let rows = client.query(
+                    &format!(
+                        r#"SELECT payload FROM "{schema}".agent_tasks_archive
+                           WHERE tenant_id = $1
+                           ORDER BY archived_at DESC
+                           LIMIT {SESSION_ARCHIVE_SCAN}"#
+                    ),
+                    &[&tenant_id],
+                )?;
+                for row in rows {
+                    let payload: Vec<u8> = row.get(0);
+                    if let Some(task) = decode_archived(&payload)
+                        && task.tenant_id == tenant_id
+                        && task.session_id.as_deref() == Some(session_id.as_str())
+                    {
+                        out.push(task);
+                    }
+                }
+            }
+            Ok(out)
+        })
+        .await?;
+        out.sort_by_key(|t| std::cmp::Reverse(t.updated_at));
+        Ok(out)
     }
 
     /// Permanently delete archived tasks older than [`ARCHIVE_RETENTION_DAYS`].
