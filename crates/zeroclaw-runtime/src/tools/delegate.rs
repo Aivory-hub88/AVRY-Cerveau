@@ -12202,6 +12202,71 @@ command = "rm independent-delegate-marker"
             (uri, task)
         }
 
+        /// A stand-in for avry-backend's `/api/v1/agent-actions/internal`: records
+        /// every POST body and answers 200.
+        async fn notify_mock() -> (String, Arc<parking_lot::Mutex<Vec<serde_json::Value>>>) {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let posts: Arc<parking_lot::Mutex<Vec<serde_json::Value>>> = Arc::default();
+            let recorded = Arc::clone(&posts);
+            zeroclaw_spawn::spawn!(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let recorded = Arc::clone(&recorded);
+                    zeroclaw_spawn::spawn!(async move {
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        loop {
+                            let n = socket.read(&mut chunk).await.unwrap_or(0);
+                            if n == 0 {
+                                break;
+                            }
+                            buf.extend_from_slice(&chunk[..n]);
+                            let text = String::from_utf8_lossy(&buf).to_string();
+                            if let Some(head_end) = text.find("\r\n\r\n") {
+                                let head = text[..head_end].to_ascii_lowercase();
+                                let len = head
+                                    .lines()
+                                    .find_map(|l| l.strip_prefix("content-length:"))
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                                    .unwrap_or(0);
+                                if buf.len() >= head_end + 4 + len {
+                                    if let Ok(body) = serde_json::from_slice::<serde_json::Value>(
+                                        &buf[head_end + 4..head_end + 4 + len],
+                                    ) {
+                                        recorded.lock().push(body);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        let _ = socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                            )
+                            .await;
+                    });
+                }
+            });
+            (base, posts)
+        }
+
+        /// Wait until `n` notifications arrived (they are sent fire-and-forget).
+        async fn posts_eventually(
+            posts: &Arc<parking_lot::Mutex<Vec<serde_json::Value>>>,
+            n: usize,
+        ) -> Vec<serde_json::Value> {
+            for _ in 0..100 {
+                if posts.lock().len() >= n {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let seen = posts.lock().clone();
+            assert!(seen.len() >= n, "expected {n} notifications, got {seen:?}");
+            seen
+        }
+
         fn result_files(workspace: &Path) -> usize {
             std::fs::read_dir(workspace.join("delegate_results"))
                 .map(|d| d.count())
@@ -12580,6 +12645,245 @@ command = "rm independent-delegate-marker"
                 // Idempotent: a second pass changes nothing further.
                 crate::tools::delegate_ledger::reconcile(&store).await;
                 assert_eq!(get("alive").await.unwrap().status, LedgerStatus::InProgress);
+            }
+
+            // ── G. settling a delegated task tells the operator's notification feed
+            //       (before this, only an agent's own task_update_status did) ──
+            {
+                use crate::control_plane::{
+                    SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
+                };
+                use crate::tools::delegate_ledger::{LedgerLink, LedgerStart, reconcile_with};
+                use zeroclaw_memory::task_ledger::NewDelegatedTask;
+
+                let run = uuid::Uuid::new_v4().simple().to_string();
+                let (base, posts) = notify_mock().await;
+                let link = LedgerLink::for_test(
+                    Arc::clone(&ledger),
+                    &user,
+                    "leads_qualifier",
+                    "chief_of_staff",
+                    Some("room-G"),
+                    Some((base.clone(), "tok".to_string())),
+                );
+                let result = |id: &str,
+                              status: BackgroundTaskStatus,
+                              output: Option<&str>,
+                              error: Option<&str>,
+                              reason: Option<&str>| {
+                    BackgroundDelegateResult {
+                        task_id: id.to_string(),
+                        agent: "leads_qualifier".to_string(),
+                        status,
+                        output: output.map(str::to_string),
+                        error: error.map(str::to_string),
+                        started_at: "2026-09-19T10:00:00Z".to_string(),
+                        finished_at: Some("2026-09-19T10:00:05Z".to_string()),
+                        meta: reason.map(|r| BackgroundResultMeta {
+                            reason: Some(r.to_string()),
+                            ..BackgroundResultMeta::default()
+                        }),
+                    }
+                };
+                for id in [
+                    &format!("g-done-{run}"),
+                    &format!("g-fail-{run}"),
+                    &format!("g-stop-{run}"),
+                ] {
+                    assert!(matches!(
+                        link.start_background(id, "leads_qualifier", "qualify the leads", None)
+                            .await,
+                        LedgerStart::Linked { .. }
+                    ));
+                }
+                link.finish(
+                    &format!("g-done-{run}"),
+                    &result(
+                        &format!("g-done-{run}"),
+                        BackgroundTaskStatus::Completed,
+                        Some("[Agent 'leads_qualifier' (p/m)]\n3 leads"),
+                        None,
+                        None,
+                    ),
+                )
+                .await;
+                link.finish(
+                    &format!("g-fail-{run}"),
+                    &result(
+                        &format!("g-fail-{run}"),
+                        BackgroundTaskStatus::Failed,
+                        None,
+                        Some("boom"),
+                        Some("tool_error"),
+                    ),
+                )
+                .await;
+                // Stopped/cancelled is the operator's or the caller's own act: no announcement.
+                link.finish(
+                    &format!("g-stop-{run}"),
+                    &result(
+                        &format!("g-stop-{run}"),
+                        BackgroundTaskStatus::Cancelled,
+                        None,
+                        Some("Cancelled by caller"),
+                        Some("cancelled"),
+                    ),
+                )
+                .await;
+                // Settling something already settled finds nothing, so announces nothing.
+                link.finish(
+                    &format!("g-done-{run}"),
+                    &result(
+                        &format!("g-done-{run}"),
+                        BackgroundTaskStatus::Completed,
+                        Some("again"),
+                        None,
+                        None,
+                    ),
+                )
+                .await;
+                // A sync hop that failed is recorded blocked: announced like a blocked task.
+                link.record_failed_hop(
+                    &format!("g-hop-{run}"),
+                    "leads_qualifier",
+                    "qualify the leads",
+                    DelegateReason::TimedOut,
+                    "Agent 'leads_qualifier' timed out after 300s",
+                )
+                .await
+                .expect("failed hop recorded");
+
+                let seen = posts_eventually(&posts, 3).await;
+                let by_status = |status: &str| {
+                    seen.iter()
+                        .filter(|b| b["payload"]["status"] == status)
+                        .collect::<Vec<_>>()
+                };
+                let done = by_status("done");
+                assert_eq!(done.len(), 1, "{seen:?}");
+                assert_eq!(done[0]["user_id"], user.as_str());
+                assert_eq!(done[0]["agent_type"], "leads_qualifier");
+                assert_eq!(done[0]["session_id"], "room-G");
+                assert_eq!(done[0]["action_type"], "task");
+                assert!(
+                    done[0]["payload"]["title"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("Delegated to leads_qualifier")
+                );
+                let blocked = by_status("blocked");
+                assert_eq!(
+                    blocked.len(),
+                    2,
+                    "the failed delegation and the failed hop: {seen:?}"
+                );
+                assert!(blocked.iter().any(|b| {
+                    b["payload"]["blocked_reason"]
+                        .as_str()
+                        .is_some_and(|r| r.starts_with("Delegation failed"))
+                }));
+                assert!(blocked.iter().any(|b| {
+                    b["payload"]["blocked_reason"]
+                        .as_str()
+                        .is_some_and(|r| r.starts_with("Delegation timed out"))
+                }));
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                assert_eq!(
+                    posts.lock().len(),
+                    3,
+                    "no post for cancelled or for the second settle"
+                );
+
+                // The reconciler announces what a daemon restart left unsettled.
+                let store = SqliteTaskStore::new_in_memory().unwrap();
+                ledger
+                    .create_delegated_task(NewDelegatedTask {
+                        tenant_id: &user,
+                        agent_type: "leads_qualifier",
+                        session_id: Some("room-G"),
+                        title: "Delegated to leads_qualifier: lost one",
+                        delegated_by: "chief_of_staff",
+                        delegation_id: &format!("g-lost-{run}"),
+                        context_id: None,
+                        status: LedgerStatus::InProgress,
+                        outcome: None,
+                        blocked_reason: None,
+                        result_summary: None,
+                    })
+                    .await
+                    .unwrap();
+                store
+                    .create(TaskRecord {
+                        id: format!("g-lost-{run}"),
+                        kind: TaskKind::Delegate,
+                        agent: "leads_qualifier".into(),
+                        status: TaskStatus::Lost,
+                        owner_pid: 0,
+                        owner_boot_id: "old-boot".into(),
+                        heartbeat_at: None,
+                        depth: 0,
+                        parent_id: None,
+                        originator_route: None,
+                        delivered: false,
+                        idem_key: None,
+                        principal_id: None,
+                        started_at: "2026-09-19T00:00:00Z".into(),
+                        finished_at: None,
+                    })
+                    .await
+                    .unwrap();
+                // With no notification target configured nothing is posted and nothing breaks.
+                reconcile_with(&store, None).await;
+                assert_eq!(posts.lock().len(), 3);
+                // Reconciled a second time it is already settled, so with a target it stays quiet too:
+                // prove the announcement on a fresh unsettled row instead.
+                ledger
+                    .create_delegated_task(NewDelegatedTask {
+                        tenant_id: &user,
+                        agent_type: "leads_qualifier",
+                        session_id: Some("room-G"),
+                        title: "Delegated to leads_qualifier: lost two",
+                        delegated_by: "chief_of_staff",
+                        delegation_id: &format!("g-lost2-{run}"),
+                        context_id: None,
+                        status: LedgerStatus::InProgress,
+                        outcome: None,
+                        blocked_reason: None,
+                        result_summary: None,
+                    })
+                    .await
+                    .unwrap();
+                store
+                    .create(TaskRecord {
+                        id: format!("g-lost2-{run}"),
+                        kind: TaskKind::Delegate,
+                        agent: "leads_qualifier".into(),
+                        status: TaskStatus::Lost,
+                        owner_pid: 0,
+                        owner_boot_id: "old-boot".into(),
+                        heartbeat_at: None,
+                        depth: 0,
+                        parent_id: None,
+                        originator_route: None,
+                        delivered: false,
+                        idem_key: None,
+                        principal_id: None,
+                        started_at: "2026-09-19T00:00:00Z".into(),
+                        finished_at: None,
+                    })
+                    .await
+                    .unwrap();
+                reconcile_with(&store, Some((base, "tok".to_string()))).await;
+                let seen = posts_eventually(&posts, 4).await;
+                let lost = seen
+                    .iter()
+                    .find(|b| {
+                        b["payload"]["blocked_reason"]
+                            .as_str()
+                            .is_some_and(|r| r.contains("daemon restarted"))
+                    })
+                    .expect("the reconciler announced the lost delegation");
+                assert_eq!(lost["payload"]["status"], "blocked");
             }
 
             let _ = std::fs::remove_dir_all(workspace);

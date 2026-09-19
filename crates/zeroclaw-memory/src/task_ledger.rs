@@ -365,7 +365,7 @@ fn archive_returned_row(
     txn: &mut postgres::Transaction<'_>,
     schema: &str,
     row: &postgres::Row,
-) -> Result<()> {
+) -> Result<AgentTask> {
     let priority_raw: String = row.get(5);
     let outcome_raw: Option<String> = row.get(12);
     let context_id: Option<String> = row.get(8);
@@ -407,7 +407,7 @@ fn archive_returned_row(
             &context_id,
         ],
     )?;
-    Ok(())
+    Ok(finished)
 }
 
 async fn run_on_os_thread<F, T>(f: F) -> Result<T>
@@ -1104,10 +1104,25 @@ impl AgentTaskLedger {
     /// stopped it (a late write never turns "abandoned" into anything else).
     /// Idempotent, so the engine and the reconciler may both call it.
     pub async fn finish_delegation(&self, delegation_id: &str, end: DelegationEnd) -> Result<bool> {
+        Ok(self
+            .finish_delegation_returning(delegation_id, end)
+            .await?
+            .is_some())
+    }
+
+    /// Like [`Self::finish_delegation`], but returns the row as it now stands
+    /// (`done` for a completed delegation, whose row has just been archived), or
+    /// `None` when there was nothing to settle. The caller uses it to tell the
+    /// operator what happened without reading the row back.
+    pub async fn finish_delegation_returning(
+        &self,
+        delegation_id: &str,
+        end: DelegationEnd,
+    ) -> Result<Option<AgentTask>> {
         let client = Arc::clone(self.client.get());
         let schema = self.schema.clone();
         let delegation_id = delegation_id.to_string();
-        run_on_os_thread(move || -> Result<bool> {
+        run_on_os_thread(move || -> Result<Option<AgentTask>> {
             let mut live = client.lock();
             let client = live.ready()?;
             match end {
@@ -1123,7 +1138,7 @@ impl AgentTaskLedger {
                         &[&delegation_id, &summary],
                     )?;
                     if updated == 0 {
-                        return Ok(false);
+                        return Ok(None);
                     }
                     let row = txn.query_opt(
                         &format!(
@@ -1134,41 +1149,51 @@ impl AgentTaskLedger {
                         &[&delegation_id],
                     )?;
                     let Some(row) = row else {
-                        return Ok(false);
+                        return Ok(None);
                     };
-                    archive_returned_row(&mut txn, &schema, &row)?;
+                    let finished = archive_returned_row(&mut txn, &schema, &row)?;
                     txn.commit()?;
-                    Ok(true)
+                    Ok(Some(finished))
                 }
-                DelegationEnd::InputRequired { reason } => Ok(client.execute(
-                    &format!(
-                        r#"UPDATE "{schema}".agent_tasks
-                           SET status = 'blocked', blocked_reason = $2, outcome = NULL,
-                               updated_at = NOW()
-                           WHERE delegation_id = $1 AND status <> 'cancelled'"#
-                    ),
-                    &[&delegation_id, &reason],
-                )? > 0),
+                DelegationEnd::InputRequired { reason } => {
+                    let rows = client.query(
+                        &format!(
+                            r#"UPDATE "{schema}".agent_tasks
+                               SET status = 'blocked', blocked_reason = $2, outcome = NULL,
+                                   updated_at = NOW()
+                               WHERE delegation_id = $1 AND status <> 'cancelled'
+                               RETURNING {TASK_COLUMNS}"#
+                        ),
+                        &[&delegation_id, &reason],
+                    )?;
+                    Ok(rows.first().map(task_from_row))
+                }
                 DelegationEnd::Failed { outcome, reason } => {
                     let outcome = outcome.as_str().to_string();
-                    Ok(client.execute(
+                    let rows = client.query(
                         &format!(
                             r#"UPDATE "{schema}".agent_tasks
                                SET status = 'blocked', outcome = $2, blocked_reason = $3,
                                    updated_at = NOW()
-                               WHERE delegation_id = $1 AND status <> 'cancelled'"#
+                               WHERE delegation_id = $1 AND status <> 'cancelled'
+                               RETURNING {TASK_COLUMNS}"#
                         ),
                         &[&delegation_id, &outcome, &reason],
-                    )? > 0)
+                    )?;
+                    Ok(rows.first().map(task_from_row))
                 }
-                DelegationEnd::Cancelled { reason } => Ok(client.execute(
-                    &format!(
-                        r#"UPDATE "{schema}".agent_tasks
-                           SET status = 'cancelled', blocked_reason = $2, updated_at = NOW()
-                           WHERE delegation_id = $1 AND status <> 'cancelled'"#
-                    ),
-                    &[&delegation_id, &reason],
-                )? > 0),
+                DelegationEnd::Cancelled { reason } => {
+                    let rows = client.query(
+                        &format!(
+                            r#"UPDATE "{schema}".agent_tasks
+                               SET status = 'cancelled', blocked_reason = $2, updated_at = NOW()
+                               WHERE delegation_id = $1 AND status <> 'cancelled'
+                               RETURNING {TASK_COLUMNS}"#
+                        ),
+                        &[&delegation_id, &reason],
+                    )?;
+                    Ok(rows.first().map(task_from_row))
+                }
             }
         })
         .await

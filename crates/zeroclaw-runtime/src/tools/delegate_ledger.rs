@@ -73,9 +73,33 @@ mod real {
         agent_type: String,
         delegated_by: String,
         session_id: Option<String>,
+        /// avry-backend's `(base_url, token)` for the operator's notification
+        /// feed, when this host has one configured.
+        notify: Option<(String, String)>,
     }
 
     impl LedgerLink {
+        /// A link with every field given, for tests that must control the
+        /// notification target (the real one reads process environment).
+        #[cfg(test)]
+        pub(crate) fn for_test(
+            ledger: Arc<AgentTaskLedger>,
+            tenant_id: &str,
+            agent_type: &str,
+            delegated_by: &str,
+            session_id: Option<&str>,
+            notify: Option<(String, String)>,
+        ) -> Self {
+            Self {
+                ledger,
+                tenant_id: tenant_id.to_string(),
+                agent_type: agent_type.to_string(),
+                delegated_by: delegated_by.to_string(),
+                session_id: session_id.map(str::to_string),
+                notify,
+            }
+        }
+
         /// `None` when there is no installed ledger or no tenant context (host
         /// and internal turns have none), which is the common non-tenant case.
         pub(crate) fn capture(target: &str) -> Option<Self> {
@@ -89,6 +113,7 @@ mod real {
                 agent_type: overlay.agent_type.clone(),
                 delegated_by,
                 session_id: current_turn_origin().and_then(|o| o.session_id.clone()),
+                notify: crate::cron::tenant_sync::backend(),
             })
         }
 
@@ -155,8 +180,16 @@ mod real {
             let Some(end) = end_for_result(result) else {
                 return;
             };
-            if let Err(e) = self.ledger.finish_delegation(delegation_id, end).await {
-                warn("finish", &e);
+            match self
+                .ledger
+                .finish_delegation_returning(delegation_id, end)
+                .await
+            {
+                // `None` = nothing to settle (already archived by the agent, or
+                // stopped by the operator): nothing happened, so nothing to announce.
+                Ok(Some(task)) => spawn_notify(&self.notify, task),
+                Ok(None) => {}
+                Err(e) => warn("finish", &e),
             }
         }
 
@@ -193,7 +226,14 @@ mod real {
                 })
                 .await
             {
-                Ok(id) => Some(id),
+                Ok(id) => {
+                    // A sync hop that failed is now `blocked`: tell the operator, as
+                    // an agent's own `task_update_status blocked` would.
+                    if let Ok(Some(task)) = self.ledger.get_task(&self.tenant_id, &id).await {
+                        spawn_notify(&self.notify, task);
+                    }
+                    Some(id)
+                }
                 Err(e) => {
                     warn("record_failed_hop", &e);
                     None
@@ -222,6 +262,12 @@ mod real {
     /// before the registry is updated), so a row is never settled with less
     /// than the engine would have written.
     pub(crate) async fn reconcile(store: &dyn TaskRegistry) {
+        reconcile_with(store, crate::cron::tenant_sync::backend()).await;
+    }
+
+    /// [`reconcile`] with the notification target passed in, so it can be tested
+    /// without touching process environment.
+    pub(crate) async fn reconcile_with(store: &dyn TaskRegistry, notify: Option<(String, String)>) {
         let Some(ledger) = current_task_ledger() else {
             return;
         };
@@ -239,10 +285,31 @@ mod real {
             let Some(end) = end_for_registry_status(record.status) else {
                 continue;
             };
-            if let Err(e) = ledger.finish_delegation(&id, end).await {
-                warn("reconcile", &e);
+            match ledger.finish_delegation_returning(&id, end).await {
+                Ok(Some(task)) => spawn_notify(&notify, task),
+                Ok(None) => {}
+                Err(e) => warn("reconcile", &e),
             }
         }
+    }
+
+    /// Announce a settled delegated task on avry-backend's activity feed --
+    /// fire-and-forget, so the write that settled it never waits on an HTTP call.
+    /// Only a move into `blocked` or `done` is announced (`cancelled` is the
+    /// operator's or the caller's own action), exactly as for an agent's tool call.
+    fn spawn_notify(
+        notify: &Option<(String, String)>,
+        task: zeroclaw_memory::task_ledger::AgentTask,
+    ) {
+        let Some((base_url, token)) = notify.clone() else {
+            return;
+        };
+        if !zeroclaw_tools::task_ledger::transition_notifies(task.status) {
+            return;
+        }
+        zeroclaw_spawn::spawn!(async move {
+            zeroclaw_tools::task_ledger::notify_task_transition(&base_url, &token, &task).await;
+        });
     }
 
     /// The text a person reads on a failed delegation's row.

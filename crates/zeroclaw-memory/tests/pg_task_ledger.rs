@@ -1141,3 +1141,128 @@ async fn session_listing_shows_every_agents_tasks_in_that_session_only() {
 
     exec(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE;")).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn finishing_a_delegation_returns_the_row_as_it_now_stands() {
+    let Some(url) = pg_url() else {
+        eprintln!("CERVEAU_TEST_PG_URL unset — skipping finish_returning test");
+        return;
+    };
+    let schema = "cerveau_task_ledger_returning_test";
+    exec(&format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema};"
+    ))
+    .await;
+    let l = AgentTaskLedger::connect(&url, schema)
+        .await
+        .expect("connect");
+    let mk = |id: &'static str| NewDelegatedTask {
+        tenant_id: "t",
+        agent_type: "leads_qualifier",
+        session_id: Some("s"),
+        title: "Delegated to leads_qualifier: x",
+        delegated_by: "chief_of_staff",
+        delegation_id: id,
+        context_id: None,
+        status: TaskStatus::InProgress,
+        outcome: None,
+        blocked_reason: None,
+        result_summary: None,
+    };
+
+    l.create_delegated_task(mk("done")).await.unwrap();
+    let done = l
+        .finish_delegation_returning(
+            "done",
+            DelegationEnd::Completed {
+                summary: Some("3 leads".into()),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("a completed delegation returns its (now archived) row");
+    assert_eq!(done.status, TaskStatus::Done);
+    assert_eq!(done.result_summary.as_deref(), Some("3 leads"));
+    assert_eq!(
+        (
+            done.tenant_id.as_str(),
+            done.agent_type.as_str(),
+            done.session_id.as_deref()
+        ),
+        ("t", "leads_qualifier", Some("s"))
+    );
+    // Settling again finds nothing: it is already archived, so there is nothing to announce.
+    assert!(
+        l.finish_delegation_returning("done", DelegationEnd::Completed { summary: None })
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    l.create_delegated_task(mk("fail")).await.unwrap();
+    let failed = l
+        .finish_delegation_returning(
+            "fail",
+            DelegationEnd::Failed {
+                outcome: TaskOutcome::TimedOut,
+                reason: "Delegation timed out: x".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("a failed delegation returns its blocked row");
+    assert_eq!(failed.status, TaskStatus::Blocked);
+    assert_eq!(failed.outcome, Some(TaskOutcome::TimedOut));
+    assert_eq!(
+        failed.blocked_reason.as_deref(),
+        Some("Delegation timed out: x")
+    );
+
+    l.create_delegated_task(mk("wait")).await.unwrap();
+    let waiting = l
+        .finish_delegation_returning(
+            "wait",
+            DelegationEnd::InputRequired {
+                reason: "Waiting for approval: send_email (pa_1)".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(waiting.status, TaskStatus::Blocked);
+    assert!(waiting.outcome.is_none());
+
+    l.create_delegated_task(mk("stop")).await.unwrap();
+    let stopped = l
+        .finish_delegation_returning(
+            "stop",
+            DelegationEnd::Cancelled {
+                reason: "Cancelled by caller".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped.status, TaskStatus::Cancelled);
+    // An operator-stopped row stays stopped: a late settle changes nothing and returns nothing.
+    assert!(
+        l.finish_delegation_returning("stop", DelegationEnd::Completed { summary: None })
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // The bool wrapper agrees.
+    l.create_delegated_task(mk("bool")).await.unwrap();
+    assert!(
+        l.finish_delegation("bool", DelegationEnd::Completed { summary: None })
+            .await
+            .unwrap()
+    );
+    assert!(
+        !l.finish_delegation("bool", DelegationEnd::Completed { summary: None })
+            .await
+            .unwrap()
+    );
+
+    exec(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE;")).await;
+}

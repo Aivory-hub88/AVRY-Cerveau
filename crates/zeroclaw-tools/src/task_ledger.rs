@@ -264,6 +264,57 @@ async fn notify_agent_action(
     ctx: &TaskLedgerContext,
     task: &zeroclaw_memory::task_ledger::AgentTask,
 ) {
+    post_task_action(
+        base_url,
+        token,
+        &ctx.tenant_id,
+        &ctx.agent_type,
+        ctx.session_id.as_deref(),
+        task,
+    )
+    .await;
+}
+
+/// Whether a task moving to `status` is worth an entry in the operator's Agent
+/// Activity feed: only a transition into `blocked` (needs a person) or `done`.
+pub fn transition_notifies(status: TaskStatus) -> bool {
+    matches!(status, TaskStatus::Blocked | TaskStatus::Done)
+}
+
+/// Post a task transition made by something other than the agent's own
+/// `task_update_status` -- the delegation engine settling a delegated task, or the
+/// reaper's reconciler. Those writes used to be invisible to the notification feed,
+/// so a delegation that failed or finished showed on the board but nowhere else.
+/// Addressed by the row itself (its tenant, agent_type and session), because there
+/// is no calling turn to take them from. Failures are logged and swallowed, like
+/// the tool's own notify.
+pub async fn notify_task_transition(
+    base_url: &str,
+    token: &str,
+    task: &zeroclaw_memory::task_ledger::AgentTask,
+) {
+    if !transition_notifies(task.status) {
+        return;
+    }
+    post_task_action(
+        base_url,
+        token,
+        &task.tenant_id,
+        &task.agent_type,
+        task.session_id.as_deref(),
+        task,
+    )
+    .await;
+}
+
+async fn post_task_action(
+    base_url: &str,
+    token: &str,
+    tenant_id: &str,
+    agent_type: &str,
+    session_id: Option<&str>,
+    task: &zeroclaw_memory::task_ledger::AgentTask,
+) {
     let payload = json!({
         "task_id": task.task_id,
         "title": task.title,
@@ -271,11 +322,11 @@ async fn notify_agent_action(
         "blocked_reason": task.blocked_reason,
     });
     let body = json!({
-        "user_id": ctx.tenant_id,
-        "agent_type": ctx.agent_type,
+        "user_id": tenant_id,
+        "agent_type": agent_type,
         "action_type": "task",
         "payload": payload,
-        "session_id": ctx.session_id,
+        "session_id": session_id,
     });
     let res = notify_client()
         .post(format!("{base_url}/api/v1/agent-actions/internal"))
@@ -903,5 +954,103 @@ mod task_list_scope_tests {
         let bad = list(&no_session, json!({"scope": "everyone"})).await;
         assert!(!bad.success);
         assert!(bad.error.unwrap().contains("'scope' must be"));
+    }
+}
+
+#[cfg(test)]
+mod notify_transition_tests {
+    use super::*;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use zeroclaw_memory::task_ledger::AgentTask;
+
+    fn task(status: TaskStatus, reason: Option<&str>) -> AgentTask {
+        let now = chrono::Utc::now();
+        AgentTask {
+            task_id: "task-1".into(),
+            tenant_id: "u1".into(),
+            agent_type: "leads_qualifier".into(),
+            session_id: Some("room-1".into()),
+            title: "Delegated to leads_qualifier: qualify".into(),
+            status,
+            priority: TaskPriority::Normal,
+            blocked_reason: reason.map(str::to_string),
+            created_at: now,
+            updated_at: now,
+            context_id: None,
+            parent_task_id: None,
+            delegated_by: Some("chief_of_staff".into()),
+            delegation_id: Some("d-1".into()),
+            outcome: None,
+            result_summary: None,
+        }
+    }
+
+    #[test]
+    fn only_blocked_and_done_are_worth_announcing() {
+        assert!(transition_notifies(TaskStatus::Blocked));
+        assert!(transition_notifies(TaskStatus::Done));
+        for quiet in [
+            TaskStatus::Todo,
+            TaskStatus::InProgress,
+            TaskStatus::Cancelled,
+        ] {
+            assert!(!transition_notifies(quiet), "{quiet:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_settled_delegation_is_posted_addressed_by_its_own_row() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agent-actions/internal"))
+            .and(header("X-Internal-Token", "tok"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        notify_task_transition(
+            &server.uri(),
+            "tok",
+            &task(TaskStatus::Blocked, Some("Delegation failed: boom")),
+        )
+        .await;
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        // Addressed by the row, not by a calling turn (there is none).
+        assert_eq!(body["user_id"], "u1");
+        assert_eq!(body["agent_type"], "leads_qualifier");
+        assert_eq!(body["action_type"], "task");
+        assert_eq!(body["session_id"], "room-1");
+        assert_eq!(body["payload"]["status"], "blocked");
+        assert_eq!(body["payload"]["blocked_reason"], "Delegation failed: boom");
+        assert_eq!(body["payload"]["task_id"], "task-1");
+    }
+
+    #[tokio::test]
+    async fn quiet_statuses_and_an_unreachable_backend_are_harmless() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        for quiet in [
+            TaskStatus::InProgress,
+            TaskStatus::Cancelled,
+            TaskStatus::Todo,
+        ] {
+            notify_task_transition(&server.uri(), "tok", &task(quiet, None)).await;
+        }
+        // A backend that is down, and one that rejects, are logged and swallowed.
+        notify_task_transition("http://127.0.0.1:1", "tok", &task(TaskStatus::Done, None)).await;
+        let rejecting = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&rejecting)
+            .await;
+        notify_task_transition(&rejecting.uri(), "tok", &task(TaskStatus::Done, None)).await;
     }
 }
