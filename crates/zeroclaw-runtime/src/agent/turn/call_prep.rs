@@ -376,17 +376,40 @@ pub(crate) async fn prepare_tool_calls(
                     continue;
                 }
                 Err(e) => {
-                    // Ledger I/O failure: fail open rather than blocking
-                    // every tool call on a control-plane storage hiccup —
-                    // execute without idempotency protection this once,
-                    // same as if no ledger were configured.
+                    // H4: ledger I/O failure fails CLOSED for mutating tools.
+                    // This branch only runs for non-Safe tools, so executing
+                    // anyway would fire a side effect with no replay
+                    // protection at exactly the moment replays are likeliest
+                    // (storage trouble). Deny with a retryable message; the
+                    // next attempt claims normally. (Safe tools never reach
+                    // here — reads stay available during a ledger outage.)
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                             .with_category(::zeroclaw_log::EventCategory::Tool)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({"tool": tool_name, "error": e.to_string()})),
-                        "F-2 idempotency claim failed; executing without idempotency protection"
+                        "F-2 idempotency claim failed; refusing to run unprotected"
                     );
+                    let msg = format!(
+                        "'{tool_name}' cannot run right now: the idempotency \
+                         ledger is unavailable, so an unprotected execution \
+                         could duplicate a side effect. Retry this call shortly."
+                    );
+                    let outcome = ToolExecutionOutcome {
+                        output: msg.clone(),
+                        success: false,
+                        error_reason: Some(msg),
+                        duration: Duration::ZERO,
+                        receipt: None,
+                        output_data: None,
+                    };
+                    if let Some(tx) = ctx.event_tx {
+                        emit_tool_call_pair(tx, call, &outcome).await;
+                    }
+                    ordered_results[idx] =
+                        Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
+                    continue;
                 }
             }
         }

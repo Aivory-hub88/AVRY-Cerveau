@@ -7570,7 +7570,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tool_call_loop_allows_low_risk_shell_in_non_interactive_mode() {
+    async fn run_tool_call_loop_denies_shell_in_non_interactive_mode() {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider::from_text_responses(vec![
             r#"<tool_call>
@@ -7650,7 +7650,7 @@ mod tests {
             turn_id: &turn_id,
         })
         .await
-        .expect("non-interactive shell should succeed for low-risk command");
+        .expect("non-interactive turn completes even though shell is denied");
 
         assert!(
             result.ends_with("done"),
@@ -7661,8 +7661,10 @@ mod tests {
             .iter()
             .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
             .expect("tool results message should be present");
-        assert!(tool_results.content.contains("hello"));
-        assert!(!tool_results.content.contains("Denied by user."));
+        // C1: shell never executes on a headless path — the model sees the
+        // denial, not command output.
+        assert!(!tool_results.content.contains("hello"));
+        assert!(tool_results.content.contains("Denied by user."));
     }
 
     #[tokio::test]
