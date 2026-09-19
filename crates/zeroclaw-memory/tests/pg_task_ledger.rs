@@ -145,6 +145,54 @@ async fn task_ledger_end_to_end() {
     assert_eq!(all.len(), 1, "done tasks stay in the ledger, never deleted");
     assert_eq!(all[0].status, TaskStatus::Done);
 
+    // ── Scenario 4b: a finished task explains itself, it is not "missing" ──
+    // Regression: a second concurrent turn updating a task the first had just
+    // finished got "task ... not found for this tenant" -- true of the live
+    // table, wrong as a diagnosis, and it sent the agent hunting/retrying.
+    let late = ledger
+        .update_status("tenant-a", &task_id, TaskStatus::Blocked, Some("late"))
+        .await
+        .expect_err("changing a done task must be refused");
+    let late = late.to_string();
+    assert!(late.contains("already done"), "wrong diagnosis: {late}");
+    assert!(late.contains("create a new task"), "not actionable: {late}");
+    assert!(
+        !late.contains("not found"),
+        "must not read as missing: {late}"
+    );
+    // Finishing it again is idempotent (the goal state already holds) and must
+    // not create a second archive row.
+    ledger
+        .update_status("tenant-a", &task_id, TaskStatus::Done, None)
+        .await
+        .expect("done twice is idempotent");
+    assert_eq!(
+        ledger
+            .list_tasks("tenant-a", "finance_invoice_ops", None)
+            .await
+            .expect("list_tasks after double done")
+            .len(),
+        1,
+        "double done must not duplicate the archived task"
+    );
+    // Another tenant must learn nothing about it: still plain "not found".
+    for status in [TaskStatus::InProgress, TaskStatus::Done] {
+        let err = ledger
+            .update_status("tenant-b", &task_id, status, None)
+            .await
+            .expect_err("cross-tenant write to an archived task")
+            .to_string();
+        assert!(err.contains("not found"), "leaked existence: {err}");
+        assert!(!err.contains("already done"), "leaked existence: {err}");
+    }
+    // A genuinely unknown id is still "not found".
+    let unknown = ledger
+        .update_status("tenant-a", "no-such-task", TaskStatus::InProgress, None)
+        .await
+        .expect_err("unknown task")
+        .to_string();
+    assert!(unknown.contains("not found"), "{unknown}");
+
     // ── Scenario 5: operator-cancelled rows resist late agent writes ──
     // `cancelled` is a dashboard-only terminal state (the Stop button writes
     // it directly — the tool schema has no Cancelled variant). A late
@@ -166,12 +214,7 @@ async fn task_ledger_end_to_end() {
     ))
     .await;
     ledger
-        .update_status(
-            "tenant-a",
-            &cancelled_id,
-            TaskStatus::InProgress,
-            None,
-        )
+        .update_status("tenant-a", &cancelled_id, TaskStatus::InProgress, None)
         .await
         .expect("late write to a cancelled row must succeed quietly, not error");
     let fetched = ledger
@@ -180,7 +223,8 @@ async fn task_ledger_end_to_end() {
         .expect("get_task cancelled")
         .expect("cancelled row must still exist");
     assert_eq!(
-        fetched.status, TaskStatus::Cancelled,
+        fetched.status,
+        TaskStatus::Cancelled,
         "a stopped task stays stopped even when the agent writes late"
     );
 
@@ -233,7 +277,11 @@ async fn task_ledger_end_to_end() {
         .expect("orphan row still exists");
     assert_eq!(orphan.status, TaskStatus::Blocked);
     assert!(
-        orphan.blocked_reason.as_deref().unwrap_or("").contains("Orphaned"),
+        orphan
+            .blocked_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("Orphaned"),
         "park reason must say orphaned: {:?}",
         orphan.blocked_reason
     );
