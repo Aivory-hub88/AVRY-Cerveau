@@ -10,6 +10,7 @@ use crate::tools::delegate_envelope::{
     self as envelope, DEFAULT_MAX_SUMMARY_BYTES, DelegateEnvelope, DelegateExecution,
     DelegateReason, DelegateState, RunFacts,
 };
+use crate::tools::delegate_ledger::{LedgerLink, LedgerStart};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::json;
@@ -208,7 +209,7 @@ fn delegate_memory_tenant_id(tenant: &crate::agent::tenant::TenantContext, targe
 /// specialist doing the work (the dashboard matches rows by exact agent_type);
 /// `tenant_id`/`platform_user_id` stay parental so principal continuity holds.
 /// Host-brain targets keep the parent overlay unchanged.
-fn delegate_tenant_overlay(
+pub(super) fn delegate_tenant_overlay(
     parent: Arc<crate::agent::tenant::TenantContext>,
     target: &str,
 ) -> Arc<crate::agent::tenant::TenantContext> {
@@ -1256,6 +1257,12 @@ impl Tool for DelegateTool {
                     "description": "Optional one-line description of what a finished answer looks \
                                     like (format, fields, level of detail). Appended to the task."
                 },
+                "ledger_task_id": {
+                    "type": "string",
+                    "description": "Optional. With background=true, the task_id of a task you \
+                                    already created with task_create: it then tracks this \
+                                    delegation instead of a second row being added."
+                },
                 "background": {
                     "type": "boolean",
                     "description": "When true, the sub-agent runs in a background tokio task and \
@@ -1439,7 +1446,12 @@ impl DelegateTool {
             }
         })
         .await;
-        Ok(self.envelope_result(result?, facts, agent_name, execution, &started_at))
+        let (tool_result, envelope) =
+            self.envelope_result(result?, facts, agent_name, execution, &started_at);
+        if execution == DelegateExecution::Sync {
+            Self::record_failed_hop(&envelope, prompt).await;
+        }
+        Ok(tool_result)
     }
 
     /// The one place a finished (or accepted, or refused) delegation becomes
@@ -1452,7 +1464,7 @@ impl DelegateTool {
         agent: &str,
         execution: DelegateExecution,
         started_at: &str,
-    ) -> ToolResult {
+    ) -> (ToolResult, DelegateEnvelope) {
         let finished_at = chrono::Utc::now().to_rfc3339();
         let task_id = facts
             .task_id
@@ -1467,37 +1479,65 @@ impl DelegateTool {
         if !result.success {
             let reason = facts.reason.unwrap_or(DelegateReason::ToolError);
             let original = result.error.clone().unwrap_or_default();
-            return DelegateEnvelope::new(task_id, agent, execution, reason.state())
+            let envelope = DelegateEnvelope::new(task_id, agent, execution, reason.state())
                 .with_reason(reason)
                 .with_mode(mode)
                 .with_error(&original)
-                .with_timing(Some(started_at), Some(&finished_at))
-                .into_tool_result(&header, Some(&original));
+                .with_timing(Some(started_at), Some(&finished_at));
+            let tool_result = envelope.clone().into_tool_result(&header, Some(&original));
+            return (tool_result, envelope);
         }
 
         if execution == DelegateExecution::Background && facts.task_id.is_some() {
             // Accepted, not finished: keep the existing "Background task
             // started…" text (callers and tests read `task_id:` from it) and
             // attach the envelope as structured data.
-            let envelope = DelegateEnvelope::new(task_id, agent, execution, DelegateState::Working)
-                .with_mode(mode)
-                .with_timing(Some(started_at), None);
-            return ToolResult {
+            let mut envelope =
+                DelegateEnvelope::new(task_id, agent, execution, DelegateState::Working)
+                    .with_mode(mode)
+                    .with_timing(Some(started_at), None);
+            if let Some(ledger_task_id) = facts.ledger_task_id.as_deref() {
+                envelope = envelope.with_ledger_task(ledger_task_id);
+            }
+            let tool_result = ToolResult {
                 success: true,
                 output: ToolOutput::json_with_text(envelope.data(), result.output.to_string()),
                 error: None,
             };
+            return (tool_result, envelope);
         }
 
         let raw = facts
             .summary
             .clone()
             .unwrap_or_else(|| result.output.to_string());
-        DelegateEnvelope::new(task_id, agent, execution, DelegateState::Completed)
+        let envelope = DelegateEnvelope::new(task_id, agent, execution, DelegateState::Completed)
             .with_mode(mode)
             .with_summary(&raw, DEFAULT_MAX_SUMMARY_BYTES)
-            .with_timing(Some(started_at), Some(&finished_at))
-            .into_tool_result(&header, None)
+            .with_timing(Some(started_at), Some(&finished_at));
+        let tool_result = envelope.clone().into_tool_result(&header, None);
+        (tool_result, envelope)
+    }
+
+    /// ADR-014 A2: a sync hop that *failed* is recorded on the tenant's board
+    /// after the fact, blocked with an `outcome`, so it has somewhere honest to
+    /// appear and the operator can Stop it. A hop that completed left no row
+    /// (it finished inside one turn), and a hop refused up front never started.
+    async fn record_failed_hop(envelope: &DelegateEnvelope, prompt: &str) {
+        if envelope.state != DelegateState::Failed {
+            return;
+        }
+        let Some(link) = LedgerLink::capture(&envelope.agent) else {
+            return;
+        };
+        link.record_failed_hop(
+            &envelope.task_id,
+            &envelope.agent,
+            prompt,
+            envelope.reason.unwrap_or(DelegateReason::ToolError),
+            envelope.error.as_deref().unwrap_or(""),
+        )
+        .await;
     }
 }
 
@@ -1827,6 +1867,35 @@ impl DelegateTool {
         let results_dir = self.results_dir();
         tokio::fs::create_dir_all(&results_dir).await?;
 
+        // ADR-014 A2: give the tenant's board a row for this delegation (or
+        // adopt the one the caller already made) before anything is spawned, so
+        // a refused `ledger_task_id` starts nothing. Best-effort: with no
+        // ledger, no tenant, or a ledger outage the delegation simply runs
+        // unlinked.
+        let ledger_link = LedgerLink::capture(agent_name);
+        let mut linked_row = false;
+        if let Some(link) = &ledger_link {
+            let adopt = args
+                .get("ledger_task_id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            match link
+                .start_background(&task_id, agent_name, prompt, adopt)
+                .await
+            {
+                LedgerStart::Linked { ledger_task_id } => {
+                    linked_row = true;
+                    envelope::note_ledger_task(&ledger_task_id);
+                }
+                LedgerStart::Refused(message) => {
+                    return Ok(fail(DelegateReason::InvalidRequest, message));
+                }
+                LedgerStart::Unlinked => {}
+            }
+        }
+        let closure_link = ledger_link.filter(|_| linked_row);
+
         let context = args
             .get("context")
             .and_then(|v| v.as_str())
@@ -1849,7 +1918,17 @@ impl DelegateTool {
             meta: None,
         };
         let result_path = results_dir.join(format!("{task_id}.json"));
-        Self::write_result_atomic(&result_path, &initial_result).await?;
+        if let Err(e) = Self::write_result_atomic(&result_path, &initial_result).await {
+            // The row exists but no delegation will ever run for it: settle it
+            // rather than leave an `in_progress` card that can never finish.
+            if let Some(link) = &closure_link {
+                let mut failed = initial_result.clone();
+                failed.status = BackgroundTaskStatus::Failed;
+                failed.error = Some(format!("could not record the delegation: {e}"));
+                link.finish(&task_id, &failed).await;
+            }
+            return Err(e);
+        }
         envelope::note_started(&task_id);
 
         // EPIC-A supervision: register the task in the durable control-plane BEFORE the
@@ -1924,6 +2003,7 @@ impl DelegateTool {
         // memory dimension and principal continuity must not split.
         // Host-brain targets keep the parent overlay unchanged.
         let ambient = DelegateAmbient::capture(&agent_name_owned);
+        let watch_link = closure_link.clone();
 
         zeroclaw_spawn::spawn!(
             scope_delegate_session_key(parent_session_key, async move {
@@ -1973,6 +2053,20 @@ impl DelegateTool {
                             () = child_token.cancelled() => {
                                 (
                                     Err("Cancelled by parent session".to_string()),
+                                    Some(DelegateReason::Cancelled),
+                                )
+                            }
+                            // The dashboard's Stop writes `cancelled` straight into
+                            // the ledger, so the delegation has to look for it.
+                            () = async {
+                                match watch_link {
+                                    Some(link) => link.watch_cancel(task_id_clone.clone()).await,
+                                    None => std::future::pending::<()>().await,
+                                }
+                            } => {
+                                (
+                                    Err("Cancelled by operator (stopped from Mission Control)"
+                                        .to_string()),
                                     Some(DelegateReason::Cancelled),
                                 )
                             }
@@ -2067,6 +2161,14 @@ impl DelegateTool {
 
                 let result_path = results_dir.join(format!("{}.json", task_id_clone));
                 let _ = DelegateTool::write_result_atomic(&result_path, &final_result).await;
+
+                // ADR-014 A2: settle the tenant-visible row before the registry
+                // records the terminal state. The reconciler only acts once the
+                // registry is terminal, so it can never beat this write and settle
+                // the row with less (no summary) than we have here.
+                if let Some(link) = &closure_link {
+                    link.finish(&task_id_clone, &final_result).await;
+                }
 
                 if let Some(cp) = crate::control_plane::control_plane() {
                     let cp_status = match final_result.status {
@@ -2312,13 +2414,14 @@ impl DelegateTool {
                         output: ToolOutput::default(),
                         error: Some(e.to_string()),
                     });
-                    let tool_result = self.envelope_result(
+                    let (tool_result, leg) = self.envelope_result(
                         tool_result,
                         facts,
                         &agent_name,
                         DelegateExecution::Parallel,
                         &parallel_started_at,
                     );
+                    Self::record_failed_hop(&leg, prompt).await;
                     if !tool_result.success {
                         all_success = false;
                     }
@@ -9736,5 +9839,466 @@ command = "echo hi"
             Some("sk-ant-global-coordinator-key"),
             "non-OAuth target without api_key must fall back to global credential"
         );
+    }
+
+    // ── ADR-014 Phase A2: the delegation ↔ ledger link, against real Postgres ──
+    //
+    // Runs only with `--features memory-postgres` and `CERVEAU_TEST_PG_URL`
+    // set (the same convention as `pg_task_ledger.rs`); a no-op otherwise. One
+    // test function, because the process-wide ledger can be installed once.
+
+    #[cfg(feature = "memory-postgres")]
+    mod ledger_link_e2e {
+        use super::*;
+        use zeroclaw_memory::task_ledger::{
+            AgentTask, AgentTaskLedger, DelegationEnd, TaskOutcome, TaskPriority,
+            TaskStatus as LedgerStatus, current_task_ledger, install_task_ledger,
+        };
+
+        /// The scratch test database's default schema. Every row is keyed by a
+        /// fresh per-run tenant id, so runs cannot see each other.
+        const SCHEMA: &str = "public";
+
+        async fn in_tenant<F: std::future::Future>(user: &str, fut: F) -> F::Output {
+            crate::agent::tenant::TENANT_CONTEXT
+                .scope(tenant_ctx(user, "chief_of_staff"), fut)
+                .await
+        }
+
+        /// Poll the ledger until `pred` holds for the row (the engine settles a
+        /// row a moment after it writes the result file).
+        async fn row_eventually(
+            ledger: &AgentTaskLedger,
+            user: &str,
+            task_id: &str,
+            pred: impl Fn(&AgentTask) -> bool,
+        ) -> AgentTask {
+            for _ in 0..100 {
+                if let Some(row) = ledger.get_task(user, task_id).await.unwrap()
+                    && pred(&row)
+                {
+                    return row;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            panic!(
+                "row {task_id} never reached the expected state: {:?}",
+                ledger.get_task(user, task_id).await
+            );
+        }
+
+        /// Accepts connections and never answers, so a delegation to it stays
+        /// running until something stops it.
+        async fn hanging_server() -> (String, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let uri = format!("http://{}", listener.local_addr().unwrap());
+            let task = zeroclaw_spawn::spawn!(async move {
+                let mut held = Vec::new();
+                while let Ok((socket, _)) = listener.accept().await {
+                    held.push(socket);
+                }
+            });
+            (uri, task)
+        }
+
+        fn result_files(workspace: &Path) -> usize {
+            std::fs::read_dir(workspace.join("delegate_results"))
+                .map(|d| d.count())
+                .unwrap_or(0)
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn delegation_ledger_link_end_to_end() {
+            let Some(url) = std::env::var("CERVEAU_TEST_PG_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+            else {
+                eprintln!("CERVEAU_TEST_PG_URL unset — skipping delegation ledger e2e");
+                return;
+            };
+            let ledger = Arc::new(AgentTaskLedger::connect(&url, SCHEMA).await.unwrap());
+            install_task_ledger(Arc::clone(&ledger));
+            assert!(
+                Arc::ptr_eq(&current_task_ledger().unwrap(), &ledger),
+                "another test installed a different process-wide ledger"
+            );
+
+            let user = format!("e2e-{}", uuid::Uuid::new_v4());
+            let workspace =
+                std::env::temp_dir().join(format!("zc_link_e2e_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&workspace).unwrap();
+            let tool = DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone());
+
+            // ── A. a background delegation gets a row; when it fails the row is
+            //       `blocked` with an outcome, not silently `in_progress` ──
+            let started = in_tenant(
+                &user,
+                tool.execute(json!({
+                    "agent": "researcher", "prompt": "look into Acme", "background": true
+                })),
+            )
+            .await
+            .unwrap();
+            assert!(started.success, "{started:?}");
+            let data = started.output.data().expect("start envelope").clone();
+            let delegation_id = data["task_id"].as_str().unwrap().to_string();
+            let row_id = data["ledger_task_id"]
+                .as_str()
+                .expect("the start envelope names the board row")
+                .to_string();
+            let file = wait_for_terminal_background_result(&workspace, &delegation_id).await;
+            assert_eq!(file.status, BackgroundTaskStatus::Failed);
+            let row = row_eventually(&ledger, &user, &row_id, |r| {
+                r.status == LedgerStatus::Blocked
+            })
+            .await;
+            assert_eq!(row.outcome, Some(TaskOutcome::Failed));
+            assert_eq!(row.delegation_id.as_deref(), Some(delegation_id.as_str()));
+            assert_eq!(row.delegated_by.as_deref(), Some("chief_of_staff"));
+            assert!(
+                row.title
+                    .starts_with("Delegated to researcher: look into Acme"),
+                "{}",
+                row.title
+            );
+            assert!(
+                row.blocked_reason
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("Delegation failed")
+            );
+
+            // ── B. adopting the row the caller already created ──
+            let mine = ledger
+                .create_task(
+                    &user,
+                    "chief_of_staff",
+                    None,
+                    "Look into Acme",
+                    TaskPriority::High,
+                )
+                .await
+                .unwrap();
+            let adopted = in_tenant(
+                &user,
+                tool.execute(json!({
+                    "agent": "researcher", "prompt": "again", "background": true,
+                    "ledger_task_id": mine
+                })),
+            )
+            .await
+            .unwrap();
+            assert!(adopted.success, "{adopted:?}");
+            let adopted_data = adopted.output.data().unwrap();
+            assert_eq!(
+                adopted_data["ledger_task_id"],
+                mine.as_str(),
+                "no duplicate row"
+            );
+            let adopted_row =
+                row_eventually(&ledger, &user, &mine, |r| r.status == LedgerStatus::Blocked).await;
+            assert_eq!(
+                adopted_row.title, "Look into Acme",
+                "the caller's own title is kept"
+            );
+            assert_eq!(
+                adopted_row.delegation_id.as_deref(),
+                adopted_data["task_id"].as_str()
+            );
+
+            // A `ledger_task_id` that cannot be used starts nothing at all.
+            let before_files = result_files(&workspace);
+            let before_rows = ledger
+                .list_tasks(&user, "chief_of_staff", None)
+                .await
+                .unwrap()
+                .len();
+            let refused = in_tenant(
+                &user,
+                tool.execute(json!({
+                    "agent": "researcher", "prompt": "x", "background": true,
+                    "ledger_task_id": "no-such-task"
+                })),
+            )
+            .await
+            .unwrap();
+            assert!(!refused.success);
+            let error = refused.error.unwrap();
+            assert!(error.contains("not found for this tenant"), "{error}");
+            assert!(
+                error.contains("[delegate state=rejected reason=invalid_request"),
+                "{error}"
+            );
+            assert_eq!(
+                result_files(&workspace),
+                before_files,
+                "nothing was spawned"
+            );
+            assert_eq!(
+                ledger
+                    .list_tasks(&user, "chief_of_staff", None)
+                    .await
+                    .unwrap()
+                    .len(),
+                before_rows,
+                "and no row was created"
+            );
+
+            // ── C. a sync hop that fails is recorded after the fact; one that is
+            //       refused up front, or never runs, leaves nothing ──
+            let sync_failed = in_tenant(
+                &user,
+                tool.execute(json!({"agent": "researcher", "prompt": "sync attempt"})),
+            )
+            .await
+            .unwrap();
+            assert!(!sync_failed.success);
+            assert!(
+                sync_failed
+                    .error
+                    .unwrap()
+                    .contains("[delegate state=failed")
+            );
+            let blocked = ledger
+                .list_tasks(&user, "chief_of_staff", Some(LedgerStatus::Blocked))
+                .await
+                .unwrap();
+            let recorded = blocked
+                .iter()
+                .find(|t| t.title.contains("sync attempt"))
+                .expect("a failed sync hop is on the board");
+            assert_eq!(recorded.outcome, Some(TaskOutcome::Failed));
+            assert_eq!(
+                recorded.delegation_id.as_deref(),
+                sync_failed.output.data().unwrap()["task_id"].as_str(),
+                "the row is keyed by the envelope's task id"
+            );
+            let rejected = in_tenant(
+                &user,
+                tool.execute(json!({"agent": "ghost", "prompt": "no such agent"})),
+            )
+            .await
+            .unwrap();
+            assert!(rejected.error.unwrap().contains("state=rejected"));
+            assert!(
+                ledger
+                    .list_tasks(&user, "chief_of_staff", None)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|t| !t.title.contains("no such agent")),
+                "a refusal never started, so it gets no row"
+            );
+
+            // ── D. no tenant, no row ──
+            let rows_before = ledger
+                .list_tasks(&user, "chief_of_staff", None)
+                .await
+                .unwrap()
+                .len();
+            let _ = tool
+                .execute(json!({"agent": "researcher", "prompt": "no tenant", "background": true}))
+                .await
+                .unwrap();
+            assert_eq!(
+                ledger
+                    .list_tasks(&user, "chief_of_staff", None)
+                    .await
+                    .unwrap()
+                    .len(),
+                rows_before
+            );
+
+            // ── E. the operator presses Stop on a running delegation: the
+            //       dashboard writes `cancelled` into the ledger, and the
+            //       delegation notices and stops ──
+            let (hang_uri, _hang) = hanging_server().await;
+            let mut agents = HashMap::new();
+            agents.insert(
+                "slow".to_string(),
+                AliasedAgentConfig {
+                    model_provider: "ollama.slow".into(),
+                    ..Default::default()
+                },
+            );
+            let slow_ws =
+                std::env::temp_dir().join(format!("zc_link_slow_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&slow_ws).unwrap();
+            let slow_tool = DelegateTool::new_with_options(
+                agents,
+                None,
+                test_security(),
+                zeroclaw_providers::ModelProviderRuntimeOptions {
+                    provider_api_url: Some(hang_uri),
+                    ..zeroclaw_providers::ModelProviderRuntimeOptions::default()
+                },
+            )
+            .with_workspace_dir(slow_ws.clone());
+            let running = in_tenant(
+                &user,
+                slow_tool.execute(json!({
+                    "agent": "slow", "prompt": "take your time", "background": true
+                })),
+            )
+            .await
+            .unwrap();
+            assert!(running.success, "{running:?}");
+            let slow_data = running.output.data().unwrap().clone();
+            let slow_id = slow_data["task_id"].as_str().unwrap().to_string();
+            let slow_row = slow_data["ledger_task_id"].as_str().unwrap().to_string();
+            let live = row_eventually(&ledger, &user, &slow_row, |r| {
+                r.status == LedgerStatus::InProgress
+            })
+            .await;
+            assert_eq!(live.delegation_id.as_deref(), Some(slow_id.as_str()));
+            assert_eq!(
+                wait_for_terminal_or_running(&slow_ws, &slow_id).await,
+                BackgroundTaskStatus::Running,
+                "still running against the hanging provider"
+            );
+
+            // What the dashboard's Stop does: it writes `cancelled` into the row and
+            // Cerveau is not told. `finish_delegation(Cancelled)` writes exactly that
+            // status and reason, from outside the running delegation.
+            assert!(
+                ledger
+                    .finish_delegation(
+                        &slow_id,
+                        DelegationEnd::Cancelled {
+                            reason: "Stopped by operator from Mission Control".into(),
+                        },
+                    )
+                    .await
+                    .unwrap()
+            );
+            let stopped = wait_for_terminal_background_result(&slow_ws, &slow_id).await;
+            assert_eq!(
+                stopped.status,
+                BackgroundTaskStatus::Cancelled,
+                "{stopped:?}"
+            );
+            assert!(
+                stopped
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("Cancelled by operator")
+            );
+            let after = ledger.get_task(&user, &slow_row).await.unwrap().unwrap();
+            assert_eq!(
+                after.status,
+                LedgerStatus::Cancelled,
+                "the engine's own settle must not overwrite the operator's Stop"
+            );
+            assert_eq!(
+                after.blocked_reason.as_deref(),
+                Some("Stopped by operator from Mission Control")
+            );
+
+            // ── F. the reconciler settles rows whose delegation ended without the
+            //       engine writing it (a daemon restart), and only those ──
+            {
+                use crate::control_plane::{
+                    SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
+                };
+                use zeroclaw_memory::task_ledger::NewDelegatedTask;
+                let store = SqliteTaskStore::new_in_memory().unwrap();
+                let registry_rec = |id: &str, status: TaskStatus| TaskRecord {
+                    id: id.into(),
+                    kind: TaskKind::Delegate,
+                    agent: "researcher".into(),
+                    status,
+                    owner_pid: 0,
+                    owner_boot_id: "old-boot".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: None,
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: None,
+                    started_at: "2026-09-19T00:00:00Z".into(),
+                    finished_at: None,
+                };
+                let mut rows = HashMap::new();
+                for (name, status) in [
+                    ("alive", TaskStatus::Running),
+                    ("lost", TaskStatus::Lost),
+                    ("timed", TaskStatus::TimedOut),
+                    ("done", TaskStatus::Completed),
+                ] {
+                    let delegation_id = format!("recon-{}-{name}", uuid::Uuid::new_v4());
+                    let row = ledger
+                        .create_delegated_task(NewDelegatedTask {
+                            tenant_id: &user,
+                            agent_type: "chief_of_staff",
+                            session_id: None,
+                            title: name,
+                            delegated_by: "chief_of_staff",
+                            delegation_id: &delegation_id,
+                            context_id: None,
+                            status: LedgerStatus::InProgress,
+                            outcome: None,
+                            blocked_reason: None,
+                            result_summary: None,
+                        })
+                        .await
+                        .unwrap();
+                    store
+                        .create(registry_rec(&delegation_id, status))
+                        .await
+                        .unwrap();
+                    rows.insert(name, row);
+                }
+                crate::tools::delegate_ledger::reconcile(&store).await;
+
+                let get = |name: &'static str| {
+                    let id = rows[name].clone();
+                    let ledger = Arc::clone(&ledger);
+                    let user = user.clone();
+                    async move { ledger.get_task(&user, &id).await.unwrap() }
+                };
+                assert_eq!(
+                    get("alive").await.unwrap().status,
+                    LedgerStatus::InProgress,
+                    "a delegation the registry still runs is left alone"
+                );
+                let lost = get("lost").await.unwrap();
+                assert_eq!(lost.status, LedgerStatus::Blocked);
+                assert_eq!(lost.outcome, Some(TaskOutcome::Lost));
+                assert!(lost.blocked_reason.unwrap().contains("daemon restarted"));
+                assert_eq!(
+                    get("timed").await.unwrap().outcome,
+                    Some(TaskOutcome::TimedOut)
+                );
+                assert!(
+                    get("done").await.is_none(),
+                    "a completed delegation's row is archived"
+                );
+                // Idempotent: a second pass changes nothing further.
+                crate::tools::delegate_ledger::reconcile(&store).await;
+                assert_eq!(get("alive").await.unwrap().status, LedgerStatus::InProgress);
+            }
+
+            let _ = std::fs::remove_dir_all(workspace);
+            let _ = std::fs::remove_dir_all(slow_ws);
+        }
+
+        /// Like `wait_for_terminal_background_result`, but returns the status
+        /// after a short wait even when it is still `Running`.
+        async fn wait_for_terminal_or_running(
+            workspace: &Path,
+            task_id: &str,
+        ) -> BackgroundTaskStatus {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            let path = workspace
+                .join("delegate_results")
+                .join(format!("{task_id}.json"));
+            let text = std::fs::read_to_string(path).unwrap();
+            serde_json::from_str::<BackgroundDelegateResult>(&text)
+                .unwrap()
+                .status
+        }
     }
 }
