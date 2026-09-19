@@ -24,6 +24,10 @@ pub struct LoopDetectorConfig {
     /// exact-repeat never fires; results differ (new ids/timestamps), so
     /// no-progress never fires. `0` disables this pattern.
     pub success_burst_threshold: usize,
+    /// Consecutive FAILURES of the same MCP/skill tool (`server__tool`) inside
+    /// the turn before escalation (warn T, block T+1, break T+2), regardless of
+    /// arguments or error text. `0` disables. See [`LoopDetector::record_failure`].
+    pub failure_streak_threshold: usize,
 }
 
 impl Default for LoopDetectorConfig {
@@ -33,6 +37,7 @@ impl Default for LoopDetectorConfig {
             window_size: 20,
             max_repeats: 3,
             success_burst_threshold: 6,
+            failure_streak_threshold: 3,
         }
     }
 }
@@ -164,6 +169,8 @@ fn hash_str(s: &str) -> u64 {
 pub struct LoopDetector {
     config: LoopDetectorConfig,
     window: VecDeque<ToolCallRecord>,
+    /// Consecutive failures per tool since its last success this turn.
+    failure_streaks: std::collections::HashMap<String, usize>,
 }
 
 impl LoopDetector {
@@ -171,6 +178,57 @@ impl LoopDetector {
         Self {
             window: VecDeque::with_capacity(config.window_size),
             config,
+            failure_streaks: std::collections::HashMap::new(),
+        }
+    }
+
+    /// A successful call ends that tool's failure streak.
+    pub fn note_success(&mut self, name: &str) {
+        self.failure_streaks.remove(name);
+    }
+
+    /// Record a FAILED call.
+    ///
+    /// Every other pattern here is fed only successful calls, so a tool that keeps
+    /// failing -- new arguments each time, error text that differs by an id -- was
+    /// bounded only by the iteration limit. In production one MCP tool failed 102
+    /// of 102 calls across 37 turns, up to 7 in a single turn. This counts
+    /// consecutive failures of the same tool and escalates like the other
+    /// patterns (warn T, block T+1, break T+2).
+    ///
+    /// Scope is deliberately narrow: only `server__tool` names (MCP and skill
+    /// tools). Built-ins such as `shell` or `file_read` fail as a normal part of
+    /// probing, and a refusal by the approval gate is a pause, not a failure.
+    pub fn record_failure(&mut self, name: &str, output: &str) -> LoopDetectionResult {
+        let threshold = self.config.failure_streak_threshold;
+        if !self.config.enabled
+            || threshold == 0
+            || !name.contains("__")
+            || output.contains("Requires human approval")
+        {
+            return LoopDetectionResult::Ok;
+        }
+        let streak = self.failure_streaks.entry(name.to_string()).or_insert(0);
+        *streak += 1;
+        let count = *streak;
+        if count < threshold {
+            LoopDetectionResult::Ok
+        } else if count == threshold {
+            LoopDetectionResult::Warning(format!(
+                "Warning: tool '{name}' has failed {count} times in a row this turn. Trying it again \
+                 with different arguments is not working -- tell the user what failed, or use \
+                 another route, instead of calling it again."
+            ))
+        } else if count == threshold + 1 {
+            LoopDetectionResult::Block(format!(
+                "Blocked: tool '{name}' has failed {count} times in a row this turn. Do not call it \
+                 again in this turn; report the failure to the user."
+            ))
+        } else {
+            LoopDetectionResult::Break(format!(
+                "Circuit breaker: tool '{name}' failed {count} times in a row this turn -- stopping \
+                 instead of retrying a tool that is not working"
+            ))
         }
     }
 
@@ -421,6 +479,7 @@ mod tests {
             max_repeats,
             // Burst disabled here so these tests isolate exact-repeat behavior.
             success_burst_threshold: 0,
+            failure_streak_threshold: 0,
         }
     }
 
@@ -742,7 +801,11 @@ mod tests {
         let mut last = LoopDetectionResult::Ok;
         for i in 0..6 {
             last = det.record("create_lead", &json!({"n": i}), &format!("id_{i}"));
-            let probe = if i % 2 == 0 { "task_list" } else { "memory_recall" };
+            let probe = if i % 2 == 0 {
+                "task_list"
+            } else {
+                "memory_recall"
+            };
             det.record(probe, &json!({}), "rows");
         }
         match last {
@@ -814,6 +877,7 @@ mod tests {
             window_size: 5,
             max_repeats: 3,
             success_burst_threshold: 0,
+            failure_streak_threshold: 0,
         };
         let mut det = LoopDetector::new(config);
         let args = json!({"x": 1});
@@ -866,6 +930,7 @@ mod tests {
             window_size: 6,
             max_repeats: 3,
             success_burst_threshold: 0,
+            failure_streak_threshold: 0,
         };
         let mut det = LoopDetector::new(config);
         let args = json!({"x": 1});
@@ -1168,6 +1233,108 @@ mod tests {
                 assert!(msg.contains("identical arguments"));
             }
             other => panic!("expected exact-repeat Warning, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod failure_streak_tests {
+    use super::*;
+
+    fn detector(threshold: usize) -> LoopDetector {
+        LoopDetector::new(LoopDetectorConfig {
+            failure_streak_threshold: threshold,
+            ..LoopDetectorConfig::default()
+        })
+    }
+
+    #[test]
+    fn consecutive_failures_escalate_warn_block_break_whatever_the_arguments() {
+        let mut d = detector(3);
+        let t = "tenant_mail__get_thread_memory";
+        assert_eq!(d.record_failure(t, "error one"), LoopDetectionResult::Ok);
+        assert_eq!(
+            d.record_failure(t, "error two (different text)"),
+            LoopDetectionResult::Ok
+        );
+        assert!(matches!(
+            d.record_failure(t, "error 3"),
+            LoopDetectionResult::Warning(_)
+        ));
+        assert!(matches!(
+            d.record_failure(t, "error 4"),
+            LoopDetectionResult::Block(_)
+        ));
+        assert!(matches!(
+            d.record_failure(t, "error 5"),
+            LoopDetectionResult::Break(_)
+        ));
+    }
+
+    #[test]
+    fn a_success_resets_the_streak() {
+        let mut d = detector(3);
+        let t = "srv__tool";
+        d.record_failure(t, "e");
+        d.record_failure(t, "e");
+        d.note_success(t);
+        assert_eq!(d.record_failure(t, "e"), LoopDetectionResult::Ok);
+        assert_eq!(d.record_failure(t, "e"), LoopDetectionResult::Ok);
+        assert!(matches!(
+            d.record_failure(t, "e"),
+            LoopDetectionResult::Warning(_)
+        ));
+    }
+
+    #[test]
+    fn streaks_are_per_tool() {
+        let mut d = detector(3);
+        for _ in 0..2 {
+            d.record_failure("a__x", "e");
+            d.record_failure("b__y", "e");
+        }
+        assert!(matches!(
+            d.record_failure("a__x", "e"),
+            LoopDetectionResult::Warning(_)
+        ));
+        assert_eq!(d.record_failure("c__z", "e"), LoopDetectionResult::Ok);
+    }
+
+    #[test]
+    fn builtins_and_approval_refusals_never_count() {
+        let mut d = detector(2);
+        for _ in 0..6 {
+            assert_eq!(d.record_failure("shell", "exit 1"), LoopDetectionResult::Ok);
+            assert_eq!(
+                d.record_failure("file_read", "not found"),
+                LoopDetectionResult::Ok
+            );
+            assert_eq!(
+                d.record_failure(
+                    "crm__create_lead",
+                    "Requires human approval before it can run (risk tier: irreversible)"
+                ),
+                LoopDetectionResult::Ok,
+                "a parked approval is a pause, not a failing tool"
+            );
+        }
+    }
+
+    #[test]
+    fn threshold_zero_or_disabled_detector_is_inert() {
+        let mut off = detector(0);
+        for _ in 0..10 {
+            assert_eq!(off.record_failure("a__x", "e"), LoopDetectionResult::Ok);
+        }
+        let mut disabled = LoopDetector::new(LoopDetectorConfig {
+            enabled: false,
+            ..LoopDetectorConfig::default()
+        });
+        for _ in 0..10 {
+            assert_eq!(
+                disabled.record_failure("a__x", "e"),
+                LoopDetectionResult::Ok
+            );
         }
     }
 }

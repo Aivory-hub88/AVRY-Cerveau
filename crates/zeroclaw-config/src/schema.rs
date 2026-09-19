@@ -6661,6 +6661,30 @@ pub struct PacingConfig {
     /// executing. Defaults to 8. `0` disables the gate.
     #[serde(default = "default_write_velocity_max_calls")]
     pub write_velocity_max_calls: usize,
+
+    /// In-turn failure-streak guard: how many times in a row the same MCP/skill
+    /// tool (`server__tool`) may FAIL inside one turn -- whatever the arguments or
+    /// error text -- before the first escalation (Warning; +1 Block; +2 ends the
+    /// turn). The other detector patterns only ever saw successful calls, so a
+    /// tool failing again and again with fresh arguments was bounded only by the
+    /// iteration limit. Gate refusals (pending approval) do not count.
+    /// Defaults to 3. `0` disables.
+    #[serde(default = "default_loop_failure_streak_threshold")]
+    pub loop_failure_streak_threshold: usize,
+
+    /// Cross-turn circuit breaker: after this many consecutive SERVER-side
+    /// failures (the MCP server itself erroring, timing out or refusing the
+    /// connection -- not a tool answering "not found") of the same tool for the
+    /// same tenant, further calls are short-circuited with a "temporarily
+    /// unavailable, do not retry" result instead of hitting the dead server.
+    /// Defaults to 5. `0` disables.
+    #[serde(default = "default_tool_breaker_threshold")]
+    pub tool_breaker_threshold: usize,
+
+    /// How long the breaker stays open before one probe call is let through
+    /// (doubling per failed probe, capped at 300 s). Defaults to 60.
+    #[serde(default = "default_tool_breaker_cooldown_secs")]
+    pub tool_breaker_cooldown_secs: u64,
 }
 
 fn default_loop_detection_enabled() -> bool {
@@ -6683,6 +6707,18 @@ fn default_write_velocity_window_secs() -> u64 {
     600
 }
 
+fn default_loop_failure_streak_threshold() -> usize {
+    3
+}
+
+fn default_tool_breaker_threshold() -> usize {
+    5
+}
+
+fn default_tool_breaker_cooldown_secs() -> u64 {
+    60
+}
+
 fn default_write_velocity_max_calls() -> usize {
     8
 }
@@ -6700,6 +6736,9 @@ impl Default for PacingConfig {
             loop_success_burst_threshold: default_loop_success_burst_threshold(),
             write_velocity_window_secs: default_write_velocity_window_secs(),
             write_velocity_max_calls: default_write_velocity_max_calls(),
+            loop_failure_streak_threshold: default_loop_failure_streak_threshold(),
+            tool_breaker_threshold: default_tool_breaker_threshold(),
+            tool_breaker_cooldown_secs: default_tool_breaker_cooldown_secs(),
         }
     }
 }
