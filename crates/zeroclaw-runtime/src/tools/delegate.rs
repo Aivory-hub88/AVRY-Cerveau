@@ -2090,11 +2090,15 @@ impl DelegateTool {
         let security = target_policy;
         let global_credential = self.global_credential.clone();
         let provider_runtime_options = self.provider_runtime_options.clone();
-        // Monotonic descent: was `self.depth` (verbatim copy), which left the
-        // `self.depth >= max_depth` check inert — a chain of background delegations never
-        // escalated depth. Matches the documented `with_depth(parent.depth + 1)` intent.
-        // Behavior change: deep background re-delegation now saturates at `max_delegation_depth`.
-        let depth = self.depth + 1;
+        // The tool built here exists only to run THIS hop, and the hop was just admitted
+        // above with the caller's depth. Giving it `self.depth + 1` (upstream's "monotonic
+        // descent") made the hop's own `depth >= max_depth` check fire against a depth the
+        // caller never had: with `max_delegation_depth = 1` a background delegation was
+        // refused on arrival, every time. The tool is never handed to the sub-agent (bounded
+        // targets get the parent's tools minus `delegate`; independent targets build their
+        // own registry), so the `+ 1` protected against no recursion and only rejected valid
+        // hops. Sync already ran the hop on the caller's own depth.
+        let depth = self.depth;
         let parent_tools = Arc::clone(&self.parent_tools);
         let runtime = self.runtime.clone();
         let multimodal_config = self.multimodal_config.clone();
@@ -2456,10 +2460,10 @@ impl DelegateTool {
             let security = Arc::clone(&self.security);
             let global_credential = self.global_credential.clone();
             let provider_runtime_options = self.provider_runtime_options.clone();
-            // Monotonic descent on the parallel path — was `self.depth` (verbatim copy),
-            // leaving the `>= max_depth` check inert (see the background path above).
-            // Behavior change: deep parallel re-delegation now saturates at `max_delegation_depth`.
-            let depth = self.depth + 1;
+            // Same as the background path: the leg's tool only runs this hop, so it takes the
+            // caller's depth. `+ 1` made every leg fail its own depth check when
+            // `max_delegation_depth = 1`.
+            let depth = self.depth;
             let parent_tools = Arc::clone(&self.parent_tools);
             let runtime = self.runtime.clone();
             let multimodal_config = self.multimodal_config.clone();
@@ -5511,6 +5515,134 @@ mod tests {
         assert_eq!(view["status"], "failed", "existing fields are unchanged");
         assert_eq!(view["envelope"]["reason"], "timed_out");
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    // A tenant config caps delegation at one level (`max_delegation_depth = 1`,
+    // ADR-008). A hop the caller is allowed to make must not be refused for
+    // depth by the machinery that runs it: background and parallel legs used to
+    // be, every time, because the tool built to run the hop was one level deeper
+    // than the caller that had just admitted it.
+
+    fn one_level_agents() -> (
+        HashMap<String, AliasedAgentConfig>,
+        HashMap<String, RuntimeProfileConfig>,
+    ) {
+        let mut agents = HashMap::new();
+        agents.insert(
+            "researcher".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.researcher".into(),
+                runtime_profile: "one_level".into(),
+                ..Default::default()
+            },
+        );
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "one_level".to_string(),
+            RuntimeProfileConfig {
+                max_delegation_depth: 1,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        (agents, profiles)
+    }
+
+    fn one_level_tool(depth: u32, workspace: PathBuf) -> DelegateTool {
+        let (agents, profiles) = one_level_agents();
+        DelegateTool::with_depth(agents, None, test_security(), depth)
+            .with_runtime_profiles(profiles)
+            .with_workspace_dir(workspace)
+    }
+
+    #[tokio::test]
+    async fn background_hop_at_depth_zero_is_not_refused_for_depth_when_the_cap_is_one() {
+        let workspace = std::env::temp_dir().join(format!("zc_depth_bg_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let tool = one_level_tool(0, workspace.clone());
+        let started = tool
+            .execute(json!({"agent": "researcher", "prompt": "x", "background": true}))
+            .await
+            .unwrap();
+        assert!(started.success, "the hop is admitted: {started:?}");
+        let task_id = started.output.data().unwrap()["task_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let file = wait_for_terminal_background_result(&workspace, &task_id).await;
+        // The provider is unreachable in this test, so it does fail — but for that
+        // reason, not for depth.
+        assert_eq!(file.status, BackgroundTaskStatus::Failed);
+        let error = file.error.unwrap_or_default();
+        assert!(!error.contains("depth limit"), "refused for depth: {error}");
+        assert_ne!(
+            file.meta.and_then(|m| m.reason).as_deref(),
+            Some("depth_exceeded")
+        );
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn background_hop_at_the_cap_is_still_refused_up_front() {
+        let workspace = std::env::temp_dir().join(format!("zc_depth_bg2_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let tool = one_level_tool(1, workspace.clone());
+        let refused = tool
+            .execute(json!({"agent": "researcher", "prompt": "x", "background": true}))
+            .await
+            .unwrap();
+        assert!(!refused.success);
+        let error = refused.error.unwrap();
+        assert!(
+            error.contains("[delegate state=rejected reason=depth_exceeded"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn parallel_legs_at_depth_zero_are_not_refused_for_depth_when_the_cap_is_one() {
+        let tool = one_level_tool(0, std::env::temp_dir());
+        let result = tool
+            .execute(json!({"parallel": ["researcher"], "prompt": "x"}))
+            .await
+            .unwrap();
+        let data = result.output.data().expect("parallel data");
+        let leg = &data["results"][0];
+        assert_ne!(
+            leg["reason"], "depth_exceeded",
+            "leg refused for depth: {leg}"
+        );
+        assert_eq!(
+            leg["state"], "failed",
+            "it ran and failed on the unreachable provider: {leg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_legs_at_the_cap_are_still_refused() {
+        let tool = one_level_tool(1, std::env::temp_dir());
+        let result = tool
+            .execute(json!({"parallel": ["researcher"], "prompt": "x"}))
+            .await
+            .unwrap();
+        let leg = &result.output.data().unwrap()["results"][0];
+        assert_eq!(leg["state"], "rejected", "{leg}");
+        assert_eq!(leg["reason"], "depth_exceeded", "{leg}");
+    }
+
+    #[tokio::test]
+    async fn sync_hop_depth_semantics_are_unchanged() {
+        // The reference behaviour the other two paths now match.
+        let ok = one_level_tool(0, std::env::temp_dir())
+            .execute(json!({"agent": "researcher", "prompt": "x"}))
+            .await
+            .unwrap();
+        assert!(!ok.error.unwrap_or_default().contains("depth limit"));
+        let refused = one_level_tool(1, std::env::temp_dir())
+            .execute(json!({"agent": "researcher", "prompt": "x"}))
+            .await
+            .unwrap();
+        assert!(refused.error.unwrap().contains("depth limit"));
     }
 
     #[tokio::test]
