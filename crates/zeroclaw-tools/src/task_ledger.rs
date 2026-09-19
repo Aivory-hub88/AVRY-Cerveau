@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
-use zeroclaw_memory::task_ledger::{AgentTaskLedger, TaskPriority, TaskStatus};
+use zeroclaw_memory::task_ledger::{AgentTaskLedger, StatusUpdate, TaskPriority, TaskStatus};
 
 /// Shared tenant addressing every task-ledger tool needs. Resolved once by
 /// the caller — see the module doc for why this crate can't resolve it
@@ -121,7 +121,11 @@ impl Tool for TaskCreateTool {
                 "orphan sweep failed; continuing with the requested ledger operation"
             );
         }
-        let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let title = args
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         if title.is_empty() {
             return Ok(ToolResult {
                 success: false,
@@ -215,6 +219,45 @@ fn notify_client() -> reqwest::Client {
 /// caller right after the write, so the payload reflects what was actually
 /// stored, not just the raw tool args). Never returns an error -- see the
 /// struct doc for why a notify failure must not surface as a tool failure.
+/// Only a write that really changed a blocked/done state is worth telling
+/// avry-backend about: a no-op (operator-stopped task, `done` on an already-done
+/// task) would post a phantom `task` action -- for a stopped task, one whose
+/// status reads `cancelled`.
+fn should_notify(status: TaskStatus, outcome: StatusUpdate) -> bool {
+    outcome == StatusUpdate::Applied && matches!(status, TaskStatus::Blocked | TaskStatus::Done)
+}
+
+/// What the agent is told after a status write, given what the ledger says
+/// actually happened. "Task X is now done" is only ever said when it is true:
+/// a stopped task ignores late writes by design (never a resurrection), and
+/// reporting success for that made the agent believe finished work was
+/// delivered. The stopped case is a refusal (`success: false`), like the other
+/// terminal-state refusals, and tells the agent not to retry.
+fn update_outcome_result(task_id: &str, status: TaskStatus, outcome: StatusUpdate) -> ToolResult {
+    match outcome {
+        StatusUpdate::Applied => ToolResult {
+            success: true,
+            output: ToolOutput::text(format!("Task {task_id} is now {}", status.as_str())),
+            error: None,
+        },
+        StatusUpdate::AlreadyDone => ToolResult {
+            success: true,
+            output: ToolOutput::text(format!("Task {task_id} was already done; nothing changed.")),
+            error: None,
+        },
+        StatusUpdate::StoppedByOperator => ToolResult {
+            success: false,
+            output: ToolOutput::default(),
+            error: Some(format!(
+                "NOT APPLIED: task {task_id} was stopped by an operator (Mission Control Stop) and \
+                 stays stopped, so setting it to '{}' had no effect. Do not retry, re-open or \
+                 re-create it; if the work is still wanted, ask the user.",
+                status.as_str()
+            )),
+        },
+    }
+}
+
 async fn notify_agent_action(
     base_url: &str,
     token: &str,
@@ -319,7 +362,11 @@ impl Tool for TaskUpdateStatusTool {
                 "orphan sweep failed; continuing with the requested ledger operation"
             );
         }
-        let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let task_id = args
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         if task_id.is_empty() {
             return Ok(ToolResult {
                 success: false,
@@ -361,9 +408,7 @@ impl Tool for TaskUpdateStatusTool {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(
-                    "'blocked_reason' is required when status is 'blocked'".to_string(),
-                ),
+                error: Some("'blocked_reason' is required when status is 'blocked'".to_string()),
             });
         }
 
@@ -373,8 +418,8 @@ impl Tool for TaskUpdateStatusTool {
             .update_status(&self.ctx.tenant_id, task_id, status, blocked_reason)
             .await
         {
-            Ok(()) => {
-                if matches!(status, TaskStatus::Blocked | TaskStatus::Done) {
+            Ok(outcome) => {
+                if should_notify(status, outcome) {
                     if let Some((base_url, token)) = &self.notify {
                         if let Ok(Some(task)) =
                             self.ctx.ledger.get_task(&self.ctx.tenant_id, task_id).await
@@ -383,14 +428,7 @@ impl Tool for TaskUpdateStatusTool {
                         }
                     }
                 }
-                Ok(ToolResult {
-                    success: true,
-                    output: ToolOutput::text(format!(
-                        "Task {task_id} is now {}",
-                        status.as_str()
-                    )),
-                    error: None,
-                })
+                Ok(update_outcome_result(task_id, status, outcome))
             }
             Err(e) => Ok(ToolResult {
                 success: false,
@@ -542,5 +580,67 @@ impl Tool for TaskListTool {
                 error: Some(format!("Failed to list tasks: {e}")),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod update_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn applied_write_says_the_new_status() {
+        let r = update_outcome_result("t-1", TaskStatus::InProgress, StatusUpdate::Applied);
+        assert!(r.success);
+        assert_eq!(r.output.to_string(), "Task t-1 is now in_progress");
+    }
+
+    #[test]
+    fn stopped_task_is_reported_as_not_applied_never_as_now_done() {
+        let r = update_outcome_result("t-1", TaskStatus::Done, StatusUpdate::StoppedByOperator);
+        assert!(!r.success, "a refused write is not a success");
+        let error = r.error.expect("refusal carries the explanation");
+        assert!(error.contains("NOT APPLIED"), "{error}");
+        assert!(error.contains("stopped by an operator"), "{error}");
+        assert!(error.contains("Do not retry"), "{error}");
+        assert!(
+            !error.contains("is now"),
+            "must never claim the new status: {error}"
+        );
+        assert!(
+            r.output.to_string().is_empty(),
+            "no success text alongside a refusal"
+        );
+    }
+
+    #[test]
+    fn done_twice_says_nothing_changed() {
+        let r = update_outcome_result("t-1", TaskStatus::Done, StatusUpdate::AlreadyDone);
+        assert!(r.success);
+        let text = r.output.to_string();
+        assert!(
+            text.contains("already done") && text.contains("nothing changed"),
+            "{text}"
+        );
+        assert!(!text.contains("is now"), "{text}");
+    }
+
+    #[test]
+    fn only_a_real_blocked_or_done_change_notifies_avry_backend() {
+        use StatusUpdate::{AlreadyDone, Applied, StoppedByOperator};
+        assert!(should_notify(TaskStatus::Done, Applied));
+        assert!(should_notify(TaskStatus::Blocked, Applied));
+        assert!(
+            !should_notify(TaskStatus::InProgress, Applied),
+            "not a notifiable state"
+        );
+        assert!(
+            !should_notify(TaskStatus::Done, AlreadyDone),
+            "no state change"
+        );
+        assert!(
+            !should_notify(TaskStatus::Done, StoppedByOperator),
+            "phantom cancelled action"
+        );
+        assert!(!should_notify(TaskStatus::Blocked, StoppedByOperator));
     }
 }
