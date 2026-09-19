@@ -216,6 +216,9 @@ pub(crate) struct DelegateEnvelope {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval: Option<ApprovalRef>,
+    /// The Mission Control row tracking this delegation (ADR-014 A2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger_task_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timing: Option<EnvelopeTiming>,
     /// The summary is peer output: data, never instructions.
@@ -244,6 +247,7 @@ impl DelegateEnvelope {
             truncated: false,
             error: None,
             approval: None,
+            ledger_task_id: None,
             timing: None,
             untrusted: true,
             redactions: 0,
@@ -262,6 +266,11 @@ impl DelegateEnvelope {
         self.reason = Some(reason);
         self.retryable = Some(reason.retryable());
         self.hint = reason.hint().map(str::to_string);
+        self
+    }
+
+    pub(crate) fn with_ledger_task(mut self, ledger_task_id: &str) -> Self {
+        self.ledger_task_id = Some(ledger_task_id.to_string());
         self
     }
 
@@ -526,6 +535,8 @@ pub(crate) struct RunFacts {
     pub summary: Option<String>,
     /// Set when a background task was accepted.
     pub task_id: Option<String>,
+    /// The ledger row tracking the accepted background task.
+    pub ledger_task_id: Option<String>,
 }
 
 tokio::task_local! {
@@ -542,6 +553,11 @@ pub(crate) fn note_completed(header: String, summary: String) {
         facts.header = Some(header);
         facts.summary = Some(summary);
     });
+}
+
+pub(crate) fn note_ledger_task(ledger_task_id: &str) {
+    let _ =
+        RUN_FACTS.try_with(|cell| cell.lock().ledger_task_id = Some(ledger_task_id.to_string()));
 }
 
 pub(crate) fn note_started(task_id: &str) {

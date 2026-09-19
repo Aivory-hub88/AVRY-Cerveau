@@ -88,6 +88,15 @@ jobs:
         run: |
           cargo test --locked -p zeroclaw-memory --features memory-postgres --test pg_task_ledger -- --test-threads=1
           cargo test --locked -p zeroclaw-memory --features memory-postgres task_ledger::
+      # ADR-014 A2: the delegation engine's link to the ledger — a running
+      # delegation must notice the operator's Stop, and a failed one must land
+      # on the board as `blocked`. Needs the runtime built with memory-postgres,
+      # which the release build has but a plain `cargo test` does not.
+      - name: Delegation ledger link (Postgres) tests
+        env:
+          RUST_BACKTRACE: full
+        run: |
+          cargo test --locked -p zeroclaw-runtime --features memory-postgres --lib ledger_link_e2e -- --test-threads=1
 
   # ── Redis-dependent tests (ADR-005)
   redis-tests:

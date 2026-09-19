@@ -135,6 +135,10 @@ pub async fn reaper_loop(
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = tick.tick() => {
+                // ADR-014 A2: settle tenant-visible rows of delegations that ended
+                // without the engine writing them (a daemon restart). Runs before
+                // the sweep so a `Lost` written by the previous tick is picked up.
+                crate::tools::delegate_ledger::reconcile(store.as_ref()).await;
                 if let Err(e) = sweep(store.as_ref(), &boot_id, max_runtime_secs).await {
                     ::zeroclaw_log::record!(
                         WARN,
