@@ -23,7 +23,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use parking_lot::Mutex;
 use postgres::Client;
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,44 @@ const ARCHIVE_LIST_LIMIT: i64 = 20;
 /// iterations), while the dashboard flags stuck work much earlier — so the
 /// sweep never races a running turn, it only buries the dead.
 const ORPHAN_PARK_AFTER_MINUTES: i64 = 30;
+
+/// Why a status write matched no *live* row. Distinguishing these matters
+/// because the agent reads the error text: "not found" for a task that was
+/// simply finished sends it hunting for a missing task and retrying, when the
+/// truth is "this is done and terminal".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingTask {
+    /// Operator-stopped: a late agent write is a silent no-op, never a resurrection.
+    Cancelled,
+    /// Finished earlier and moved to the archive: `done` is terminal.
+    AlreadyDone,
+    /// No such task for this tenant (or it belongs to another tenant -- the
+    /// two are deliberately indistinguishable).
+    NotFound,
+}
+
+impl MissingTask {
+    fn from_flags(cancelled: bool, archived: bool) -> Self {
+        if cancelled {
+            Self::Cancelled
+        } else if archived {
+            Self::AlreadyDone
+        } else {
+            Self::NotFound
+        }
+    }
+}
+
+fn not_found_error(task_id: &str) -> anyhow::Error {
+    anyhow::anyhow!("task {task_id} not found for this tenant")
+}
+
+fn already_done_error(task_id: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "task {task_id} is already done. `done` is terminal and cannot be changed or \
+         re-opened; if there is new work, create a new task instead."
+    )
+}
 
 /// Lifecycle state of a task. Terminal state is `Done` — re-opening a done
 /// task is deliberately not supported; the clean way to correct a mistake
@@ -210,7 +248,8 @@ impl AgentTaskLedger {
     /// same libpq key=value DSN every other Cerveau Postgres consumer uses
     /// (NOT a `postgresql://` URL — see CERVEAU-STATUS.md §7).
     pub async fn connect(db_url: &str, schema: &str) -> Result<Self> {
-        let db_url = db_url.to_string();        let schema_owned = schema.to_string();
+        let db_url = db_url.to_string();
+        let schema_owned = schema.to_string();
         // Connect AND create-table-if-missing on the SAME spawned OS thread,
         // in one continuous synchronous call chain — see
         // `PgCapabilityGraph::connect`'s doc comment for why splitting this
@@ -378,8 +417,8 @@ impl AgentTaskLedger {
         let task_id_for_error = task_id_owned.clone();
         let status_str = status.as_str().to_string();
         let blocked_reason = blocked_reason.map(str::to_string);
-        // Clones for the cancelled-row probe below (the update closure moves
-        // the originals onto its OS thread).
+        // Clones for the diagnosis below (the update closure moves the
+        // originals onto its OS thread).
         let tenant_probe = tenant_id.clone();
         let task_probe = task_id_owned.clone();
         let schema_probe = schema.clone();
@@ -398,25 +437,29 @@ impl AgentTaskLedger {
         })
         .await?;
         if rows == 0 {
-            // A task the operator stopped stays stopped: a late agent write
-            // is a silent no-op, never a resurrection. Only genuinely
-            // missing rows are an error.
-            let cancelled = run_on_os_thread(move || -> Result<bool> {
+            let missing = run_on_os_thread(move || -> Result<MissingTask> {
                 let mut client = client_probe.lock();
-                let row = client.query_opt(
+                let row = client.query_one(
                     &format!(
-                        r#"SELECT 1 FROM "{schema_probe}".agent_tasks
-                           WHERE task_id = $1 AND tenant_id = $2 AND status = 'cancelled'"#
+                        r#"SELECT
+                             EXISTS (SELECT 1 FROM "{schema_probe}".agent_tasks
+                                     WHERE task_id = $1 AND tenant_id = $2
+                                       AND status = 'cancelled'),
+                             EXISTS (SELECT 1 FROM "{schema_probe}".agent_tasks_archive
+                                     WHERE task_id = $1 AND tenant_id = $2)"#
                     ),
                     &[&task_probe, &tenant_probe],
                 )?;
-                Ok(row.is_some())
+                Ok(MissingTask::from_flags(row.get(0), row.get(1)))
             })
             .await?;
-            if cancelled {
-                return Ok(());
-            }
-            anyhow::bail!("task {task_id_for_error} not found for this tenant");
+            return match missing {
+                // A task the operator stopped stays stopped: a late agent
+                // write is a silent no-op, never a resurrection.
+                MissingTask::Cancelled => Ok(()),
+                MissingTask::AlreadyDone => Err(already_done_error(&task_id_for_error)),
+                MissingTask::NotFound => Err(not_found_error(&task_id_for_error)),
+            };
         }
         Ok(())
     }
@@ -448,7 +491,24 @@ impl AgentTaskLedger {
                 &[&task_id_owned, &tenant_id],
             )?;
             let Some(row) = row else {
-                anyhow::bail!("task {task_id_for_error} not found for this tenant");
+                // Nothing live to finish. If it was already finished, the
+                // caller's goal (task is done) holds: succeed idempotently
+                // rather than tell the agent a finished task does not exist.
+                // Tenant-scoped, so another tenant's id still reads as not found.
+                let archived: bool = txn
+                    .query_one(
+                        &format!(
+                            r#"SELECT EXISTS (SELECT 1 FROM "{schema}".agent_tasks_archive
+                                              WHERE task_id = $1 AND tenant_id = $2)"#
+                        ),
+                        &[&task_id_owned, &tenant_id],
+                    )?
+                    .get(0);
+                return if archived {
+                    Ok(())
+                } else {
+                    Err(not_found_error(&task_id_for_error))
+                };
             };
 
             let now = Utc::now();
@@ -569,8 +629,11 @@ impl AgentTaskLedger {
                     Ok(deleted) if deleted > 0 => {
                         ::zeroclaw_log::record!(
                             INFO,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_attrs(::serde_json::json!({ "deleted": deleted })),
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({ "deleted": deleted })),
                             "agent_tasks_archive: swept expired rows"
                         );
                     }
@@ -578,8 +641,11 @@ impl AgentTaskLedger {
                     Err(e) => {
                         ::zeroclaw_log::record!(
                             WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                                .with_attrs(::serde_json::json!({ "error": e.to_string() })),
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_attrs(::serde_json::json!({ "error": e.to_string() })),
                             "agent_tasks_archive: sweep failed, will retry next interval"
                         );
                     }
@@ -736,6 +802,40 @@ pub fn current_task_ledger() -> Option<Arc<AgentTaskLedger>> {
 
 #[cfg(test)]
 mod tests {
+    use super::{MissingTask, already_done_error, not_found_error};
+
+    #[test]
+    fn missing_task_diagnosis_prefers_cancelled_then_archived_then_not_found() {
+        assert_eq!(MissingTask::from_flags(true, false), MissingTask::Cancelled);
+        assert_eq!(MissingTask::from_flags(true, true), MissingTask::Cancelled);
+        assert_eq!(
+            MissingTask::from_flags(false, true),
+            MissingTask::AlreadyDone
+        );
+        assert_eq!(MissingTask::from_flags(false, false), MissingTask::NotFound);
+    }
+
+    #[test]
+    fn already_done_error_says_done_is_terminal_not_missing() {
+        let done = already_done_error("t-1").to_string();
+        assert!(
+            done.contains("t-1") && done.contains("already done"),
+            "{done}"
+        );
+        assert!(
+            done.contains("terminal") && done.contains("create a new task"),
+            "{done}"
+        );
+        assert!(
+            !done.contains("not found"),
+            "must not read as a missing task: {done}"
+        );
+        assert_eq!(
+            not_found_error("t-1").to_string(),
+            "task t-1 not found for this tenant"
+        );
+    }
+
     use super::*;
 
     #[test]
