@@ -53,6 +53,23 @@ const ARCHIVE_LIST_LIMIT: i64 = 20;
 /// sweep never races a running turn, it only buries the dead.
 const ORPHAN_PARK_AFTER_MINUTES: i64 = 30;
 
+/// What a status write actually did. `update_status` reports this instead of a
+/// bare `()` so callers can tell the agent the truth: an operator-stopped task
+/// silently ignores late agent writes (by design -- never a resurrection), and
+/// "Task X is now done" for a write that changed nothing is a lie the agent then
+/// acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusUpdate {
+    /// The requested status was written.
+    Applied,
+    /// `done` was requested for a task that was already done: nothing changed,
+    /// and the goal state holds.
+    AlreadyDone,
+    /// The operator stopped this task (dashboard Stop button); the write was
+    /// ignored and the task stays cancelled.
+    StoppedByOperator,
+}
+
 /// Why a status write matched no *live* row. Distinguishing these matters
 /// because the agent reads the error text: "not found" for a task that was
 /// simply finished sends it hunting for a missing task and retrying, when the
@@ -405,7 +422,7 @@ impl AgentTaskLedger {
         task_id: &str,
         status: TaskStatus,
         blocked_reason: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<StatusUpdate> {
         if status == TaskStatus::Done {
             return self.archive_task_transactionally(tenant_id, task_id).await;
         }
@@ -455,13 +472,13 @@ impl AgentTaskLedger {
             .await?;
             return match missing {
                 // A task the operator stopped stays stopped: a late agent
-                // write is a silent no-op, never a resurrection.
-                MissingTask::Cancelled => Ok(()),
+                // write is ignored, never a resurrection -- but reported.
+                MissingTask::Cancelled => Ok(StatusUpdate::StoppedByOperator),
                 MissingTask::AlreadyDone => Err(already_done_error(&task_id_for_error)),
                 MissingTask::NotFound => Err(not_found_error(&task_id_for_error)),
             };
         }
-        Ok(())
+        Ok(StatusUpdate::Applied)
     }
 
     /// `done` transition: move the row out of `agent_tasks` into
@@ -471,13 +488,17 @@ impl AgentTaskLedger {
     /// and fast (it only ever holds open work) while the ledger's own
     /// audit-trail guarantee still holds: nothing is lost, `list_tasks`
     /// still surfaces it, just from the archive.
-    async fn archive_task_transactionally(&self, tenant_id: &str, task_id: &str) -> Result<()> {
+    async fn archive_task_transactionally(
+        &self,
+        tenant_id: &str,
+        task_id: &str,
+    ) -> Result<StatusUpdate> {
         let client = Arc::clone(self.client.get());
         let schema = self.schema.clone();
         let tenant_id = tenant_id.to_string();
         let task_id_owned = task_id.to_string();
         let task_id_for_error = task_id_owned.clone();
-        run_on_os_thread(move || -> Result<()> {
+        run_on_os_thread(move || -> Result<StatusUpdate> {
             let mut client = client.lock();
             let mut txn = client.transaction()?;
 
@@ -513,7 +534,8 @@ impl AgentTaskLedger {
                     &[&task_id_owned, &tenant_id],
                 )?;
                 return match MissingTask::from_flags(flags.get(0), flags.get(1)) {
-                    MissingTask::Cancelled | MissingTask::AlreadyDone => Ok(()),
+                    MissingTask::Cancelled => Ok(StatusUpdate::StoppedByOperator),
+                    MissingTask::AlreadyDone => Ok(StatusUpdate::AlreadyDone),
                     MissingTask::NotFound => Err(not_found_error(&task_id_for_error)),
                 };
             };
@@ -553,7 +575,7 @@ impl AgentTaskLedger {
             )?;
 
             txn.commit()?;
-            Ok(())
+            Ok(StatusUpdate::Applied)
         })
         .await
     }

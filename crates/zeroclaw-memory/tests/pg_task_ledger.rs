@@ -14,7 +14,7 @@
 
 #![cfg(feature = "memory-postgres")]
 
-use zeroclaw_memory::task_ledger::{AgentTaskLedger, TaskPriority, TaskStatus};
+use zeroclaw_memory::task_ledger::{AgentTaskLedger, StatusUpdate, TaskPriority, TaskStatus};
 
 const SCHEMA: &str = "cerveau_task_ledger_test";
 
@@ -134,10 +134,13 @@ async fn task_ledger_end_to_end() {
     );
 
     // ── Scenario 4: done is terminal, but the row is never deleted ──
-    ledger
-        .update_status("tenant-a", &task_id, TaskStatus::Done, None)
-        .await
-        .expect("update_status done");
+    assert_eq!(
+        ledger
+            .update_status("tenant-a", &task_id, TaskStatus::Done, None)
+            .await
+            .expect("update_status done"),
+        StatusUpdate::Applied
+    );
     let all = ledger
         .list_tasks("tenant-a", "finance_invoice_ops", None)
         .await
@@ -162,10 +165,14 @@ async fn task_ledger_end_to_end() {
     );
     // Finishing it again is idempotent (the goal state already holds) and must
     // not create a second archive row.
-    ledger
-        .update_status("tenant-a", &task_id, TaskStatus::Done, None)
-        .await
-        .expect("done twice is idempotent");
+    assert_eq!(
+        ledger
+            .update_status("tenant-a", &task_id, TaskStatus::Done, None)
+            .await
+            .expect("done twice is idempotent"),
+        StatusUpdate::AlreadyDone,
+        "a repeated done must say nothing changed, not \"applied\""
+    );
     assert_eq!(
         ledger
             .list_tasks("tenant-a", "finance_invoice_ops", None)
@@ -213,10 +220,14 @@ async fn task_ledger_end_to_end() {
          WHERE task_id = '{cancelled_id}';"
     ))
     .await;
-    ledger
-        .update_status("tenant-a", &cancelled_id, TaskStatus::InProgress, None)
-        .await
-        .expect("late write to a cancelled row must succeed quietly, not error");
+    assert_eq!(
+        ledger
+            .update_status("tenant-a", &cancelled_id, TaskStatus::InProgress, None)
+            .await
+            .expect("late write to a cancelled row must succeed quietly, not error"),
+        StatusUpdate::StoppedByOperator,
+        "the caller must be able to tell the write was ignored"
+    );
     let fetched = ledger
         .get_task("tenant-a", &cancelled_id)
         .await
@@ -231,10 +242,14 @@ async fn task_ledger_end_to_end() {
     // ── Scenario 5b: a late `done` must not turn "abandoned" into "delivered" ──
     // Regression: the archive DELETE had no status filter, so an agent's late
     // `done` on an operator-cancelled row archived it as Done, undoing the Stop.
-    ledger
-        .update_status("tenant-a", &cancelled_id, TaskStatus::Done, None)
-        .await
-        .expect("late done on a cancelled row is a silent no-op");
+    assert_eq!(
+        ledger
+            .update_status("tenant-a", &cancelled_id, TaskStatus::Done, None)
+            .await
+            .expect("late done on a cancelled row is a silent no-op"),
+        StatusUpdate::StoppedByOperator,
+        "a late done on a stopped task must be reported as ignored"
+    );
     let after_done = ledger
         .get_task("tenant-a", &cancelled_id)
         .await
