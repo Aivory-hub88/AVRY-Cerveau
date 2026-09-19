@@ -778,7 +778,7 @@ fn build_hardware_context(
 }
 
 // Tool execution moved to `super::tool_execution`.
-pub use super::tool_execution::{ToolExecutionOutcome, should_execute_tools_in_parallel};
+pub use super::tool_execution::ToolExecutionOutcome;
 
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
@@ -6977,71 +6977,6 @@ mod tests {
             "expected creation failure for multiple images, got: {}",
             err
         );
-    }
-
-    #[test]
-    fn should_execute_tools_in_parallel_returns_false_for_single_call() {
-        let calls = vec![ParsedToolCall {
-            name: "file_read".to_string(),
-            arguments: serde_json::json!({"path": "a.txt"}),
-            tool_call_id: None,
-            arguments_parse_error: None,
-        }];
-
-        assert!(!should_execute_tools_in_parallel(&calls, None));
-    }
-
-    #[test]
-    fn should_execute_tools_in_parallel_returns_false_when_approval_is_required() {
-        let calls = vec![
-            ParsedToolCall {
-                name: "shell".to_string(),
-                arguments: serde_json::json!({"command": "pwd"}),
-                tool_call_id: None,
-                arguments_parse_error: None,
-            },
-            ParsedToolCall {
-                name: "http_request".to_string(),
-                arguments: serde_json::json!({"url": "https://example.com"}),
-                tool_call_id: None,
-                arguments_parse_error: None,
-            },
-        ];
-        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig::default();
-        let approval_mgr = ApprovalManager::from_risk_profile(&approval_cfg);
-
-        assert!(!should_execute_tools_in_parallel(
-            &calls,
-            Some(&approval_mgr)
-        ));
-    }
-
-    #[test]
-    fn should_execute_tools_in_parallel_returns_true_when_cli_has_no_interactive_approvals() {
-        let calls = vec![
-            ParsedToolCall {
-                name: "shell".to_string(),
-                arguments: serde_json::json!({"command": "pwd"}),
-                tool_call_id: None,
-                arguments_parse_error: None,
-            },
-            ParsedToolCall {
-                name: "http_request".to_string(),
-                arguments: serde_json::json!({"url": "https://example.com"}),
-                tool_call_id: None,
-                arguments_parse_error: None,
-            },
-        ];
-        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig {
-            level: crate::security::AutonomyLevel::Full,
-            ..zeroclaw_config::schema::RiskProfileConfig::default()
-        };
-        let approval_mgr = ApprovalManager::from_risk_profile(&approval_cfg);
-
-        assert!(should_execute_tools_in_parallel(
-            &calls,
-            Some(&approval_mgr)
-        ));
     }
 
     #[tokio::test]

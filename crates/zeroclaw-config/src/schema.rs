@@ -509,6 +509,13 @@ pub struct Config {
     #[group = "Agent"]
     pub tool_risk_tiers: ToolRiskTiersConfig,
 
+    /// Cerveau: which tools a batch may run concurrently (`[tool_concurrency]`).
+    /// Parallelism is deny-by-default -- see [`ToolConcurrencyConfig`].
+    #[serde(default)]
+    #[nested]
+    #[group = "Agent"]
+    pub tool_concurrency: ToolConcurrencyConfig,
+
     /// Named runtime/LLM execution profiles (`[runtime_profiles.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -13778,6 +13785,43 @@ pub enum ToolRiskTier {
     Irreversible,
 }
 
+/// Tool-concurrency policy (`[tool_concurrency]`).
+///
+/// When a model emits several tool calls in one response, only tools that are
+/// known to be read-only may run concurrently with each other; every other call
+/// is a barrier that runs alone, in the order the model emitted it (so
+/// `create_lead` then `update_lead_stage` in one batch can never race). A small
+/// built-in set of read-only tools (`memory_recall`, `file_read`, `web_search_tool`,
+/// ...) is always parallel-safe. This section declares the operator's own
+/// read-only tools -- typically MCP tools, which do not (yet) advertise
+/// `readOnlyHint` here.
+///
+/// A tool's risk tier is deliberately NOT used: a tenant MCP server declared
+/// `safe` means "executes without parking", not "read-only", and its tools
+/// (e.g. `send_mail`) must not run beside each other.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "tool_concurrency"]
+#[serde(default)]
+pub struct ToolConcurrencyConfig {
+    /// Read-only tools that may run concurrently with one another. Each entry is
+    /// an exact tool name, or a name ending in `*` to match a prefix
+    /// (`tenant_aivory-mail__search_*`). Declaring a tool that writes is a bug
+    /// in the config, not a feature: concurrent writes are what this prevents.
+    pub parallel_safe: Vec<String>,
+}
+
+impl ToolConcurrencyConfig {
+    /// Whether `tool_name` is declared read-only/concurrency-safe by the operator.
+    #[must_use]
+    pub fn declares_parallel_safe(&self, tool_name: &str) -> bool {
+        self.parallel_safe.iter().any(|entry| match entry.strip_suffix('*') {
+            Some(prefix) => !prefix.is_empty() && tool_name.starts_with(prefix),
+            None => entry == tool_name,
+        })
+    }
+}
+
 /// Global per-tool risk classification (`[tool_risk_tiers]`). A tool's
 /// inherent risk is a property of the tool itself, not the calling agent,
 /// so this is one global list rather than per-`[risk_profiles.<alias>]`.
@@ -20378,6 +20422,7 @@ impl Default for Config {
             mcp_bundles: HashMap::new(),
             agent_type_mcp_bundles: HashMap::new(),
             tool_risk_tiers: ToolRiskTiersConfig::default(),
+            tool_concurrency: ToolConcurrencyConfig::default(),
             peer_groups: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
@@ -30352,6 +30397,7 @@ auto_save = true
             mcp_bundles: HashMap::new(),
             agent_type_mcp_bundles: HashMap::new(),
             tool_risk_tiers: ToolRiskTiersConfig::default(),
+            tool_concurrency: ToolConcurrencyConfig::default(),
             peer_groups: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
@@ -31318,6 +31364,7 @@ default_temperature = 0.7
             mcp_bundles: HashMap::new(),
             agent_type_mcp_bundles: HashMap::new(),
             tool_risk_tiers: ToolRiskTiersConfig::default(),
+            tool_concurrency: ToolConcurrencyConfig::default(),
             peer_groups: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
@@ -45832,5 +45879,34 @@ model_provider = \"ollama.default\"
             ..Default::default()
         };
         assert!(agent.is_dispatchable());
+    }
+}
+
+#[cfg(test)]
+mod tool_concurrency_tests {
+    use super::ToolConcurrencyConfig;
+
+    fn cfg(entries: &[&str]) -> ToolConcurrencyConfig {
+        ToolConcurrencyConfig {
+            parallel_safe: entries.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn exact_and_prefix_entries_match_and_nothing_else_does() {
+        let c = cfg(&["memory_recall", "tenant_aivory-mail__search_*"]);
+        assert!(c.declares_parallel_safe("memory_recall"));
+        assert!(c.declares_parallel_safe("tenant_aivory-mail__search_mail"));
+        assert!(c.declares_parallel_safe("tenant_aivory-mail__search_threads"));
+        assert!(!c.declares_parallel_safe("tenant_aivory-mail__send_mail"), "sibling write tool");
+        assert!(!c.declares_parallel_safe("memory_recall_all"), "exact entry is not a prefix");
+        assert!(!c.declares_parallel_safe("memory_store"));
+    }
+
+    #[test]
+    fn a_bare_star_or_empty_list_declares_nothing() {
+        // "*" alone must not become "everything is parallel-safe".
+        assert!(!cfg(&["*"]).declares_parallel_safe("anything"));
+        assert!(!cfg(&[]).declares_parallel_safe("memory_recall"));
     }
 }
