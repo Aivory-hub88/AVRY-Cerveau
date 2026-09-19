@@ -150,6 +150,35 @@ impl BackgroundResultState {
     }
 }
 
+/// Aivory product agent types. Each is a first-class tenant-facing identity
+/// with its own per-tenant memory scope (`t_<user>.<agent_type>`), so a
+/// delegate hop to one of them must land in *that* specialist's scope.
+const PRODUCT_AGENT_TYPES: [&str; 6] = [
+    "autonomous",
+    "customer_service",
+    "leads_qualifier",
+    "finance_invoice_ops",
+    "office_assistant",
+    "chief_of_staff",
+];
+
+/// Tenant id that keys the memory scope of a delegate target's sub-turn.
+///
+/// Tenant memory is keyed by `<platform_user_id>.<agent_type>` (see
+/// `TenantSelector::tenant_id`). A product-type target runs as *itself*, so it
+/// reads and writes its own scope under the same authenticated user — the
+/// specialist sees the memory it accumulated in direct conversations, and
+/// nothing another user owns. Host-brain targets have no per-user identity, so
+/// they inherit the caller's scope rather than falling back to the shared host
+/// scope (which every tenant would share).
+fn delegate_memory_tenant_id(tenant: &crate::agent::tenant::TenantContext, target: &str) -> String {
+    if PRODUCT_AGENT_TYPES.contains(&target) {
+        format!("{}.{}", tenant.platform_user_id, target)
+    } else {
+        tenant.tenant_id.clone()
+    }
+}
+
 pub struct DelegateTool {
     agents: Arc<HashMap<String, AliasedAgentConfig>>,
     security: Arc<SecurityPolicy>,
@@ -712,6 +741,17 @@ impl DelegateTool {
         let api_key = config
             .resolved_model_provider_for_agent(agent_name)
             .and_then(|(_, _, cfg)| cfg.api_key.as_deref());
+        // A tenant turn's delegate sub-turn must use tenant-scoped memory,
+        // exactly as a direct turn does (`agent/loop_.rs`). Without this the
+        // target read the empty host-alias scope: every `memory_recall` came
+        // back "No memories found" and any `memory_store` landed in a scope
+        // shared by all tenants.
+        if let Some(tenant) = crate::agent::tenant::current_tenant() {
+            let scope = delegate_memory_tenant_id(&tenant, agent_name);
+            return zeroclaw_memory::create_memory_for_tenant(config, agent_name, &scope, api_key)
+                .await
+                .map(Some);
+        }
         zeroclaw_memory::create_memory_for_agent(config, agent_name, api_key)
             .await
             .map(Some)
@@ -1642,14 +1682,6 @@ impl DelegateTool {
         // agent_type). `tenant_id`/`platform_user_id` stay parental —
         // memory dimension and principal continuity must not split.
         // Host-brain targets keep the parent overlay unchanged.
-        const PRODUCT_AGENT_TYPES: [&str; 6] = [
-            "autonomous",
-            "customer_service",
-            "leads_qualifier",
-            "finance_invoice_ops",
-            "office_assistant",
-            "chief_of_staff",
-        ];
         let tenant_overlay = crate::agent::tenant::current_tenant().map(|t| {
             if PRODUCT_AGENT_TYPES.contains(&agent_name_owned.as_str()) {
                 std::sync::Arc::new(crate::agent::tenant::TenantContext {
@@ -3619,6 +3651,13 @@ mod tests {
     }
 
     async fn delegate_memory_fixture(model_uri: Option<String>) -> DelegateMemoryFixture {
+        delegate_memory_fixture_with_agents(model_uri, &[]).await
+    }
+
+    async fn delegate_memory_fixture_with_agents(
+        model_uri: Option<String>,
+        extra_agents: &[&str],
+    ) -> DelegateMemoryFixture {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
 
         let tmp = TempDir::new().unwrap();
@@ -3672,6 +3711,11 @@ mod tests {
         root_config
             .agents
             .insert("target".to_string(), target_config.clone());
+        for alias in extra_agents {
+            root_config
+                .agents
+                .insert((*alias).to_string(), target_config.clone());
+        }
 
         let inner_memory = Arc::new(SqliteMemory::new("delegate-test", &data_dir).unwrap());
         let caller_uuid = inner_memory.ensure_agent_uuid("caller").await.unwrap();
@@ -4655,6 +4699,199 @@ mod tests {
         assert!(result.success, "agentic delegate failed: {result:?}");
         assert!(result.output.contains("memory workflow done"));
         assert_stored_for_target_only(&fixture, "sync-key").await;
+    }
+
+    fn tenant_ctx(
+        user: &str,
+        agent_type: &str,
+    ) -> Option<Arc<crate::agent::tenant::TenantContext>> {
+        Some(Arc::new(crate::agent::tenant::TenantContext {
+            tenant_id: format!("{user}.{agent_type}"),
+            platform_user_id: user.to_string(),
+            agent_type: agent_type.to_string(),
+            persona: None,
+            connected_toolkits: Vec::new(),
+            disabled_toolkits: Vec::new(),
+            tenant_custom_mcp_servers: Vec::new(),
+        }))
+    }
+
+    #[test]
+    fn delegate_memory_scope_is_the_targets_own_for_product_types() {
+        let caller = tenant_ctx("user1", "chief_of_staff").unwrap();
+        // Product-type target: the specialist's own scope under the same user.
+        assert_eq!(
+            delegate_memory_tenant_id(&caller, "leads_qualifier"),
+            "user1.leads_qualifier"
+        );
+        // Host-brain target: no per-user identity, so inherit the caller's
+        // scope instead of the host scope every tenant shares.
+        assert_eq!(
+            delegate_memory_tenant_id(&caller, "analyst_brain"),
+            "user1.chief_of_staff"
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_delegate_target_sees_its_own_tenant_memory_and_nothing_else() {
+        use zeroclaw_memory::MemoryCategory;
+        let fixture = delegate_memory_fixture_with_agents(None, &["leads_qualifier"]).await;
+        let config = fixture.tool.root_config.as_deref().expect("root config");
+
+        // Lex's memory as written in a direct tenant turn.
+        let direct = zeroclaw_memory::create_memory_for_tenant(
+            config,
+            "leads_qualifier",
+            "user1.leads_qualifier",
+            None,
+        )
+        .await
+        .unwrap();
+        direct
+            .store(
+                "email_alvin",
+                "Email campaign to Alvin was already sent",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        // Same user's coordinator memory must NOT leak into the specialist.
+        let coordinator = zeroclaw_memory::create_memory_for_tenant(
+            config,
+            "leads_qualifier",
+            "user1.chief_of_staff",
+            None,
+        )
+        .await
+        .unwrap();
+        coordinator
+            .store(
+                "aira_note",
+                "Coordinator-only Alvin note",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Aira (chief_of_staff, user1) delegates to Lex.
+        let seen_by_user1 = crate::agent::tenant::TENANT_CONTEXT
+            .scope(tenant_ctx("user1", "chief_of_staff"), async {
+                let mem = fixture
+                    .tool
+                    .memory_for_target_agent("leads_qualifier")
+                    .await
+                    .unwrap()
+                    .expect("memory handle");
+                mem.recall("Alvin", 10, None, None, None).await.unwrap()
+            })
+            .await;
+        assert_eq!(
+            seen_by_user1.len(),
+            1,
+            "delegate sub-turn must see the specialist's own tenant memory: {seen_by_user1:?}"
+        );
+        assert_eq!(seen_by_user1[0].key, "email_alvin");
+
+        // A different user delegating to Lex sees nothing of user1's.
+        let seen_by_user2 = crate::agent::tenant::TENANT_CONTEXT
+            .scope(tenant_ctx("user2", "chief_of_staff"), async {
+                let mem = fixture
+                    .tool
+                    .memory_for_target_agent("leads_qualifier")
+                    .await
+                    .unwrap()
+                    .expect("memory handle");
+                mem.recall("Alvin", 10, None, None, None).await.unwrap()
+            })
+            .await;
+        assert!(
+            seen_by_user2.is_empty(),
+            "cross-tenant leak through delegate memory: {seen_by_user2:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_delegate_to_host_brain_inherits_caller_scope_not_shared_host_scope() {
+        use zeroclaw_memory::MemoryCategory;
+        let fixture = delegate_memory_fixture(None).await;
+        let config = fixture.tool.root_config.as_deref().expect("root config");
+
+        let caller_scope = zeroclaw_memory::create_memory_for_tenant(
+            config,
+            "target",
+            "user1.chief_of_staff",
+            None,
+        )
+        .await
+        .unwrap();
+        caller_scope
+            .store("ctx", "Quarterly plan context", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        crate::agent::tenant::TENANT_CONTEXT
+            .scope(tenant_ctx("user1", "chief_of_staff"), async {
+                let mem = fixture
+                    .tool
+                    .memory_for_target_agent("target")
+                    .await
+                    .unwrap()
+                    .expect("memory handle");
+                // Reads the caller's tenant scope ...
+                assert_eq!(
+                    mem.recall("Quarterly", 10, None, None, None)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                // ... and writes stay in it, never in the shared host scope.
+                mem.store("w", "written by delegate", MemoryCategory::Core, None)
+                    .await
+                    .unwrap();
+            })
+            .await;
+        let host = zeroclaw_memory::create_memory_for_agent(config, "target", None)
+            .await
+            .unwrap();
+        assert!(
+            host.recall("written", 10, None, None, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "tenant delegate write leaked into the shared host scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_tenant_delegate_memory_is_unchanged_host_agent_scope() {
+        use zeroclaw_memory::MemoryCategory;
+        let fixture = delegate_memory_fixture(None).await;
+        let config = fixture.tool.root_config.as_deref().expect("root config");
+        // No TENANT_CONTEXT: vanilla single-operator path, host alias scope.
+        let via_delegate = fixture
+            .tool
+            .memory_for_target_agent("target")
+            .await
+            .unwrap()
+            .expect("memory handle");
+        via_delegate
+            .store("k", "vanilla operator memory", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let direct = zeroclaw_memory::create_memory_for_agent(config, "target", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            direct
+                .recall("vanilla", 10, None, None, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
