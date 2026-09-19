@@ -228,6 +228,42 @@ async fn task_ledger_end_to_end() {
         "a stopped task stays stopped even when the agent writes late"
     );
 
+    // ── Scenario 5b: a late `done` must not turn "abandoned" into "delivered" ──
+    // Regression: the archive DELETE had no status filter, so an agent's late
+    // `done` on an operator-cancelled row archived it as Done, undoing the Stop.
+    ledger
+        .update_status("tenant-a", &cancelled_id, TaskStatus::Done, None)
+        .await
+        .expect("late done on a cancelled row is a silent no-op");
+    let after_done = ledger
+        .get_task("tenant-a", &cancelled_id)
+        .await
+        .expect("get_task after late done")
+        .expect("cancelled row must still exist");
+    assert_eq!(
+        after_done.status,
+        TaskStatus::Cancelled,
+        "a stopped task stays stopped even when the agent finishes it late"
+    );
+    // ...and it must not have leaked into the archive as a delivered task.
+    let archived_dupes = ledger
+        .list_tasks("tenant-a", "finance_invoice_ops", Some(TaskStatus::Done))
+        .await
+        .expect("list done tasks")
+        .into_iter()
+        .filter(|t| t.task_id == cancelled_id)
+        .count();
+    assert_eq!(archived_dupes, 0, "cancelled task archived as done");
+    // Another tenant still learns nothing about it.
+    assert!(
+        ledger
+            .update_status("tenant-b", &cancelled_id, TaskStatus::Done, None)
+            .await
+            .expect_err("cross-tenant done on a cancelled row")
+            .to_string()
+            .contains("not found")
+    );
+
     // ── Scenario 6: orphan sweep parks dead in_progress rows ──
     // A new turn in session-2 must park session-1's stale in_progress row
     // (older than the sweep threshold) but leave same-session and fresh

@@ -484,30 +484,37 @@ impl AgentTaskLedger {
             let row = txn.query_opt(
                 &format!(
                     r#"DELETE FROM "{schema}".agent_tasks
-                       WHERE task_id = $1 AND tenant_id = $2
+                       WHERE task_id = $1 AND tenant_id = $2 AND status <> 'cancelled'
                        RETURNING task_id, tenant_id, agent_type, session_id, title,
                                  priority, blocked_reason, created_at"#
                 ),
                 &[&task_id_owned, &tenant_id],
             )?;
             let Some(row) = row else {
-                // Nothing live to finish. If it was already finished, the
-                // caller's goal (task is done) holds: succeed idempotently
-                // rather than tell the agent a finished task does not exist.
-                // Tenant-scoped, so another tenant's id still reads as not found.
-                let archived: bool = txn
-                    .query_one(
-                        &format!(
-                            r#"SELECT EXISTS (SELECT 1 FROM "{schema}".agent_tasks_archive
-                                              WHERE task_id = $1 AND tenant_id = $2)"#
-                        ),
-                        &[&task_id_owned, &tenant_id],
-                    )?
-                    .get(0);
-                return if archived {
-                    Ok(())
-                } else {
-                    Err(not_found_error(&task_id_for_error))
+                // Nothing live to finish. Diagnose why, in one round trip:
+                //  - operator-cancelled: a late agent `done` is a silent no-op.
+                //    The DELETE above deliberately skips cancelled rows;
+                //    archiving one would rewrite "abandoned" as "delivered" and
+                //    resurrect it on the board.
+                //  - already archived: the goal state already holds, succeed
+                //    idempotently rather than tell the agent a finished task
+                //    does not exist.
+                //  - neither: genuinely unknown. Both probes are tenant-scoped,
+                //    so another tenant's id still reads as not found.
+                let flags = txn.query_one(
+                    &format!(
+                        r#"SELECT
+                             EXISTS (SELECT 1 FROM "{schema}".agent_tasks
+                                     WHERE task_id = $1 AND tenant_id = $2
+                                       AND status = 'cancelled'),
+                             EXISTS (SELECT 1 FROM "{schema}".agent_tasks_archive
+                                     WHERE task_id = $1 AND tenant_id = $2)"#
+                    ),
+                    &[&task_id_owned, &tenant_id],
+                )?;
+                return match MissingTask::from_flags(flags.get(0), flags.get(1)) {
+                    MissingTask::Cancelled | MissingTask::AlreadyDone => Ok(()),
+                    MissingTask::NotFound => Err(not_found_error(&task_id_for_error)),
                 };
             };
 
