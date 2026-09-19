@@ -8,6 +8,10 @@ use crate::approval::ApprovalManager;
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
+use crate::tools::delegate_envelope::{
+    self as envelope, DEFAULT_MAX_SUMMARY_BYTES, DelegateEnvelope, DelegateExecution,
+    DelegateReason, DelegateState, RunFacts,
+};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::json;
@@ -69,6 +73,25 @@ pub struct BackgroundDelegateResult {
     pub error: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
+    /// ADR-014 A1: the failure cause and parked approval, in the shape the
+    /// result envelope needs. Additive and optional — files written before
+    /// this field existed parse with `None`, and an older binary ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<BackgroundResultMeta>,
+}
+
+/// Envelope inputs that the on-disk [`BackgroundTaskStatus`] cannot express.
+/// Kept out of that enum on purpose: adding a variant there is only safe in
+/// the forward direction (see ADR-014 §2.2).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct BackgroundResultMeta {
+    /// `snake_case` [`DelegateReason`], when the cause is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_tool: Option<String>,
 }
 
 /// Status of a background delegate task.
@@ -254,6 +277,40 @@ impl DelegateAmbient {
         )
         .await
     }
+}
+
+/// A refused or failed delegation. Behaves exactly like the literal
+/// `ToolResult { success: false, .. }` it replaces, and additionally records
+/// *why* for the envelope boundary that wraps the call (ADR-014 A1). A site
+/// that still builds the literal is classified `tool_error` there.
+fn fail(reason: DelegateReason, error: impl Into<String>) -> ToolResult {
+    envelope::note_reason(reason);
+    ToolResult {
+        success: false,
+        output: ToolOutput::default(),
+        error: Some(error.into()),
+    }
+}
+
+/// Task text handed to a sub-agent. Byte-identical to the old inline
+/// `[Context]/[Task]` composition when `expected_output` is empty.
+fn compose_prompt(prompt: &str, context: &str, expected_output: &str) -> String {
+    let mut full = if context.is_empty() {
+        prompt.to_string()
+    } else {
+        format!("[Context]\n{context}\n\n[Task]\n{prompt}")
+    };
+    if !expected_output.is_empty() {
+        full.push_str(&format!("\n\n[Expected output]\n{expected_output}"));
+    }
+    full
+}
+
+fn expected_output_arg(args: &serde_json::Value) -> &str {
+    args.get("expected_output")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("")
 }
 
 pub struct DelegateTool {
@@ -619,11 +676,14 @@ impl DelegateTool {
                     })),
                 "delegate refused: caller delegation_policy forbids delegation"
             );
-            return Err(anyhow::Error::msg(format!(
-                "delegation is forbidden for caller {:?} by risk profile {:?} \
-                 delegation_policy; {remediation}",
-                self.caller_alias, self.security.risk_profile_name
-            )));
+            return Err(envelope::tagged(
+                DelegateReason::PolicyForbidden,
+                format!(
+                    "delegation is forbidden for caller {:?} by risk profile {:?} \
+                     delegation_policy; {remediation}",
+                    self.caller_alias, self.security.risk_profile_name
+                ),
+            ));
         }
 
         // Resolve reachability and execution mode through `Config` so
@@ -653,7 +713,7 @@ impl DelegateTool {
                     })),
                 "delegate refused: target not in caller's reachable set"
             );
-            return Err(anyhow::Error::msg(error));
+            return Err(envelope::tagged(DelegateReason::NotReachable, error));
         };
 
         let mut target_policy = SecurityPolicy::for_agent(config, target_alias).map_err(|e| {
@@ -797,18 +857,17 @@ impl DelegateTool {
             "delegate refused: independent target has always_ask entries"
         );
 
-        Some(ToolResult {
-            success: false,
-            output: ToolOutput::default(),
-            error: Some(format!(
+        Some(fail(
+            DelegateReason::PolicyForbidden,
+            format!(
                 "delegate target {target_alias:?} cannot run in independent mode from {:?}: \
                  risk profile {target_risk_profile:?} has always_ask entries ({}). \
                  See {}.",
                 self.caller_alias,
                 always_ask_label,
                 Self::INDEPENDENT_ALWAYS_ASK_DOC_REF
-            )),
-        })
+            ),
+        ))
     }
 
     fn build_target_provider(
@@ -1240,7 +1299,14 @@ impl Tool for DelegateTool {
                 },
                 "context": {
                     "type": "string",
-                    "description": "Optional context to prepend (e.g. relevant code, prior findings)"
+                    "description": "Optional context to prepend (e.g. relevant code, prior findings). \
+                                    The sub-agent starts with NO conversation history, so include \
+                                    everything it needs."
+                },
+                "expected_output": {
+                    "type": "string",
+                    "description": "Optional one-line description of what a finished answer looks \
+                                    like (format, fields, level of detail). Appended to the task."
                 },
                 "background": {
                     "type": "boolean",
@@ -1326,11 +1392,12 @@ impl Tool for DelegateTool {
             })?;
 
         if agent_name.is_empty() {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some("'agent' parameter must not be empty".into()),
-            });
+            return Ok(Self::refusal(
+                "(none)",
+                DelegateExecution::Sync,
+                DelegateReason::InvalidRequest,
+                "'agent' parameter must not be empty",
+            ));
         }
 
         let prompt = args
@@ -1350,11 +1417,12 @@ impl Tool for DelegateTool {
             })?;
 
         if prompt.is_empty() {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some("'prompt' parameter must not be empty".into()),
-            });
+            return Ok(Self::refusal(
+                agent_name,
+                DelegateExecution::Sync,
+                DelegateReason::InvalidRequest,
+                "'prompt' parameter must not be empty",
+            ));
         }
 
         let background = args
@@ -1362,12 +1430,126 @@ impl Tool for DelegateTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        if background {
-            return self.execute_background(agent_name, prompt, &args).await;
+        let execution = if background {
+            DelegateExecution::Background
+        } else {
+            DelegateExecution::Sync
+        };
+        self.run_enveloped(agent_name, prompt, &args, execution)
+            .await
+    }
+}
+
+impl DelegateTool {
+    /// A refusal that never reached the delegation engine (bad arguments),
+    /// already shaped as an envelope.
+    fn refusal(
+        agent: &str,
+        execution: DelegateExecution,
+        reason: DelegateReason,
+        message: &str,
+    ) -> ToolResult {
+        DelegateEnvelope::new(
+            uuid::Uuid::new_v4().to_string(),
+            agent,
+            execution,
+            reason.state(),
+        )
+        .with_reason(reason)
+        .with_error(message)
+        .into_tool_result(&format!("[Agent '{agent}']"), Some(message))
+    }
+
+    fn mode_label(&self, target: &str) -> Option<&'static str> {
+        let mode = self
+            .root_config
+            .as_ref()?
+            .delegate_target_mode(&self.caller_alias, target)?;
+        Some(match mode {
+            DelegateExecutionMode::Bounded => "bounded",
+            DelegateExecutionMode::Independent => "independent",
+        })
+    }
+
+    /// Run one delegation (sync or background) and shape whatever comes back
+    /// as a [`DelegateEnvelope`]. The engine below is untouched: it records
+    /// facts into a task-local cell and returns its usual `ToolResult`.
+    async fn run_enveloped(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        args: &serde_json::Value,
+        execution: DelegateExecution,
+    ) -> anyhow::Result<ToolResult> {
+        let started_at = chrono::Utc::now().to_rfc3339();
+        let (result, facts) = envelope::capture(async {
+            match execution {
+                DelegateExecution::Background => {
+                    self.execute_background(agent_name, prompt, args).await
+                }
+                _ => self.execute_sync(agent_name, prompt, args).await,
+            }
+        })
+        .await;
+        Ok(self.envelope_result(result?, facts, agent_name, execution, &started_at))
+    }
+
+    /// The one place a finished (or accepted, or refused) delegation becomes
+    /// an envelope. `result` keeps the engine's original text/error; the
+    /// envelope adds state, reason, retryability and the framed summary.
+    fn envelope_result(
+        &self,
+        result: ToolResult,
+        facts: RunFacts,
+        agent: &str,
+        execution: DelegateExecution,
+        started_at: &str,
+    ) -> ToolResult {
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        let task_id = facts
+            .task_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let header = facts
+            .header
+            .clone()
+            .unwrap_or_else(|| format!("[Agent '{agent}']"));
+        let mode = self.mode_label(agent);
+
+        if !result.success {
+            let reason = facts.reason.unwrap_or(DelegateReason::ToolError);
+            let original = result.error.clone().unwrap_or_default();
+            return DelegateEnvelope::new(task_id, agent, execution, reason.state())
+                .with_reason(reason)
+                .with_mode(mode)
+                .with_error(&original)
+                .with_timing(Some(started_at), Some(&finished_at))
+                .into_tool_result(&header, Some(&original));
         }
 
-        // --- Synchronous delegation (original path) ---
-        self.execute_sync(agent_name, prompt, &args).await
+        if execution == DelegateExecution::Background && facts.task_id.is_some() {
+            // Accepted, not finished: keep the existing "Background task
+            // started…" text (callers and tests read `task_id:` from it) and
+            // attach the envelope as structured data.
+            let envelope = DelegateEnvelope::new(task_id, agent, execution, DelegateState::Working)
+                .with_mode(mode)
+                .with_timing(Some(started_at), None);
+            return ToolResult {
+                success: true,
+                output: ToolOutput::json_with_text(envelope.data(), result.output.to_string()),
+                error: None,
+            };
+        }
+
+        let raw = facts
+            .summary
+            .clone()
+            .unwrap_or_else(|| result.output.to_string());
+        DelegateEnvelope::new(task_id, agent, execution, DelegateState::Completed)
+            .with_mode(mode)
+            .with_summary(&raw, DEFAULT_MAX_SUMMARY_BYTES)
+            .with_timing(Some(started_at), Some(&finished_at))
+            .into_tool_result(&header, None)
     }
 }
 
@@ -1493,18 +1675,17 @@ impl DelegateTool {
             None => {
                 let available: Vec<&str> =
                     self.agents.keys().map(|s: &String| s.as_str()).collect();
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!(
+                return Ok(fail(
+                    DelegateReason::UnknownAgent,
+                    format!(
                         "Unknown agent '{agent_name}'. Available agents: {}",
                         if available.is_empty() {
                             "(none configured)".to_string()
                         } else {
                             available.join(", ")
                         }
-                    )),
-                });
+                    ),
+                ));
             }
         };
 
@@ -1516,16 +1697,15 @@ impl DelegateTool {
 
         // Check recursion depth (immutable — set at construction, incremented for sub-agents)
         if self.depth >= max_depth {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!(
+            return Ok(fail(
+                DelegateReason::DepthExceeded,
+                format!(
                     "Delegation depth limit reached ({depth}/{max}). \
                      Cannot delegate further to prevent infinite loops.",
                     depth = self.depth,
                     max = max_depth
-                )),
-            });
+                ),
+            ));
         }
 
         if admission == DelegateAdmission::Required {
@@ -1533,19 +1713,11 @@ impl DelegateTool {
                 .security
                 .enforce_tool_operation(ToolOperation::Act, "delegate")
             {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(error),
-                });
+                return Ok(fail(DelegateReason::PolicyForbidden, error));
             }
 
             if let Err(e) = self.policy_for_target(agent_name) {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!("{e:#}")),
-                });
+                return Ok(fail(envelope::reason_of(&e), format!("{e:#}")));
             }
             if let Some(refusal) = self.independent_always_ask_refusal(agent_name) {
                 return Ok(refusal);
@@ -1560,22 +1732,17 @@ impl DelegateTool {
         ) {
             Ok(provider) => provider,
             Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!(
+                return Ok(fail(
+                    DelegateReason::ProviderError,
+                    format!(
                         "Failed to create model_provider '{legacy_provider_type}' for agent '{agent_name}': {e}"
-                    )),
-                });
+                    ),
+                ));
             }
         };
 
         // Build the message
-        let full_prompt = if context.is_empty() {
-            prompt.to_string()
-        } else {
-            format!("[Context]\n{context}\n\n[Task]\n{prompt}")
-        };
+        let full_prompt = compose_prompt(prompt, context, expected_output_arg(args));
 
         // Agentic mode: run full tool-call loop with allowlisted tools.
         if agentic {
@@ -1659,13 +1826,10 @@ impl DelegateTool {
         let result = match result {
             Ok(inner) => inner,
             Err(_elapsed) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!(
-                        "Agent '{agent_name}' timed out after {timeout_secs}s"
-                    )),
-                });
+                return Ok(fail(
+                    DelegateReason::TimedOut,
+                    format!("Agent '{agent_name}' timed out after {timeout_secs}s"),
+                ));
             }
         };
 
@@ -1687,23 +1851,24 @@ impl DelegateTool {
             Ok(response)
                 if zeroclaw_api::model_provider::strip_think_tags(&response).is_empty() =>
             {
+                fail(
+                    DelegateReason::ProviderError,
+                    invalid_semantic_completion_error(agent_name),
+                )
+            }
+            Ok(response) => {
+                let header = format!("[Agent '{agent_name}' ({provider_type}/{model})]");
+                envelope::note_completed(header.clone(), response.clone());
                 ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(invalid_semantic_completion_error(agent_name)),
+                    success: true,
+                    output: format!("{header}\n{response}").into(),
+                    error: None,
                 }
             }
-            Ok(response) => ToolResult {
-                success: true,
-                output: format!("[Agent '{agent_name}' ({provider_type}/{model})]\n{response}",)
-                    .into(),
-                error: None,
-            },
-            Err(e) => ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(delegate_failure_error(agent_name, &e)),
-            },
+            Err(e) => fail(
+                DelegateReason::ProviderError,
+                delegate_failure_error(agent_name, &e),
+            ),
         }
     }
 }
@@ -1725,53 +1890,43 @@ impl DelegateTool {
             None => {
                 let available: Vec<&str> =
                     self.agents.keys().map(|s: &String| s.as_str()).collect();
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!(
+                return Ok(fail(
+                    DelegateReason::UnknownAgent,
+                    format!(
                         "Unknown agent '{agent_name}'. Available agents: {}",
                         if available.is_empty() {
                             "(none configured)".to_string()
                         } else {
                             available.join(", ")
                         }
-                    )),
-                });
+                    ),
+                ));
             }
         };
 
         let max_depth = self.resolve_max_depth(&agent_config.runtime_profile);
         if self.depth >= max_depth {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!(
+            return Ok(fail(
+                DelegateReason::DepthExceeded,
+                format!(
                     "Delegation depth limit reached ({depth}/{max}).",
                     depth = self.depth,
                     max = max_depth
-                )),
-            });
+                ),
+            ));
         }
 
         if let Err(error) = self
             .security
             .enforce_tool_operation(ToolOperation::Act, "delegate")
         {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(error),
-            });
+            return Ok(fail(DelegateReason::PolicyForbidden, error));
         }
 
         let target_policy = match self.policy_for_target(agent_name) {
             Ok(p) => p,
             Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!("{e:#}")),
-                });
+                return Ok(fail(envelope::reason_of(&e), format!("{e:#}")));
             }
         };
         if let Some(refusal) = self.independent_always_ask_refusal(agent_name) {
@@ -1784,15 +1939,14 @@ impl DelegateTool {
             Self::background_task_cancels().lock().len(),
             Self::MAX_CONCURRENT_BACKGROUND_DELEGATIONS,
         ) {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!(
+            return Ok(fail(
+                DelegateReason::CapacityExceeded,
+                format!(
                     "Too many background delegations in flight (limit {}). Wait for some to \
                      finish (check_result) or cancel one (cancel_task) before starting more.",
                     Self::MAX_CONCURRENT_BACKGROUND_DELEGATIONS
-                )),
-            });
+                ),
+            ));
         }
 
         let task_id = uuid::Uuid::new_v4().to_string();
@@ -1804,11 +1958,7 @@ impl DelegateTool {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .unwrap_or("");
-        let full_prompt = if context.is_empty() {
-            prompt.to_string()
-        } else {
-            format!("[Context]\n{context}\n\n[Task]\n{prompt}")
-        };
+        let full_prompt = compose_prompt(prompt, context, expected_output_arg(args));
 
         let started_at = chrono::Utc::now().to_rfc3339();
         let agent_name_owned = agent_name.to_string();
@@ -1822,9 +1972,11 @@ impl DelegateTool {
             error: None,
             started_at: started_at.clone(),
             finished_at: None,
+            meta: None,
         };
         let result_path = results_dir.join(format!("{task_id}.json"));
         Self::write_result_atomic(&result_path, &initial_result).await?;
+        envelope::note_started(&task_id);
 
         // EPIC-A supervision: register the task in the durable control-plane BEFORE the
         // spawn, so a crash between here and the spawn is recoverable by the reaper. A
@@ -1942,28 +2094,40 @@ impl DelegateTool {
                 // call still finished as `Completed`. Scoping it here is
                 // what makes `InputRequired` observable at all.
                 let pending_cell = std::sync::Arc::new(parking_lot::Mutex::new(None));
-                let outcome = crate::agent::tenant::LAST_PENDING_APPROVAL
+                // ADR-014 A1: the failure cause travels with the outcome so it
+                // can be stored beside the (unchanged) status enum.
+                let (outcome, failure_reason) = crate::agent::tenant::LAST_PENDING_APPROVAL
                     .scope(Some(pending_cell.clone()), async {
                         // Race the delegation against cancellation
                         tokio::select! {
                             () = child_token.cancelled() => {
-                                Err("Cancelled by parent session".to_string())
+                                (
+                                    Err("Cancelled by parent session".to_string()),
+                                    Some(DelegateReason::Cancelled),
+                                )
                             }
-                            result = Box::pin(inner.execute_sync_with_admission(
-                                &agent_name_owned,
-                                &full_prompt,
-                                &args_inner,
-                                DelegateAdmission::Prevalidated,
+                            (result, facts) = Box::pin(envelope::capture(
+                                inner.execute_sync_with_admission(
+                                    &agent_name_owned,
+                                    &full_prompt,
+                                    &args_inner,
+                                    DelegateAdmission::Prevalidated,
+                                ),
                             )) => {
                                 match result {
                                     Ok(tool_result) => {
                                         if tool_result.success {
-                                            Ok(tool_result.output.into_string())
+                                            (Ok(tool_result.output.into_string()), None)
                                         } else {
-                                            Err(tool_result.error.unwrap_or_else(|| "Unknown error".into()))
+                                            (
+                                                Err(tool_result
+                                                    .error
+                                                    .unwrap_or_else(|| "Unknown error".into())),
+                                                Some(facts.reason.unwrap_or(DelegateReason::ToolError)),
+                                            )
                                         }
                                     }
-                                    Err(e) => Err(e.to_string()),
+                                    Err(e) => (Err(e.to_string()), Some(DelegateReason::ToolError)),
                                 }
                             }
                         }
@@ -1983,15 +2147,20 @@ impl DelegateTool {
                         // prose usually says so; the status did not, and a
                         // caller reading the status is the one that has to
                         // decide whether the work is really done.
-                        let (status, error) = match &parked_approval {
+                        let (status, error, meta) = match &parked_approval {
                             Some(summary) => (
                                 BackgroundTaskStatus::InputRequired,
                                 Some(format!(
                                     "Waiting on approval {} for tool {}",
                                     summary.id, summary.tool_name
                                 )),
+                                Some(BackgroundResultMeta {
+                                    reason: Some(DelegateReason::ApprovalPending.as_str().into()),
+                                    approval_id: Some(summary.id.clone()),
+                                    approval_tool: Some(summary.tool_name.clone()),
+                                }),
                             ),
-                            None => (BackgroundTaskStatus::Completed, None),
+                            None => (BackgroundTaskStatus::Completed, None, None),
                         };
                         BackgroundDelegateResult {
                             task_id: task_id_clone.clone(),
@@ -2001,6 +2170,7 @@ impl DelegateTool {
                             error,
                             started_at,
                             finished_at: Some(finished_at),
+                            meta,
                         }
                     }
                     Err(err) => {
@@ -2017,6 +2187,10 @@ impl DelegateTool {
                             error: Some(err),
                             started_at,
                             finished_at: Some(finished_at),
+                            meta: failure_reason.map(|reason| BackgroundResultMeta {
+                                reason: Some(reason.as_str().into()),
+                                ..BackgroundResultMeta::default()
+                            }),
                         }
                     }
                 };
@@ -2103,11 +2277,12 @@ impl DelegateTool {
             })?;
 
         if prompt.is_empty() {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some("'prompt' parameter must not be empty".into()),
-            });
+            return Ok(Self::refusal(
+                "(parallel)",
+                DelegateExecution::Parallel,
+                DelegateReason::InvalidRequest,
+                "'prompt' parameter must not be empty",
+            ));
         }
 
         let agent_names: Vec<String> = parallel_agents
@@ -2117,11 +2292,12 @@ impl DelegateTool {
             .collect();
 
         if agent_names.is_empty() {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some("'parallel' array must contain at least one agent name".into()),
-            });
+            return Ok(Self::refusal(
+                "(parallel)",
+                DelegateExecution::Parallel,
+                DelegateReason::InvalidRequest,
+                "'parallel' array must contain at least one agent name",
+            ));
         }
 
         // Validate all agents exist before starting any
@@ -2129,18 +2305,19 @@ impl DelegateTool {
             if !self.agents.contains_key(name) {
                 let available: Vec<&str> =
                     self.agents.keys().map(|s: &String| s.as_str()).collect();
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!(
+                return Ok(Self::refusal(
+                    name,
+                    DelegateExecution::Parallel,
+                    DelegateReason::UnknownAgent,
+                    &format!(
                         "Unknown agent '{name}' in parallel list. Available: {}",
                         if available.is_empty() {
                             "(none configured)".to_string()
                         } else {
                             available.join(", ")
                         }
-                    )),
-                });
+                    ),
+                ));
             }
         }
 
@@ -2150,11 +2327,12 @@ impl DelegateTool {
             // launching a partial set of child agents and then reporting mixed
             // results.
             if let Err(e) = self.policy_for_target(name) {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!("{e:#}")),
-                });
+                return Ok(Self::refusal(
+                    name,
+                    DelegateExecution::Parallel,
+                    envelope::reason_of(&e),
+                    &format!("{e:#}"),
+                ));
             }
             if let Some(refusal) = self.independent_always_ask_refusal(name) {
                 return Ok(refusal);
@@ -2166,6 +2344,8 @@ impl DelegateTool {
             .ok()
             .flatten();
         let parent_session_key = current_tool_loop_session_key();
+
+        let parallel_started_at = chrono::Utc::now().to_rfc3339();
 
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
@@ -2233,8 +2413,12 @@ impl DelegateTool {
                         .scope(scope_delegate_session_key(session_key, async move {
                             crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
                                 .scope(receipt_scope, async move {
-                                    Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
-                                        .await
+                                    Box::pin(envelope::capture(inner.execute_sync(
+                                        &agent_name,
+                                        &prompt,
+                                        &args_clone,
+                                    )))
+                                    .await
                                 })
                                 .await
                         }))
@@ -2249,13 +2433,31 @@ impl DelegateTool {
 
         // Collect all results
         let mut outputs = Vec::with_capacity(handles.len());
+        let mut envelopes: Vec<serde_json::Value> = Vec::with_capacity(handles.len());
         let mut all_success = true;
 
         for handle in handles {
             match handle.await {
-                Ok((agent_name, Ok(tool_result))) => {
+                Ok((agent_name, (result, facts))) => {
+                    // An `Err` here is an argument-level error from the engine
+                    // (never a delegation outcome); shape it like any failure.
+                    let tool_result = result.unwrap_or_else(|e| ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(e.to_string()),
+                    });
+                    let tool_result = self.envelope_result(
+                        tool_result,
+                        facts,
+                        &agent_name,
+                        DelegateExecution::Parallel,
+                        &parallel_started_at,
+                    );
                     if !tool_result.success {
                         all_success = false;
+                    }
+                    if let Some(data) = tool_result.output.data() {
+                        envelopes.push(data.clone());
                     }
                     outputs.push(format!(
                         "--- {agent_name} (success={}) ---\n{}{}",
@@ -2267,10 +2469,6 @@ impl DelegateTool {
                             .unwrap_or_default()
                     ));
                 }
-                Ok((agent_name, Err(e))) => {
-                    all_success = false;
-                    outputs.push(format!("--- {agent_name} (success=false) ---\nError: {e}"));
-                }
                 Err(e) => {
                     all_success = false;
                     outputs.push(format!("--- [join error] ---\n{e}"));
@@ -2280,12 +2478,18 @@ impl DelegateTool {
 
         Ok(ToolResult {
             success: all_success,
-            output: format!(
-                "[Parallel delegation: {} agents]\n\n{}",
-                agent_names.len(),
-                outputs.join("\n\n")
-            )
-            .into(),
+            output: ToolOutput::json_with_text(
+                json!({
+                    "v": envelope::ENVELOPE_VERSION,
+                    "execution": DelegateExecution::Parallel.as_str(),
+                    "results": envelopes,
+                }),
+                format!(
+                    "[Parallel delegation: {} agents]\n\n{}",
+                    agent_names.len(),
+                    outputs.join("\n\n")
+                ),
+            ),
             error: if all_success {
                 None
             } else {
@@ -2345,6 +2549,11 @@ impl DelegateTool {
                 "timed_out" => BackgroundResultState::TimedOut,
                 _ => BackgroundResultState::from_file_status(&result.status),
             };
+            let reason = match label {
+                "timed_out" => DelegateReason::TimedOut,
+                _ => DelegateReason::Lost,
+            };
+            let envelope = Self::envelope_from_file(&result, Some(reason));
             return Ok((
                 state,
                 json!({
@@ -2354,11 +2563,80 @@ impl DelegateTool {
                     "started_at": result.started_at,
                     "note": "the owning daemon exited or the task exceeded its max runtime; \
                              reconciled by the supervision reaper",
+                    "envelope": envelope.data(),
                 }),
             ));
         }
         let state = BackgroundResultState::from_file_status(&result.status);
-        Ok((state, serde_json::to_value(result)?))
+        let envelope = Self::envelope_from_file(&result, None);
+        let mut value = serde_json::to_value(&result)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("envelope".to_string(), envelope.data());
+        }
+        Ok((state, value))
+    }
+
+    /// Derive the envelope for a stored background result. `reconciled` is the
+    /// reaper's verdict (`lost` / `timed_out`) for a task whose file still
+    /// says `Running`; otherwise state and reason come from the file status
+    /// plus the optional [`BackgroundResultMeta`].
+    fn envelope_from_file(
+        result: &BackgroundDelegateResult,
+        reconciled: Option<DelegateReason>,
+    ) -> DelegateEnvelope {
+        let base = |state| {
+            DelegateEnvelope::new(
+                result.task_id.clone(),
+                result.agent.clone(),
+                DelegateExecution::Background,
+                state,
+            )
+            .with_timing(Some(&result.started_at), result.finished_at.as_deref())
+        };
+        let stored_reason = result
+            .meta
+            .as_ref()
+            .and_then(|m| m.reason.as_deref())
+            .and_then(DelegateReason::parse);
+        let with_error = |env: DelegateEnvelope| match result.error.as_deref() {
+            Some(error) => env.with_error(error),
+            None => env,
+        };
+
+        if let Some(reason) = reconciled {
+            return with_error(base(reason.state()).with_reason(reason));
+        }
+        match result.status {
+            BackgroundTaskStatus::Running => base(DelegateState::Working)
+                .with_hint("still running; use check_result or await_sessions"),
+            BackgroundTaskStatus::Completed => {
+                let text = envelope::strip_agent_header(result.output.as_deref().unwrap_or(""));
+                base(DelegateState::Completed).with_summary(text, DEFAULT_MAX_SUMMARY_BYTES)
+            }
+            BackgroundTaskStatus::Failed => with_error(
+                base(DelegateState::Failed)
+                    .with_reason(stored_reason.unwrap_or(DelegateReason::ToolError)),
+            ),
+            BackgroundTaskStatus::Cancelled => {
+                with_error(base(DelegateState::Canceled).with_reason(DelegateReason::Cancelled))
+            }
+            BackgroundTaskStatus::InputRequired => {
+                let mut env =
+                    base(DelegateState::InputRequired).with_reason(DelegateReason::ApprovalPending);
+                if let Some(meta) = &result.meta
+                    && let (Some(id), Some(tool)) = (&meta.approval_id, &meta.approval_tool)
+                {
+                    env = env.with_approval(id, tool);
+                }
+                if let Some(text) = result.output.as_deref() {
+                    env = env.with_summary(
+                        envelope::strip_agent_header(text),
+                        DEFAULT_MAX_SUMMARY_BYTES,
+                    );
+                }
+                env
+            }
+        }
     }
 
     fn task_ids_from_args(args: &serde_json::Value) -> anyhow::Result<Vec<String>> {
@@ -2892,11 +3170,7 @@ impl DelegateTool {
             DelegateAdmission::Required => match self.policy_for_target(agent_name) {
                 Ok(policy) => policy,
                 Err(e) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(format!("{e:#}")),
-                    });
+                    return Ok(fail(envelope::reason_of(&e), format!("{e:#}")));
                 }
             },
             DelegateAdmission::Prevalidated => Arc::clone(&self.security),
@@ -3221,31 +3495,27 @@ impl DelegateTool {
         };
 
         match result {
-            Ok(Ok(response)) if response.trim().is_empty() => Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(invalid_semantic_completion_error(agent_name)),
-            }),
-            Ok(Ok(response)) => Ok(ToolResult {
-                success: true,
-                output: format!(
-                    "[Agent '{agent_name}' ({provider_type}/{model}, agentic)]\n{response}",
-                )
-                .into(),
-                error: None,
-            }),
-            Ok(Err(e)) => Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(delegate_failure_error(agent_name, &e)),
-            }),
-            Err(_) => Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!(
-                    "Agent '{agent_name}' timed out after {agentic_timeout_secs}s"
-                )),
-            }),
+            Ok(Ok(response)) if response.trim().is_empty() => Ok(fail(
+                DelegateReason::ProviderError,
+                invalid_semantic_completion_error(agent_name),
+            )),
+            Ok(Ok(response)) => {
+                let header = format!("[Agent '{agent_name}' ({provider_type}/{model}, agentic)]");
+                envelope::note_completed(header.clone(), response.clone());
+                Ok(ToolResult {
+                    success: true,
+                    output: format!("{header}\n{response}").into(),
+                    error: None,
+                })
+            }
+            Ok(Err(e)) => Ok(fail(
+                DelegateReason::ToolError,
+                delegate_failure_error(agent_name, &e),
+            )),
+            Err(_) => Ok(fail(
+                DelegateReason::TimedOut,
+                format!("Agent '{agent_name}' timed out after {agentic_timeout_secs}s"),
+            )),
         }
     }
 }
@@ -3593,6 +3863,7 @@ mod tests {
             error: error.map(str::to_string),
             started_at: "2026-06-29T12:00:00Z".to_string(),
             finished_at,
+            meta: None,
         }
     }
 
@@ -4811,6 +5082,334 @@ mod tests {
         assert!(result.error.unwrap().contains("Unknown agent"));
     }
 
+    // ── ADR-014 Phase A1: delegation envelope ───────────────────────────
+
+    /// Assert a failed delegation is machine-readable both ways: the original
+    /// message survives, the tail names state/reason, and the structured data
+    /// agrees.
+    fn assert_failure_envelope(
+        result: &ToolResult,
+        original_fragment: &str,
+        state: &str,
+        reason: &str,
+        retryable: bool,
+    ) {
+        assert!(!result.success, "{result:?}");
+        let error = result.error.as_deref().expect("failure carries an error");
+        assert!(error.contains(original_fragment), "{error}");
+        assert!(
+            error.contains(&format!(
+                "[delegate state={state} reason={reason} retryable={}]",
+                if retryable { "yes" } else { "no" }
+            )),
+            "{error}"
+        );
+        assert!(
+            result.output.is_empty(),
+            "display text stays empty on failure"
+        );
+        let data = result
+            .output
+            .data()
+            .expect("structured envelope on failure");
+        assert_eq!(data["state"], state, "{data}");
+        assert_eq!(data["reason"], reason, "{data}");
+        assert_eq!(data["retryable"], retryable, "{data}");
+        assert_eq!(data["v"], 1);
+    }
+
+    #[tokio::test]
+    async fn sync_unknown_agent_is_rejected_with_a_reason() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let result = tool
+            .execute(json!({"agent": "nonexistent", "prompt": "test"}))
+            .await
+            .unwrap();
+        assert_failure_envelope(&result, "Unknown agent", "rejected", "unknown_agent", false);
+    }
+
+    #[tokio::test]
+    async fn sync_depth_limit_is_rejected_with_a_reason() {
+        let tool = DelegateTool::with_depth(sample_agents(), None, test_security(), 3);
+        let result = tool
+            .execute(json!({"agent": "researcher", "prompt": "test"}))
+            .await
+            .unwrap();
+        assert_failure_envelope(&result, "depth limit", "rejected", "depth_exceeded", false);
+    }
+
+    #[tokio::test]
+    async fn empty_prompt_is_an_invalid_request_not_a_failure() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let result = tool
+            .execute(json!({"agent": "researcher", "prompt": "   "}))
+            .await
+            .unwrap();
+        assert_failure_envelope(
+            &result,
+            "'prompt' parameter must not be empty",
+            "rejected",
+            "invalid_request",
+            false,
+        );
+    }
+
+    #[tokio::test]
+    async fn background_start_failure_is_rejected_with_a_reason() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let result = tool
+            .execute(json!({"agent": "nonexistent", "prompt": "x", "background": true}))
+            .await
+            .unwrap();
+        assert_failure_envelope(&result, "Unknown agent", "rejected", "unknown_agent", false);
+    }
+
+    #[tokio::test]
+    async fn parallel_leg_failure_is_labelled_per_agent() {
+        let tool = DelegateTool::with_depth(sample_agents(), None, test_security(), 3);
+        // Both legs pass admission (depth is only checked per leg at run time),
+        // so each fails inside the engine with its own reason.
+        let result = tool
+            .execute(json!({"parallel": ["researcher", "coder"], "prompt": "x"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let data = result.output.data().expect("parallel data");
+        let legs = data["results"].as_array().unwrap();
+        assert_eq!(legs.len(), 2, "{data}");
+        for leg in legs {
+            assert_eq!(leg["state"], "rejected", "{leg}");
+            assert_eq!(leg["reason"], "depth_exceeded", "{leg}");
+            assert_eq!(leg["execution"], "parallel");
+        }
+        assert!(
+            result
+                .output
+                .to_string()
+                .contains("[delegate state=rejected")
+        );
+    }
+
+    #[test]
+    fn prompt_composition_is_byte_identical_to_the_old_inline_form() {
+        assert_eq!(compose_prompt("do it", "", ""), "do it");
+        assert_eq!(
+            compose_prompt("do it", "ctx", ""),
+            "[Context]\nctx\n\n[Task]\ndo it"
+        );
+        assert_eq!(
+            compose_prompt("do it", "", "a table"),
+            "do it\n\n[Expected output]\na table"
+        );
+        assert_eq!(
+            compose_prompt("do it", "ctx", "a table"),
+            "[Context]\nctx\n\n[Task]\ndo it\n\n[Expected output]\na table"
+        );
+        assert_eq!(
+            expected_output_arg(&json!({"expected_output": "  x  "})),
+            "x"
+        );
+        assert_eq!(expected_output_arg(&json!({})), "");
+    }
+
+    #[test]
+    fn schema_advertises_expected_output_and_stays_closed() {
+        let schema = DelegateTool::new(sample_agents(), None, test_security()).parameters_schema();
+        assert_eq!(schema["properties"]["expected_output"]["type"], "string");
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    /// An older binary's view of a result file: only the pre-A1 fields.
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct LegacyBackgroundResult {
+        task_id: String,
+        agent: String,
+        status: BackgroundTaskStatus,
+        output: Option<String>,
+        error: Option<String>,
+        started_at: String,
+        finished_at: Option<String>,
+    }
+
+    #[test]
+    fn result_files_are_compatible_in_both_directions() {
+        // Old file -> new binary: no `meta` key at all.
+        let old = r#"{"task_id":"t1","agent":"lex","status":"completed","output":"[Agent 'lex' (p/m)]\nhi","error":null,"started_at":"2026-09-19T10:00:00Z","finished_at":"2026-09-19T10:00:01Z"}"#;
+        let parsed: BackgroundDelegateResult = serde_json::from_str(old).unwrap();
+        assert!(parsed.meta.is_none());
+
+        // New file -> old binary: the extra `meta` key is ignored, not an error.
+        let mut new = background_result(
+            "t2",
+            BackgroundTaskStatus::Failed,
+            None,
+            Some("Agent 'lex' timed out after 300s"),
+        );
+        new.meta = Some(BackgroundResultMeta {
+            reason: Some("timed_out".into()),
+            ..BackgroundResultMeta::default()
+        });
+        let json = serde_json::to_string(&new).unwrap();
+        assert!(json.contains("\"meta\""));
+        let legacy: LegacyBackgroundResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(legacy.status, BackgroundTaskStatus::Failed);
+
+        // A file with no meta writes no `meta` key (byte-stable for old readers).
+        let plain = serde_json::to_string(&background_result(
+            "t3",
+            BackgroundTaskStatus::Running,
+            None,
+            None,
+        ))
+        .unwrap();
+        assert!(!plain.contains("meta"));
+    }
+
+    fn file_envelope(result: &BackgroundDelegateResult) -> serde_json::Value {
+        DelegateTool::envelope_from_file(result, None).data()
+    }
+
+    #[test]
+    fn stored_running_task_is_working_with_a_hint() {
+        let env = file_envelope(&background_result(
+            "t",
+            BackgroundTaskStatus::Running,
+            None,
+            None,
+        ));
+        assert_eq!(env["state"], "working");
+        assert!(env["hint"].as_str().unwrap().contains("check_result"));
+    }
+
+    #[test]
+    fn stored_completed_task_strips_the_label_and_redacts_credentials() {
+        let output = "[Agent 'researcher' (p/m)]\nlead 3f2a9c1e-8b7d-4e0a-9c11-5d6f7a8b9c0d ok; key sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH";
+        let env = file_envelope(&background_result(
+            "t",
+            BackgroundTaskStatus::Completed,
+            Some(output),
+            None,
+        ));
+        assert_eq!(env["state"], "completed");
+        let summary = env["summary"].as_str().unwrap();
+        assert!(!summary.contains("[Agent '"));
+        assert!(
+            summary.contains("3f2a9c1e-8b7d-4e0a-9c11-5d6f7a8b9c0d"),
+            "ids stay verbatim"
+        );
+        assert!(
+            !summary.contains("abcdefghijklmnopqrstuvwxyz0123456789"),
+            "{summary}"
+        );
+        assert!(env["redactions"].as_u64().unwrap() >= 1);
+        assert_eq!(env["timing"]["duration_ms"], 1000);
+    }
+
+    #[test]
+    fn stored_failure_uses_the_recorded_reason_or_falls_back_to_tool_error() {
+        let mut failed = background_result(
+            "t",
+            BackgroundTaskStatus::Failed,
+            None,
+            Some("Agent 'researcher' timed out after 300s"),
+        );
+        failed.meta = Some(BackgroundResultMeta {
+            reason: Some("timed_out".into()),
+            ..BackgroundResultMeta::default()
+        });
+        let env = file_envelope(&failed);
+        assert_eq!(env["state"], "failed");
+        assert_eq!(env["reason"], "timed_out");
+        assert_eq!(env["retryable"], false);
+        assert!(env["hint"].as_str().unwrap().contains("narrow"));
+
+        // A file written before A1 has no meta: still a well-formed failure.
+        let legacy = background_result("t", BackgroundTaskStatus::Failed, None, Some("boom"));
+        let env = file_envelope(&legacy);
+        assert_eq!(env["state"], "failed");
+        assert_eq!(env["reason"], "tool_error");
+    }
+
+    #[test]
+    fn stored_input_required_exposes_the_approval_and_is_not_an_error() {
+        let mut parked = background_result(
+            "t",
+            BackgroundTaskStatus::InputRequired,
+            Some("[Agent 'researcher' (p/m)]\nI created the draft and parked the send"),
+            Some("Waiting on approval pa_9 for tool send_email"),
+        );
+        parked.meta = Some(BackgroundResultMeta {
+            reason: Some("approval_pending".into()),
+            approval_id: Some("pa_9".into()),
+            approval_tool: Some("send_email".into()),
+        });
+        let env = file_envelope(&parked);
+        assert_eq!(env["state"], "input_required");
+        assert_eq!(env["reason"], "approval_pending");
+        assert_eq!(env["approval"]["pending_id"], "pa_9");
+        assert_eq!(env["approval"]["tool"], "send_email");
+        assert!(env["hint"].as_str().unwrap().contains("do not retry"));
+        assert!(env["summary"].as_str().unwrap().contains("parked the send"));
+    }
+
+    #[test]
+    fn stored_cancelled_task_is_canceled() {
+        let env = file_envelope(&background_result(
+            "t",
+            BackgroundTaskStatus::Cancelled,
+            None,
+            Some("Cancelled by parent session"),
+        ));
+        assert_eq!(env["state"], "canceled");
+        assert_eq!(env["reason"], "cancelled");
+    }
+
+    #[test]
+    fn reaper_verdicts_win_over_a_stale_running_file() {
+        let running = background_result("t", BackgroundTaskStatus::Running, None, None);
+        let lost = DelegateTool::envelope_from_file(&running, Some(DelegateReason::Lost)).data();
+        assert_eq!(lost["state"], "failed");
+        assert_eq!(lost["reason"], "lost");
+        assert_eq!(lost["retryable"], true);
+        let timed_out =
+            DelegateTool::envelope_from_file(&running, Some(DelegateReason::TimedOut)).data();
+        assert_eq!(timed_out["reason"], "timed_out");
+    }
+
+    #[tokio::test]
+    async fn check_result_carries_the_envelope_for_a_failed_task() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_envelope_check_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let task_id = uuid::Uuid::new_v4().to_string();
+        write_background_result(&workspace, &{
+            let mut r = background_result(
+                &task_id,
+                BackgroundTaskStatus::Failed,
+                None,
+                Some("Agent 'researcher' timed out after 300s"),
+            );
+            r.meta = Some(BackgroundResultMeta {
+                reason: Some("timed_out".into()),
+                ..BackgroundResultMeta::default()
+            });
+            r
+        });
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let check = tool
+            .execute(json!({"action": "check_result", "task_id": task_id}))
+            .await
+            .unwrap();
+        assert!(!check.success);
+        let view: serde_json::Value = serde_json::from_str(&check.output.to_string()).unwrap();
+        assert_eq!(view["status"], "failed", "existing fields are unchanged");
+        assert_eq!(view["envelope"]["reason"], "timed_out");
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
     #[tokio::test]
     async fn depth_limit_enforced() {
         let tool = DelegateTool::with_depth(sample_agents(), None, test_security(), 3);
@@ -5958,6 +6557,20 @@ mod tests {
         assert!(result.success, "parallel delegate failed: {result:?}");
         assert!(result.output.contains("reviewer-ok"), "{result:?}");
         assert!(result.output.contains("sysadmin-ok"), "{result:?}");
+
+        // ADR-014 A1: each fan-out leg is an envelope in the structured data.
+        let data = result
+            .output
+            .data()
+            .expect("parallel result carries structured data");
+        assert_eq!(data["execution"], "parallel");
+        let legs = data["results"].as_array().expect("results array");
+        assert_eq!(legs.len(), 2, "{data}");
+        assert!(
+            legs.iter()
+                .all(|leg| leg["state"] == "completed" && leg["untrusted"] == true),
+            "{data}"
+        );
     }
 
     #[tokio::test]
@@ -6080,6 +6693,22 @@ mod tests {
             "{bg_result:?}"
         );
         assert!(bg_result.error.is_none(), "{bg_result:?}");
+
+        // ADR-014 A1: the start result carries a `working` envelope, and
+        // check_result renders the finished one without the agent label.
+        assert_eq!(
+            result.output.data().expect("start envelope")["state"],
+            "working"
+        );
+        let check = tool
+            .execute(json!({"action": "check_result", "task_id": task_id}))
+            .await
+            .unwrap();
+        let view: serde_json::Value = serde_json::from_str(&check.output.to_string()).unwrap();
+        assert_eq!(view["envelope"]["state"], "completed", "{view}");
+        let summary = view["envelope"]["summary"].as_str().unwrap();
+        assert!(summary.contains("background-ok"));
+        assert!(!summary.contains("[Agent '"), "label line must be stripped");
     }
 
     #[tokio::test]
