@@ -1331,7 +1331,41 @@ impl DelegateTool {
             .await
     }
 
+    /// Synchronous delegation under the target's tenant overlay.
+    ///
+    /// The sub-turn runs inline on the caller's task, so without this it kept
+    /// the CALLER's `agent_type` (e.g. `chief_of_staff`): task-ledger rows,
+    /// pending-approval rows, write-velocity budgets and per-agent-type MCP /
+    /// skill grants were all attributed to the coordinator instead of the
+    /// specialist doing the work (the dashboard matches rows by exact
+    /// `agent_type`). The background and parallel paths already relabel via
+    /// [`DelegateAmbient`]; this makes the sync path (the default) agree.
+    /// Idempotent when an outer scope already applied the same overlay.
     async fn execute_sync_with_admission(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        args: &serde_json::Value,
+        admission: DelegateAdmission,
+    ) -> anyhow::Result<ToolResult> {
+        match crate::agent::tenant::current_tenant() {
+            Some(parent) => {
+                let overlay = delegate_tenant_overlay(parent, agent_name.trim());
+                crate::agent::tenant::TENANT_CONTEXT
+                    .scope(
+                        Some(overlay),
+                        self.execute_sync_with_admission_inner(agent_name, prompt, args, admission),
+                    )
+                    .await
+            }
+            None => {
+                self.execute_sync_with_admission_inner(agent_name, prompt, args, admission)
+                    .await
+            }
+        }
+    }
+
+    async fn execute_sync_with_admission_inner(
         &self,
         agent_name: &str,
         prompt: &str,
@@ -3081,7 +3115,7 @@ mod tests {
     use zeroclaw_memory::{AgentScopedMemory, SqliteMemory};
     use zeroclaw_providers::{ChatRequest, ChatResponse, ToolCall};
 
-    zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool, CountingEchoTool);
+    zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool, CountingEchoTool, TenantProbeTool);
 
     #[tokio::test]
     async fn reconciled_loss_label_surfaces_registry_truth() {
@@ -5116,6 +5150,134 @@ mod tests {
         // Outside the scope nothing leaks.
         assert!(crate::agent::tenant::current_tenant().is_none());
         assert!(crate::approval::current_delegation_approval().is_none());
+    }
+
+    /// Records the tenant identity visible to it at execution time, so a test
+    /// can see WHICH tenant overlay a delegate sub-turn actually ran under.
+    struct TenantProbeTool(Arc<parking_lot::Mutex<Vec<Option<(String, String)>>>>);
+
+    #[async_trait]
+    impl Tool for TenantProbeTool {
+        fn name(&self) -> &str {
+            "tenant_probe"
+        }
+        fn description(&self) -> &str {
+            "Records the current tenant overlay."
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.0.lock().push(
+                crate::agent::tenant::current_tenant()
+                    .map(|t| (t.tenant_id.clone(), t.agent_type.clone())),
+            );
+            Ok(ToolResult {
+                success: true,
+                output: "probed".to_string().into(),
+                error: None,
+            })
+        }
+    }
+
+    /// A chat server that makes the delegate's model call `tenant_probe` once,
+    /// then finish.
+    async fn start_tenant_probe_chat_server() -> LocalChatServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let responses = vec![
+            chat_completion_tool_call("tenant_probe", "call_probe", serde_json::json!({})),
+            serde_json::json!({"choices": [{"message": {"content": "probe done"}}]}),
+        ];
+        let task = zeroclaw_spawn::spawn!(async move {
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _request = read_http_request(&mut socket).await;
+                write_json_response(&mut socket, response).await;
+            }
+        });
+        LocalChatServer { uri, _task: task }
+    }
+
+    /// Run one SYNC delegate hop to `target` from `caller_tenant` and return the
+    /// tenant identity the target's tool saw.
+    async fn sync_delegate_probe(
+        target: &str,
+        caller_tenant: Option<Arc<crate::agent::tenant::TenantContext>>,
+    ) -> Vec<Option<(String, String)>> {
+        let server = start_tenant_probe_chat_server().await;
+        let fixture =
+            delegate_memory_fixture_with_agents(Some(server.uri.clone()), &[target]).await;
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        // Bounded delegation caps the target's tools by the CALLER's policy, so
+        // the shared `agentic_test` risk profile (used by both caller and
+        // target) must admit the probe.
+        let mut config = (**fixture.tool.root_config.as_ref().expect("root config")).clone();
+        config
+            .risk_profiles
+            .get_mut("agentic_test")
+            .unwrap()
+            .allowed_tools
+            .push("tenant_probe".to_string());
+        let config = Arc::new(config);
+        let caller_security = Arc::new(SecurityPolicy::for_agent(&config, "caller").unwrap());
+        let tool = DelegateTool::new(config.agents.clone(), None, caller_security)
+            .with_root_config(Arc::clone(&config))
+            .with_workspace_dir(fixture.workspace_dir.clone())
+            .with_providers_models(fixture.tool.providers_models.as_ref().clone())
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_caller_alias("caller")
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(TenantProbeTool(
+                Arc::clone(&seen),
+            ))])));
+
+        let result = crate::agent::tenant::TENANT_CONTEXT
+            .scope(caller_tenant, async {
+                tool.execute(serde_json::json!({"agent": target, "prompt": "probe"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
+        assert!(result.success, "sync delegate hop failed: {result:?}");
+        let recorded = seen.lock().clone();
+        recorded
+    }
+
+    #[tokio::test]
+    async fn sync_delegate_runs_under_the_target_specialists_tenant_overlay() {
+        // The sub-turn must be attributed to the specialist doing the work, with
+        // the parental tenant_id kept for principal continuity.
+        let seen =
+            sync_delegate_probe("leads_qualifier", tenant_ctx("user1", "chief_of_staff")).await;
+        assert_eq!(
+            seen,
+            vec![Some((
+                "user1.chief_of_staff".to_string(),
+                "leads_qualifier".to_string()
+            ))],
+            "agent_type must be relabelled to the target on the sync path"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_delegate_to_a_host_brain_keeps_the_parent_overlay() {
+        let seen =
+            sync_delegate_probe("analyst_brain", tenant_ctx("user1", "chief_of_staff")).await;
+        assert_eq!(
+            seen,
+            vec![Some((
+                "user1.chief_of_staff".to_string(),
+                "chief_of_staff".to_string()
+            ))],
+            "host-brain targets have no per-user identity: parent overlay unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_delegate_without_a_tenant_stays_tenantless() {
+        let seen = sync_delegate_probe("leads_qualifier", None).await;
+        assert_eq!(seen, vec![None], "vanilla path must not invent a tenant");
     }
 
     #[tokio::test]
