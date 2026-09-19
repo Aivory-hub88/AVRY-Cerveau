@@ -82,13 +82,49 @@ impl Tool for McpToolWrapper {
                 output: output.into(),
                 error: None,
             }),
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(e.to_string()),
-            }),
+            Err(e) => {
+                let error = render_call_error(&e);
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "tool": self.prefixed_name,
+                            "error": &error,
+                        })),
+                    "mcp_tool: MCP tool call failed"
+                );
+                Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(error),
+                })
+            }
         }
     }
+}
+
+/// Model-facing text for a failed MCP call.
+///
+/// `anyhow::Error::to_string()` prints only the OUTERMOST context, so a
+/// transport failure surfaced as the useless "MCP server `x` error during tool
+/// call `y`" -- the cause (HTTP status, refused connection, bad body) sat in the
+/// error chain and never reached the model. In production one tool failed 102
+/// times across 37 turns and the agent could not tell "bad thread id" from
+/// "upstream is down", so it just retried with new arguments.
+///
+/// This renders the whole chain (`{:#}`), redacts URLs (they carry internal
+/// hosts and the tenant-scoping query parameter), scrubs credentials, and
+/// bounds the length via `sanitize_api_error`.
+pub(crate) fn render_call_error(error: &anyhow::Error) -> String {
+    zeroclaw_providers::sanitize_api_error(&redact_urls(&format!("{error:#}")))
+}
+
+fn redact_urls(text: &str) -> String {
+    static URL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    URL.get_or_init(|| regex::Regex::new(r#"https?://[^\s'")\]>]+"#).expect("url regex compiles"))
+        .replace_all(text, "<url>")
+        .into_owned()
 }
 
 #[cfg(test)]
@@ -262,5 +298,64 @@ mod tests {
                 .expect("non-object args must not propagate Err");
             assert!(!result.success, "expected non-fatal failure for {non_obj}");
         }
+    }
+}
+
+#[cfg(test)]
+mod call_error_tests {
+    use super::*;
+
+    #[test]
+    fn transport_cause_reaches_the_model_not_just_the_outer_context() {
+        let error = anyhow::anyhow!("HTTP 502 Bad Gateway: upstream connect error")
+            .context("MCP server `tenant_aivory-mail` error during tool call `get_thread_memory`");
+        // What the tool used to say:
+        assert_eq!(
+            error.to_string(),
+            "MCP server `tenant_aivory-mail` error during tool call `get_thread_memory`"
+        );
+        // What the model now sees:
+        let rendered = render_call_error(&error);
+        assert!(
+            rendered.contains("error during tool call `get_thread_memory`"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("HTTP 502 Bad Gateway"),
+            "cause missing: {rendered}"
+        );
+    }
+
+    #[test]
+    fn internal_urls_and_tenant_query_params_are_redacted() {
+        let error = anyhow::anyhow!(
+            "error sending request for url (http://127.0.0.1:4100/mcp/leads?tenant_id=user_42): \
+             connection refused"
+        )
+        .context("MCP server `native` error during tool call `list_leads`");
+        let rendered = render_call_error(&error);
+        assert!(rendered.contains("connection refused"), "{rendered}");
+        assert!(
+            !rendered.contains("127.0.0.1"),
+            "internal host leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("tenant_id"),
+            "tenant param leaked: {rendered}"
+        );
+        assert!(rendered.contains("<url>"), "{rendered}");
+    }
+
+    #[test]
+    fn credentials_are_scrubbed_and_length_is_bounded() {
+        let secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789";
+        let error = anyhow::anyhow!("{} {}", "x".repeat(2000), secret).context("call failed");
+        let rendered = render_call_error(&error);
+        assert!(!rendered.contains(secret), "secret leaked: {rendered}");
+        assert!(
+            rendered.chars().count() <= 503,
+            "unbounded ({} chars)",
+            rendered.chars().count()
+        );
     }
 }
