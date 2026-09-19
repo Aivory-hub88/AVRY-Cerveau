@@ -382,6 +382,29 @@ pub async fn render_memory_context(
     context
 }
 
+/// Fold knowledge-graph context into a rendered `[Memory context]` block.
+///
+/// The graph line goes *inside* the same open/close tags as recalled memories
+/// (creating the block when nothing else was recalled), so everything that keys
+/// on those tags -- the model-switch idempotence check, stripping the preamble
+/// from stored history -- treats it exactly like ordinary recalled memory.
+/// `None`/blank graph context returns `context` untouched.
+#[must_use]
+pub fn with_graph_knowledge(context: String, graph: Option<&str>) -> String {
+    let Some(graph) = graph.map(str::trim).filter(|g| !g.is_empty()) else {
+        return context;
+    };
+    let line = format!("- graph_knowledge: {graph}\n");
+    match context.rfind(MEMORY_CONTEXT_CLOSE) {
+        Some(close_at) => {
+            let mut merged = context;
+            merged.insert_str(close_at, &line);
+            merged
+        }
+        None => format!("{MEMORY_CONTEXT_OPEN}\n{line}{MEMORY_CONTEXT_CLOSE}\n\n{context}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1824,5 +1847,46 @@ mod tests {
             .find("- supporting_match: ")
             .expect("the weaker relevant entry survives the configured floor");
         assert!(best < supporting, "BM25 relevance order survives blending");
+    }
+}
+
+#[cfg(test)]
+mod graph_knowledge_tests {
+    use super::*;
+
+    #[test]
+    fn graph_context_joins_an_existing_block_inside_its_tags() {
+        let ctx = format!("{MEMORY_CONTEXT_OPEN}\n- core_1: likes tea\n{MEMORY_CONTEXT_CLOSE}\n\n");
+        let merged = with_graph_knowledge(ctx, Some("Bu Sari is the contact"));
+        assert_eq!(
+            merged,
+            format!(
+                "{MEMORY_CONTEXT_OPEN}\n- core_1: likes tea\n- graph_knowledge: Bu Sari is the contact\n{MEMORY_CONTEXT_CLOSE}\n\n"
+            )
+        );
+        assert!(
+            merged.starts_with(MEMORY_CONTEXT_OPEN),
+            "idempotence check keys on the prefix"
+        );
+        assert_eq!(merged.matches(MEMORY_CONTEXT_CLOSE).count(), 1);
+    }
+
+    #[test]
+    fn graph_context_creates_the_block_when_nothing_else_was_recalled() {
+        let merged = with_graph_knowledge(String::new(), Some("  Toko Melati, Rp 50 juta  "));
+        assert_eq!(
+            merged,
+            format!(
+                "{MEMORY_CONTEXT_OPEN}\n- graph_knowledge: Toko Melati, Rp 50 juta\n{MEMORY_CONTEXT_CLOSE}\n\n"
+            )
+        );
+    }
+
+    #[test]
+    fn absent_or_blank_graph_context_is_a_no_op() {
+        let ctx = format!("{MEMORY_CONTEXT_OPEN}\n- k: v\n{MEMORY_CONTEXT_CLOSE}\n\n");
+        assert_eq!(with_graph_knowledge(ctx.clone(), None), ctx);
+        assert_eq!(with_graph_knowledge(ctx.clone(), Some("   ")), ctx);
+        assert_eq!(with_graph_knowledge(String::new(), None), "");
     }
 }

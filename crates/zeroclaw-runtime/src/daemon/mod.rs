@@ -356,6 +356,12 @@ pub async fn run(
         .await;
     }
 
+    // Build the knowledge-graph HTTP client now so the first tenant turn's
+    // auto-recall does not pay for it inside its time budget.
+    if config.cognee.enabled {
+        tokio::task::spawn_blocking(zeroclaw_tools::graph_memory::warm_client);
+    }
+
     crate::agent::pricing_catalog::load_global_pricing_catalog(&config.data_dir);
 
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];

@@ -7837,10 +7837,46 @@ pub struct CogneeConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub internal_secret: Option<String>,
+    /// Mirror the durable facts post-turn consolidation distills from tenant
+    /// turns into that tenant's knowledge graph automatically, instead of
+    /// relying on the model to choose `graph_remember`. Each fact is `add`ed at
+    /// once; graph extraction (`cognify`, an LLM pipeline) is debounced per
+    /// tenant. Requires `enabled`. Default off.
+    #[serde(default)]
+    pub auto_ingest: bool,
+    /// Seconds to wait after the last ingested fact before running `cognify`
+    /// for a tenant, so a burst of facts costs one extraction, not many.
+    #[serde(default = "default_cognee_ingest_debounce_secs")]
+    pub ingest_debounce_secs: u64,
+    /// Inject fast graph summaries into every tenant turn's `[Memory context]`,
+    /// so agents use the graph without having to call `graph_recall`. Runs in
+    /// parallel with the normal memory recall and fails open. Requires
+    /// `enabled`. Default off.
+    #[serde(default)]
+    pub auto_recall: bool,
+    /// Hard time budget for the auto-recall search; past it the turn proceeds
+    /// without graph context.
+    #[serde(default = "default_cognee_recall_timeout_ms")]
+    pub recall_timeout_ms: u64,
+    /// Cap on the characters of graph context injected per turn.
+    #[serde(default = "default_cognee_recall_max_chars")]
+    pub recall_max_chars: usize,
 }
 
 fn default_cognee_base_url() -> String {
     "http://127.0.0.1:3200".into()
+}
+
+fn default_cognee_ingest_debounce_secs() -> u64 {
+    90
+}
+
+fn default_cognee_recall_timeout_ms() -> u64 {
+    1500
+}
+
+fn default_cognee_recall_max_chars() -> usize {
+    1200
 }
 
 impl Default for CogneeConfig {
@@ -7849,6 +7885,11 @@ impl Default for CogneeConfig {
             enabled: false,
             base_url: default_cognee_base_url(),
             internal_secret: None,
+            auto_ingest: false,
+            ingest_debounce_secs: default_cognee_ingest_debounce_secs(),
+            auto_recall: false,
+            recall_timeout_ms: default_cognee_recall_timeout_ms(),
+            recall_max_chars: default_cognee_recall_max_chars(),
         }
     }
 }

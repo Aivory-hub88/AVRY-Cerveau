@@ -3475,8 +3475,12 @@ async fn process_message_impl(
             let model_bg = model_name.clone();
             let user_bg = effective_message.clone();
             let reply_bg = assistant_reply.clone();
+            // Captured here: `spawn` drops task-locals, and the graph mirror
+            // below needs the tenant identity (already validated by the gateway).
+            let cognee_bg = config.cognee.clone();
+            let tenant_bg = crate::agent::tenant::current_tenant();
             zeroclaw_spawn::spawn!(async move {
-                if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
+                match zeroclaw_memory::consolidation::consolidate_turn_extract(
                     provider_bg.as_ref(),
                     &model_bg,
                     effective_temperature,
@@ -3487,13 +3491,32 @@ async fn process_message_impl(
                 )
                 .await
                 {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    Ok(durable) => {
+                        // Persist what the turn distilled into the tenant's graph
+                        // too, so the graph fills without the model having to
+                        // choose `graph_remember`. No-op unless `[cognee]
+                        // auto_ingest` is on.
+                        if let (Some(fact), Some(tenant)) = (durable, tenant_bg) {
+                            crate::agent::graph_sync::enqueue_ingest(
+                                &cognee_bg,
+                                &tenant.platform_user_id,
+                                &tenant.agent_type,
+                                &fact,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({"error": format!("{e}")})),
-                        "cerveau: background turn consolidation failed"
-                    );
+                            "cerveau: background turn consolidation failed"
+                        );
+                    }
                 }
             });
         }
@@ -5971,6 +5994,146 @@ mod tests {
         fn alias(&self) -> &str {
             "StaticRecallMemory"
         }
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_injects_graph_knowledge_for_opted_in_tenant_turns() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let sidecar = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/search"))
+            .and(header("X-Tenant-Id", "user1"))
+            .and(header("X-Agent-Type", "leads_qualifier"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"searchResult": [{"payload": {"text": "Toko Melati: Rp 50 juta, contact Bu Sari."}}]}
+            ])))
+            .mount(&sidecar)
+            .await;
+
+        async fn user_message_after_turn(
+            cognee: zeroclaw_config::schema::CogneeConfig,
+            tenant: Option<Arc<crate::agent::tenant::TenantContext>>,
+        ) -> String {
+            let config = zeroclaw_config::schema::Config {
+                cognee,
+                ..zeroclaw_config::schema::Config::default()
+            };
+            let model_provider = ScriptedModelProvider::from_text_responses(vec!["done"]);
+            let mut history = vec![ChatMessage::user("what about Toko Melati?".to_string())];
+            let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+            let observer = RecallCountingObserver::default();
+            let turn_id = uuid::Uuid::new_v4().to_string();
+            let mem = StaticRecallMemory;
+
+            crate::agent::tenant::TENANT_CONTEXT
+                .scope(tenant, async {
+                    run_tool_call_loop(ToolLoop {
+                        parent_agent_alias: None,
+                        sop_reassembly: None,
+                        exec: ResolvedAgentExecution {
+                            model_access: ResolvedModelAccess {
+                                model_provider: &model_provider,
+                                provider_name: "scripted",
+                                model: "scripted-model",
+                                temperature: Some(0.0),
+                            },
+                            tools_registry: &tools_registry,
+                            observer: &observer,
+                            silent: true,
+                            approval: None,
+                            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                            config: Some(&config),
+                            max_tool_iterations: 3,
+                            hooks: None,
+                            excluded_tools: &[],
+                            dedup_exempt_tools: &[],
+                            activated_tools: None,
+                            model_switch_callback: None,
+                            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                            strict_tool_parsing: false,
+                            parallel_tools: false,
+                            max_tool_result_chars: 0,
+                            context_token_budget: 0,
+                            receipt_generator: None,
+                            knobs: &LoopKnobs::default(),
+                        },
+                        history: &mut history,
+                        channel_name: "cli",
+                        channel_reply_target: None,
+                        cancellation_token: None,
+                        on_delta: None,
+                        shared_budget: None,
+                        channel: None,
+                        collected_receipts: None,
+                        event_tx: None,
+                        steering: None,
+                        new_messages_out: None,
+                        image_cache: None,
+                        memory: Some(crate::agent::memory_inject::TurnMemory {
+                            handle: &mem,
+                            query: "what about Toko Melati?".to_string(),
+                            sessions: vec![Some("session-1".to_string())],
+                            suppress: false,
+                            cfg: crate::agent::memory_inject::MemoryInjectConfig::default(),
+                        }),
+                        ingress: IngressContext::from_origin(
+                            zeroclaw_api::ingress::TurnOrigin::Interactive,
+                        ),
+                        agent_alias: None,
+                        turn_id: &turn_id,
+                    })
+                    .await
+                    .expect("turn should complete")
+                })
+                .await;
+            history
+                .iter()
+                .find(|m| m.role == "user")
+                .map(|m| m.content.clone())
+                .unwrap_or_default()
+        }
+
+        let tenant = || {
+            Some(Arc::new(crate::agent::tenant::TenantContext {
+                tenant_id: "user1.leads_qualifier".into(),
+                platform_user_id: "user1".into(),
+                agent_type: "leads_qualifier".into(),
+                persona: None,
+                connected_toolkits: Vec::new(),
+                disabled_toolkits: Vec::new(),
+                tenant_custom_mcp_servers: Vec::new(),
+            }))
+        };
+        let cognee = |auto_recall: bool, base_url: String| zeroclaw_config::schema::CogneeConfig {
+            enabled: true,
+            auto_recall,
+            base_url,
+            ..zeroclaw_config::schema::CogneeConfig::default()
+        };
+
+        // Opted in + tenant turn: graph line is INSIDE the memory block, before the question.
+        let msg = user_message_after_turn(cognee(true, sidecar.uri()), tenant()).await;
+        assert!(msg.starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN), "{msg}");
+        assert!(
+            msg.contains("- graph_knowledge: Toko Melati: Rp 50 juta, contact Bu Sari."),
+            "{msg}"
+        );
+        let close = msg.find(zeroclaw_memory::MEMORY_CONTEXT_CLOSE).expect("close tag");
+        assert!(msg.find("graph_knowledge").unwrap() < close, "graph line inside the tags");
+        assert!(msg.ends_with("what about Toko Melati?"), "{msg}");
+
+        // Not opted in: never touches the graph.
+        let msg = user_message_after_turn(cognee(false, sidecar.uri()), tenant()).await;
+        assert!(!msg.contains("graph_knowledge"), "{msg}");
+        // No tenant identity: nothing to scope a graph read to.
+        let msg = user_message_after_turn(cognee(true, sidecar.uri()), None).await;
+        assert!(!msg.contains("graph_knowledge"), "{msg}");
+        // Sidecar down: the turn still completes with its ordinary memory context.
+        let msg = user_message_after_turn(cognee(true, "http://127.0.0.1:1".into()), tenant()).await;
+        assert!(!msg.contains("graph_knowledge"), "{msg}");
+        assert!(msg.starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN), "{msg}");
     }
 
     #[tokio::test]

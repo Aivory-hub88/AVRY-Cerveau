@@ -381,21 +381,48 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         {
             let scopes: Vec<Option<&str>> =
                 turn_memory.sessions.iter().map(|s| s.as_deref()).collect();
-            let context = crate::agent::memory_inject::render_memory_context(
-                turn_memory.handle,
-                observer,
-                &turn_memory.query,
-                &scopes,
-                &turn_memory.cfg,
-                exclude_conversation,
-                TurnMeta {
-                    agent_alias,
-                    parent_agent_alias,
-                    turn_id,
-                    channel_name,
-                },
-            )
-            .await;
+            // Knowledge-graph context runs concurrently with the ordinary
+            // recall (bounded by `[cognee].recall_timeout_ms`, fails open), so
+            // it adds at most the slower of the two, never their sum. Only for
+            // tenant turns, and only when the operator opted in.
+            let graph_recall = async {
+                match (
+                    config.map(|c| &c.cognee),
+                    crate::agent::tenant::current_tenant(),
+                ) {
+                    (Some(cognee), Some(tenant)) if cognee.enabled && cognee.auto_recall => {
+                        zeroclaw_tools::graph_memory::recall_context(
+                            cognee,
+                            &tenant.platform_user_id,
+                            &tenant.agent_type,
+                            &turn_memory.query,
+                        )
+                        .await
+                    }
+                    _ => None,
+                }
+            };
+            let (context, graph_context) = tokio::join!(
+                crate::agent::memory_inject::render_memory_context(
+                    turn_memory.handle,
+                    observer,
+                    &turn_memory.query,
+                    &scopes,
+                    &turn_memory.cfg,
+                    exclude_conversation,
+                    TurnMeta {
+                        agent_alias,
+                        parent_agent_alias,
+                        turn_id,
+                        channel_name,
+                    },
+                ),
+                graph_recall,
+            );
+            let context = crate::agent::memory_inject::with_graph_knowledge(
+                context,
+                graph_context.as_deref(),
+            );
             if !context.is_empty() {
                 let existing = &turn_state.history[last_user_idx].content;
                 turn_state.history[last_user_idx].content = format!("{context}{existing}");

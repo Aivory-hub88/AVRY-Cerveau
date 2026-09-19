@@ -74,6 +74,35 @@ pub async fn consolidate_turn(
     user_message: &str,
     assistant_response: &str,
 ) -> anyhow::Result<()> {
+    consolidate_turn_extract(
+        model_provider,
+        model,
+        temperature,
+        memory,
+        memory_config,
+        user_message,
+        assistant_response,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// [`consolidate_turn`], additionally returning the durable `memory_update` the
+/// turn distilled (`None` when nothing new was learned).
+///
+/// The update is returned on **every** successful path, including when it was
+/// dropped as a near-duplicate of an existing Core memory: "already in Core
+/// memory" says nothing about whether it reached the knowledge graph, and the
+/// graph's own ingestion de-duplicates identical content.
+pub async fn consolidate_turn_extract(
+    model_provider: &dyn ModelProvider,
+    model: &str,
+    temperature: Option<f64>,
+    memory: &dyn Memory,
+    memory_config: &MemoryConfig,
+    user_message: &str,
+    assistant_response: &str,
+) -> anyhow::Result<Option<String>> {
     let turn_text = format!(
         "User: {}\nAssistant: {}",
         strip_media_markers(user_message),
@@ -108,6 +137,12 @@ pub async fn consolidate_turn(
         .await?;
 
     let result: ConsolidationResult = parse_consolidation_response(&raw, &turn_text);
+    let durable: Option<String> = result
+        .memory_update
+        .as_deref()
+        .map(str::trim)
+        .filter(|update| !update.is_empty())
+        .map(str::to_string);
 
     // Phase 1: Write history entry to Daily category. The gated arm tags the
     // write Episodic; the default arm keeps the exact legacy store call so the
@@ -190,7 +225,7 @@ pub async fn consolidate_turn(
                         .with_attrs(::serde_json::json!({"duplicate_of": dup_of})),
                     "memory consolidation skipped duplicate core update"
                 );
-                return Ok(());
+                return Ok(durable);
             }
             DedupAction::Merge { into } => {
                 if let Some(survivor) = candidates.iter().find(|entry| entry.id == into) {
@@ -216,7 +251,7 @@ pub async fn consolidate_turn(
                             options,
                         )
                         .await?;
-                    return Ok(());
+                    return Ok(durable);
                 }
             }
         }
@@ -270,7 +305,7 @@ pub async fn consolidate_turn(
         }
     }
 
-    Ok(())
+    Ok(durable)
 }
 
 /// Store atomic facts extracted from a turn as individual Core memories,
@@ -758,6 +793,47 @@ mod tests {
             "We use a staged rollout.",
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn consolidate_turn_extract_returns_the_durable_update() {
+        let provider = ScriptedProvider::new(TYPED_RESPONSE);
+        let memory = RecordingMemory::default();
+        let durable = consolidate_turn_extract(
+            &provider,
+            "test-model",
+            None,
+            &memory,
+            &MemoryConfig::default(),
+            "How do we deploy?",
+            "We use a staged rollout.",
+        )
+        .await
+        .unwrap();
+        assert_eq!(durable.as_deref(), Some("Use staged rollout for deploys."));
+    }
+
+    #[tokio::test]
+    async fn consolidate_turn_extract_returns_none_when_nothing_was_learned() {
+        for response in [
+            r#"{"history_entry": "Small talk.", "memory_update": null}"#,
+            r#"{"history_entry": "Small talk.", "memory_update": "   "}"#,
+        ] {
+            let provider = ScriptedProvider::new(response);
+            let memory = RecordingMemory::default();
+            let durable = consolidate_turn_extract(
+                &provider,
+                "test-model",
+                None,
+                &memory,
+                &MemoryConfig::default(),
+                "hi",
+                "hello",
+            )
+            .await
+            .unwrap();
+            assert!(durable.is_none(), "{response}");
+        }
     }
 
     #[tokio::test]
