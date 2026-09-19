@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use crate::approval::ApprovalManager;
 use crate::observability::{Observer, ObserverEvent};
 use crate::tools::{ActivatedToolSet, Tool};
 use tokio::sync::mpsc::Sender;
@@ -753,80 +752,132 @@ pub(crate) async fn execute_one_tool(
     outcome
 }
 
-// ── Parallel / sequential decision ───────────────────────────────────────
+// ── Parallel / sequential planning ───────────────────────────────────────
 
-/// Argument keys that, across the tool registry, carry a filesystem path
-/// (see `file_write`, `file_edit`, `file_download`, `file_upload`). Kept as
-/// a flat list rather than per-tool metadata — this is a conservative,
-/// best-effort heuristic, not a full dependency analysis.
-const PATH_ARG_KEYS: &[&str] = &["path", "file_path", "dest_path"];
+/// Built-in tools that only READ and share no mutable session state, so a batch
+/// may run them concurrently with each other. Everything not named here (and not
+/// declared by the operator in `[tool_concurrency].parallel_safe`) is a barrier.
+///
+/// `tool_search` is deliberately absent: it activates deferred MCP tools, and
+/// running it beside the tools it activates races the lookup against activation.
+/// `delegate` is absent too: a sub-agent may write, and two of them may touch
+/// the same records (an operator who wants model-emitted parallel delegation
+/// declares it).
+const PARALLEL_SAFE_BUILTINS: &[&str] = &[
+    "calculator",
+    "content_search",
+    "file_read",
+    "glob_search",
+    "graph_recall",
+    "memory_recall",
+    "read_skill",
+    "session_search",
+    "task_list",
+    "web_fetch",
+    "web_search_tool",
+];
 
-/// Extract every path-shaped string argument from a single tool call.
-/// Missing keys or non-string values are simply skipped — a tool call with
-/// no path arguments contributes nothing to the overlap check.
-fn path_args_of(call: &ParsedToolCall) -> Vec<&str> {
-    let Some(obj) = call.arguments.as_object() else {
-        return Vec::new();
-    };
-    PATH_ARG_KEYS
-        .iter()
-        .filter_map(|key| obj.get(*key).and_then(|v| v.as_str()))
-        .collect()
+/// Decides which calls of a batch may run concurrently. Deny-by-default: a call
+/// is parallel-safe only if it is a known read-only built-in or the operator
+/// declared it read-only.
+pub(crate) struct ParallelSafety<'a> {
+    declared: Option<&'a zeroclaw_config::schema::ToolConcurrencyConfig>,
 }
 
-/// Conservative check: does this batch contain two or more tool calls that
-/// reference the same path argument value (plain string comparison, no
-/// canonicalization)? If so, they may race on the same file/resource and
-/// must not be dispatched concurrently.
-///
-/// This mirrors Hermes Agent's `_plan_tool_batch_segments`, scaled down to
-/// this codebase's existing "heuristic, not a dependency graph" style.
-fn batch_has_path_overlap(tool_calls: &[ParsedToolCall]) -> bool {
-    let mut seen: Vec<&str> = Vec::new();
-    for call in tool_calls {
-        for path in path_args_of(call) {
-            if seen.contains(&path) {
-                return true;
-            }
-            seen.push(path);
+impl<'a> ParallelSafety<'a> {
+    pub(crate) fn new(
+        declared: Option<&'a zeroclaw_config::schema::ToolConcurrencyConfig>,
+    ) -> Self {
+        Self { declared }
+    }
+
+    fn is_safe(&self, call: &ParsedToolCall) -> bool {
+        // A call whose arguments did not parse will fail on its own; it must not
+        // be scheduled beside anything.
+        if call.arguments_parse_error.is_some() {
+            return false;
+        }
+        PARALLEL_SAFE_BUILTINS.contains(&call.name.as_str())
+            || self
+                .declared
+                .is_some_and(|declared| declared.declares_parallel_safe(&call.name))
+    }
+}
+
+/// One step of an execution plan over a batch of calls (indices into it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BatchSegment {
+    /// Two or more consecutive parallel-safe calls, run concurrently.
+    Parallel(std::ops::Range<usize>),
+    /// Calls run one at a time, in order.
+    Sequential(std::ops::Range<usize>),
+}
+
+impl BatchSegment {
+    fn range(&self) -> &std::ops::Range<usize> {
+        match self {
+            Self::Parallel(range) | Self::Sequential(range) => range,
         }
     }
-    false
 }
 
-pub fn should_execute_tools_in_parallel(
-    tool_calls: &[ParsedToolCall],
-    approval: Option<&ApprovalManager>,
-) -> bool {
-    if tool_calls.len() <= 1 {
-        return false;
+/// Split a batch into ordered segments.
+///
+/// Call order is preserved exactly: a later call never crosses an earlier
+/// barrier, so the results and side effects match fully-sequential execution,
+/// only faster where the calls are provably independent. Consecutive
+/// parallel-safe calls form a parallel run; a run of one demotes to sequential
+/// (no benefit); adjacent sequential calls merge. This replaces the previous
+/// all-or-nothing rule, under which one batch of `[create_lead, update_lead_stage]`
+/// ran both at once whenever neither needed approval.
+pub(crate) fn plan_tool_batch(
+    calls: &[ParsedToolCall],
+    safety: &ParallelSafety<'_>,
+) -> Vec<BatchSegment> {
+    fn push_sequential(segments: &mut Vec<BatchSegment>, range: std::ops::Range<usize>) {
+        if let Some(BatchSegment::Sequential(last)) = segments.last_mut()
+            && last.end == range.start
+        {
+            last.end = range.end;
+            return;
+        }
+        segments.push(BatchSegment::Sequential(range));
+    }
+    fn close_run(segments: &mut Vec<BatchSegment>, run: &mut Option<usize>, end: usize) {
+        let Some(start) = run.take() else { return };
+        if end - start >= 2 {
+            segments.push(BatchSegment::Parallel(start..end));
+        } else {
+            push_sequential(segments, start..end);
+        }
     }
 
-    // tool_search activates deferred MCP tools into ActivatedToolSet.
-    // Running tool_search in parallel with the tools it activates causes a
-    // race condition where the tool lookup happens before activation completes.
-    // Force sequential execution whenever tool_search is in the batch.
-    if tool_calls.iter().any(|call| call.name == "tool_search") {
-        return false;
+    let mut segments = Vec::new();
+    let mut run: Option<usize> = None;
+    for (index, call) in calls.iter().enumerate() {
+        if safety.is_safe(call) {
+            run.get_or_insert(index);
+        } else {
+            close_run(&mut segments, &mut run, index);
+            push_sequential(&mut segments, index..index + 1);
+        }
     }
+    close_run(&mut segments, &mut run, calls.len());
+    segments
+}
 
-    if let Some(mgr) = approval
-        && tool_calls.iter().any(|call| mgr.needs_approval(&call.name))
-    {
-        // Approval-gated calls must keep sequential handling so the caller can
-        // enforce CLI prompt/deny policy consistently.
-        return false;
-    }
-
-    // Two or more calls touching the same path/file argument race on that
-    // resource if dispatched concurrently (e.g. two `file_write` calls to
-    // the same path). Fall back to sequential rather than risk an
-    // unpredictable interleaving.
-    if batch_has_path_overlap(tool_calls) {
-        return false;
-    }
-
-    true
+/// Compact form of a plan for logs: `P2,S1,P3` (parallel of 2, sequential of 1, ...).
+pub(crate) fn describe_plan(plan: &[BatchSegment]) -> String {
+    plan.iter()
+        .map(|segment| {
+            let len = segment.range().len();
+            match segment {
+                BatchSegment::Parallel(_) => format!("P{len}"),
+                BatchSegment::Sequential(_) => format!("S{len}"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 // ── Parallel execution ───────────────────────────────────────────────────
@@ -906,6 +957,62 @@ pub(crate) async fn execute_tools_sequential(
         slots.push(Some(outcome));
     }
 
+    slots.resize_with(tool_calls.len(), || None);
+    Ok(slots)
+}
+
+/// Execute a batch according to `plan`, segment by segment, in order. A parallel
+/// segment runs its calls concurrently; a sequential one runs them one at a time.
+/// Slots line up with `tool_calls`. If a segment is interrupted (cancellation),
+/// the remaining calls are left unexecuted (`None`), as before.
+pub(crate) async fn execute_tools_planned(
+    tool_calls: &[ParsedToolCall],
+    plan: &[BatchSegment],
+    dispatch: ToolDispatchContext<'_>,
+    meta: &TurnMeta<'_>,
+    observer: &dyn Observer,
+    cancellation_token: Option<&CancellationToken>,
+    receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
+    event_tx: Option<&Sender<TurnEvent>>,
+) -> Result<Vec<Option<ToolExecutionOutcome>>> {
+    let mut slots: Vec<Option<ToolExecutionOutcome>> = Vec::with_capacity(tool_calls.len());
+    for segment in plan {
+        if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
+            break;
+        }
+        let calls = &tool_calls[segment.range().clone()];
+        let part = match segment {
+            BatchSegment::Parallel(_) => {
+                execute_tools_parallel(
+                    calls,
+                    dispatch,
+                    meta,
+                    observer,
+                    cancellation_token,
+                    receipt_generator,
+                    event_tx,
+                )
+                .await?
+            }
+            BatchSegment::Sequential(_) => {
+                execute_tools_sequential(
+                    calls,
+                    dispatch,
+                    meta,
+                    observer,
+                    cancellation_token,
+                    receipt_generator,
+                    event_tx,
+                )
+                .await?
+            }
+        };
+        let interrupted = part.iter().any(Option::is_none);
+        slots.extend(part);
+        if interrupted {
+            break;
+        }
+    }
     slots.resize_with(tool_calls.len(), || None);
     Ok(slots)
 }
@@ -1300,11 +1407,8 @@ mod tests {
         assert_eq!(invocations.load(Ordering::SeqCst), 0);
     }
 
-    use super::should_execute_tools_in_parallel;
+    use super::{BatchSegment, ParallelSafety, describe_plan, plan_tool_batch};
     use crate::agent::loop_::ParsedToolCall;
-    use crate::approval::ApprovalManager;
-    use zeroclaw_config::autonomy::AutonomyLevel;
-    use zeroclaw_config::schema::RiskProfileConfig;
 
     fn parsed_tool_call(name: &str) -> ParsedToolCall {
         ParsedToolCall {
@@ -1315,237 +1419,319 @@ mod tests {
         }
     }
 
-    fn parsed_tool_call_with_args(name: &str, arguments: serde_json::Value) -> ParsedToolCall {
-        ParsedToolCall {
-            name: name.to_string(),
-            arguments,
-            tool_call_id: None,
-            arguments_parse_error: None,
-        }
+    // --- deny-by-default batch planner ---
+
+    fn plan_of(calls: &[ParsedToolCall]) -> String {
+        describe_plan(&plan_tool_batch(calls, &ParallelSafety::new(None)))
     }
 
-    fn supervised_risk_profile() -> RiskProfileConfig {
-        RiskProfileConfig {
-            level: AutonomyLevel::Supervised,
-            auto_approve: vec!["file_read".into()],
-            always_ask: vec!["shell".into()],
-            ..RiskProfileConfig::default()
-        }
+    fn calls_named(names: &[&str]) -> Vec<ParsedToolCall> {
+        names.iter().map(|n| parsed_tool_call(n)).collect()
     }
-
-    // --- tool_search branch---
 
     #[test]
-    fn tool_search_in_batch_forces_serial() {
-        // Two non-approval-gated tools in a batch where one is `tool_search`
-        // must run sequentially. Without the `tool_search` branch the default
-        // path would return `true` and the runtime would dispatch them in
-        // parallel, racing the lookup against the activation.
-        let calls = vec![
-            parsed_tool_call("tool_search"),
-            parsed_tool_call("file_read"),
-        ];
-
-        assert!(
-            !should_execute_tools_in_parallel(&calls, None),
-            "batch containing tool_search must force sequential execution (line 349-351)"
+    fn consecutive_read_only_calls_form_one_parallel_run() {
+        assert_eq!(
+            plan_of(&calls_named(&["memory_recall", "task_list", "file_read"])),
+            "P3"
+        );
+        assert_eq!(
+            plan_of(&calls_named(&["memory_recall", "memory_recall"])),
+            "P2"
         );
     }
 
     #[test]
-    fn tool_search_with_approval_required_in_batch_still_forces_serial() {
-        // When both branches would trigger, the test only needs to confirm
-        // the call still returns `false` — the ordering between the
-        // `tool_search` branch and the approval branch is an implementation
-        // detail. The important invariant is: `tool_search` present ⇒ serial.
-        let calls = vec![parsed_tool_call("tool_search"), parsed_tool_call("shell")];
-        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig::default();
-        let approval_mgr = ApprovalManager::from_risk_profile(&approval_cfg);
+    fn a_single_or_empty_batch_has_nothing_to_parallelise() {
+        assert_eq!(plan_of(&calls_named(&["memory_recall"])), "S1");
+        assert_eq!(plan_of(&[]), "");
+    }
 
-        assert!(
-            !should_execute_tools_in_parallel(&calls, Some(&approval_mgr)),
-            "tool_search in a mixed approval batch must still force sequential execution"
+    #[test]
+    fn dependent_writes_never_run_together() {
+        // The regression this planner exists for: two auto-approved writes in one
+        // batch used to run concurrently. Unknown = barrier = one at a time.
+        let plan = plan_tool_batch(
+            &calls_named(&["create_lead", "update_lead_stage"]),
+            &ParallelSafety::new(None),
+        );
+        assert_eq!(plan, vec![BatchSegment::Sequential(0..2)]);
+        // Even under "Full autonomy", which the old rule treated as a licence to
+        // parallelise everything, including shell and file_write.
+        assert_eq!(
+            plan_of(&calls_named(&["file_write", "shell", "anything"])),
+            "S3"
         );
     }
 
     #[test]
-    fn non_search_non_approval_batch_remains_parallel_eligible() {
-        let calls = vec![
-            parsed_tool_call("file_read"),
-            parsed_tool_call("memory_recall"),
-        ];
-
-        assert!(
-            should_execute_tools_in_parallel(&calls, None),
-            "non-tool_search, non-approval batch must remain parallel-eligible (default branch)"
+    fn a_write_between_reads_is_a_barrier_and_order_is_preserved() {
+        // read, read, WRITE, read, read  ->  reads together, the write alone, reads together.
+        let plan = plan_tool_batch(
+            &calls_named(&[
+                "memory_recall",
+                "task_list",
+                "task_create",
+                "memory_recall",
+                "file_read",
+            ]),
+            &ParallelSafety::new(None),
         );
-    }
-
-    // --- approval-required + control branches---
-
-    #[test]
-    fn approval_required_batch_forces_sequential() {
-        let mgr = ApprovalManager::for_non_interactive(&supervised_risk_profile());
-        let batch = vec![
-            parsed_tool_call("file_read"),
-            parsed_tool_call("shell"),
-            parsed_tool_call("file_read"),
-        ];
-        assert!(
-            !should_execute_tools_in_parallel(&batch, Some(&mgr)),
-            "batch with approval-required tool must execute sequentially"
+        assert_eq!(
+            plan,
+            vec![
+                BatchSegment::Parallel(0..2),
+                BatchSegment::Sequential(2..3),
+                BatchSegment::Parallel(3..5),
+            ]
         );
-    }
-
-    #[test]
-    fn approval_required_alone_in_batch_still_sequential() {
-        // A two-element batch where one tool requires approval must still
-        // take the serial branch (length check above already returns false
-        // for len <= 1; this asserts the approval branch is the actual gate).
-        let mgr = ApprovalManager::for_non_interactive(&supervised_risk_profile());
-        let batch = vec![parsed_tool_call("file_read"), parsed_tool_call("shell")];
-        assert!(
-            !should_execute_tools_in_parallel(&batch, Some(&mgr)),
-            "approval branch must trigger regardless of approval tool position"
+        // A read after a write never runs before it, and a lone read demotes.
+        assert_eq!(
+            plan_of(&calls_named(&["task_create", "memory_recall"])),
+            "S2"
+        );
+        assert_eq!(
+            plan_of(&calls_named(&[
+                "memory_recall",
+                "task_create",
+                "memory_recall"
+            ])),
+            "S3"
         );
     }
 
     #[test]
-    fn mixed_batch_with_approval_forces_serial_even_with_parallel_candidates() {
-        // Mixed batch: two file_read (parallel candidates) plus one shell
-        // (approval-required). The presence of `shell` must force serial
-        // execution, even though the other two could otherwise run in
-        // parallel.
-        let mgr = ApprovalManager::for_non_interactive(&supervised_risk_profile());
-        let batch = vec![
-            parsed_tool_call("file_read"),
-            parsed_tool_call("shell"),
-            parsed_tool_call("file_read"),
-        ];
-        assert!(
-            !should_execute_tools_in_parallel(&batch, Some(&mgr)),
-            "mixed batch must serialize when any approval-required tool is present"
+    fn tool_search_is_always_a_barrier() {
+        // Activating deferred tools must not race the lookup of what it activates.
+        assert_eq!(
+            plan_of(&calls_named(&[
+                "tool_search",
+                "memory_recall",
+                "memory_recall"
+            ])),
+            "S1,P2"
+        );
+        assert_eq!(
+            plan_of(&calls_named(&["memory_recall", "tool_search"])),
+            "S2"
         );
     }
 
     #[test]
-    fn parallel_when_no_approval_and_no_tool_search() {
-        // Control case: a batch of three non-approval, non-tool_search
-        // calls under `Supervised` (where `file_read` is auto-approved and
-        // `shell` is approval-required) may run in parallel.
-        let mgr = ApprovalManager::for_non_interactive(&supervised_risk_profile());
-        let batch = vec![
-            parsed_tool_call("file_read"),
-            parsed_tool_call("file_read"),
-            parsed_tool_call("file_read"),
-        ];
-        assert!(
-            should_execute_tools_in_parallel(&batch, Some(&mgr)),
-            "non-approval, non-tool_search batch must run in parallel when allowed"
-        );
-    }
-
-    #[test]
-    fn full_autonomy_batch_with_unknown_tool_runs_in_parallel() {
-        // Under `Full` autonomy, no tool requires approval — `needs_approval`
-        // returns false for every name. The control case extends to a batch
-        // whose names would otherwise be unknown to supervised profile.
-        let full = RiskProfileConfig {
-            level: AutonomyLevel::Full,
-            ..RiskProfileConfig::default()
+    fn delegate_is_a_barrier_unless_the_operator_declares_it() {
+        assert_eq!(plan_of(&calls_named(&["delegate", "delegate"])), "S2");
+        let declared = zeroclaw_config::schema::ToolConcurrencyConfig {
+            parallel_safe: vec!["delegate".to_string()],
         };
-        let mgr = ApprovalManager::for_non_interactive(&full);
-        let batch = vec![
-            parsed_tool_call("file_write"),
-            parsed_tool_call("shell"),
-            parsed_tool_call("anything"),
-        ];
-        assert!(
-            should_execute_tools_in_parallel(&batch, Some(&mgr)),
-            "full autonomy never prompts, so parallel execution is allowed"
+        let plan = plan_tool_batch(
+            &calls_named(&["delegate", "delegate"]),
+            &ParallelSafety::new(Some(&declared)),
+        );
+        assert_eq!(plan, vec![BatchSegment::Parallel(0..2)]);
+    }
+
+    #[test]
+    fn operator_declared_mcp_reads_run_in_parallel_but_their_write_siblings_do_not() {
+        let declared = zeroclaw_config::schema::ToolConcurrencyConfig {
+            parallel_safe: vec!["tenant_aivory-mail__search_*".to_string()],
+        };
+        let calls = calls_named(&[
+            "tenant_aivory-mail__search_mail",
+            "tenant_aivory-mail__search_threads",
+            "tenant_aivory-mail__send_mail",
+        ]);
+        let plan = plan_tool_batch(&calls, &ParallelSafety::new(Some(&declared)));
+        assert_eq!(
+            plan,
+            vec![BatchSegment::Parallel(0..2), BatchSegment::Sequential(2..3)]
         );
     }
 
     #[test]
-    fn no_approval_manager_with_multi_call_batch_runs_in_parallel() {
-        // When the caller passes `None` for `approval` and no tool in the
-        // batch is `tool_search`, the function takes the parallel branch
-        // unconditionally — useful for the tests / harnesses that exercise
-        // the tool loop without an approval manager.
-        let batch = vec![
-            parsed_tool_call("file_read"),
+    fn a_call_with_unparseable_arguments_is_a_barrier() {
+        let mut broken = parsed_tool_call("memory_recall");
+        broken.arguments_parse_error = Some("expected value at line 1".to_string());
+        let calls = vec![
+            parsed_tool_call("memory_recall"),
+            broken,
             parsed_tool_call("memory_recall"),
         ];
-        assert!(
-            should_execute_tools_in_parallel(&batch, None),
-            "no approval manager + non-tool_search batch must run in parallel"
+        assert_eq!(
+            plan_of(&calls),
+            "S3",
+            "the broken call splits the run into singletons"
         );
     }
 
-    // --- path-overlap branch ---
+    /// A tool that logs `start:<name>` / `end:<name>` around a sleep, so a test can
+    /// read the real interleaving off the shared log.
+    struct TimelineTool {
+        name: String,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+        millis: u64,
+    }
 
-    #[test]
-    fn overlapping_path_args_force_serial() {
-        // Two `file_write` calls targeting the same path race on that file
-        // if dispatched concurrently. The overlap check must force serial
-        // execution even though neither call is `tool_search` nor
-        // approval-gated.
-        let batch = vec![
-            parsed_tool_call_with_args(
-                "file_write",
-                serde_json::json!({"path": "notes.txt", "content": "a"}),
-            ),
-            parsed_tool_call_with_args(
-                "file_write",
-                serde_json::json!({"path": "notes.txt", "content": "b"}),
-            ),
-        ];
+    impl zeroclaw_api::attribution::Attributable for TimelineTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            "test-timeline-tool"
+        }
+    }
 
-        assert!(
-            !should_execute_tools_in_parallel(&batch, None),
-            "batch with two tool calls writing the same path must force sequential execution"
+    #[async_trait]
+    impl Tool for TimelineTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "Records when it starts and ends"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<zeroclaw_api::tool::ToolResult> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("start:{}", self.name));
+            tokio::time::sleep(std::time::Duration::from_millis(self.millis)).await;
+            self.log.lock().unwrap().push(format!("end:{}", self.name));
+            Ok(zeroclaw_api::tool::ToolResult {
+                success: true,
+                output: format!("{} done", self.name).into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Run `names` (one TimelineTool each, keyed by name) as one planned batch and
+    /// return the interleaving log plus which slots produced an outcome.
+    async fn run_planned_batch(names: &[&str]) -> (Vec<String>, Vec<bool>) {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry: Vec<Box<dyn Tool>> = Vec::new();
+        for name in [
+            "memory_recall",
+            "task_list",
+            "file_read",
+            "create_lead",
+            "update_lead_stage",
+        ] {
+            registry.push(Box::new(TimelineTool {
+                name: name.to_string(),
+                log: Arc::clone(&log),
+                millis: 120,
+            }));
+        }
+        let calls = calls_named(names);
+        let plan = plan_tool_batch(&calls, &ParallelSafety::new(None));
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
+        let slots = super::execute_tools_planned(
+            &calls,
+            &plan,
+            ToolDispatchContext {
+                tools_registry: &registry,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &meta,
+            &NoopObserver,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("planned execution");
+        let executed = slots.iter().map(Option::is_some).collect();
+        let log = log.lock().unwrap().clone();
+        (log, executed)
+    }
+
+    #[tokio::test]
+    async fn read_only_calls_really_overlap_in_time() {
+        let (log, executed) = run_planned_batch(&["memory_recall", "task_list", "file_read"]).await;
+        assert_eq!(executed, vec![true, true, true]);
+        // All three start before any of them ends: genuinely concurrent.
+        let first_end = log.iter().position(|e| e.starts_with("end:")).unwrap();
+        assert_eq!(
+            first_end, 3,
+            "expected 3 starts before the first end, got {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_is_a_real_barrier_between_two_read_runs() {
+        let (log, executed) = run_planned_batch(&[
+            "memory_recall",
+            "task_list",
+            "create_lead",
+            "file_read",
+            "memory_recall",
+        ])
+        .await;
+        assert_eq!(executed, vec![true; 5]);
+        let at = |needle: &str| {
+            log.iter()
+                .position(|e| e == needle)
+                .unwrap_or_else(|| panic!("{needle} missing in {log:?}"))
+        };
+        // The write starts only after BOTH earlier reads finished...
+        assert!(at("start:create_lead") > at("end:memory_recall"), "{log:?}");
+        assert!(at("start:create_lead") > at("end:task_list"), "{log:?}");
+        // ...and the later reads start only after the write finished.
+        assert!(at("end:create_lead") < at("start:file_read"), "{log:?}");
+        // The two reads before the write did overlap each other.
+        assert!(at("start:task_list") < at("end:memory_recall"), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn two_writes_in_one_batch_run_strictly_one_after_the_other() {
+        let (log, executed) = run_planned_batch(&["create_lead", "update_lead_stage"]).await;
+        assert_eq!(executed, vec![true, true]);
+        assert_eq!(
+            log,
+            vec![
+                "start:create_lead",
+                "end:create_lead",
+                "start:update_lead_stage",
+                "end:update_lead_stage"
+            ],
+            "dependent writes must never interleave"
         );
     }
 
     #[test]
-    fn distinct_path_args_remain_parallel_eligible() {
-        // Regression guard: different paths must not trip the overlap
-        // heuristic and must remain parallel-eligible as before.
-        let batch = vec![
-            parsed_tool_call_with_args(
-                "file_write",
-                serde_json::json!({"path": "a.txt", "content": "a"}),
-            ),
-            parsed_tool_call_with_args(
-                "file_write",
-                serde_json::json!({"path": "b.txt", "content": "b"}),
-            ),
+    fn plan_covers_every_call_exactly_once_in_order() {
+        let names = [
+            "memory_recall",
+            "a",
+            "memory_recall",
+            "memory_recall",
+            "b",
+            "b",
+            "file_read",
         ];
-
-        assert!(
-            should_execute_tools_in_parallel(&batch, None),
-            "batch with distinct path arguments must remain parallel-eligible"
-        );
-    }
-
-    #[test]
-    fn tool_call_without_path_args_does_not_panic_and_has_no_overlap() {
-        // A tool call whose arguments carry no path-shaped field (or no
-        // object at all) must be treated as contributing no path to the
-        // overlap check, and must never cause a panic.
-        let batch = vec![
-            parsed_tool_call("calculator"),
-            parsed_tool_call_with_args(
-                "file_write",
-                serde_json::json!({"path": "a.txt", "content": "a"}),
-            ),
-            parsed_tool_call_with_args("memory_recall", serde_json::json!("not-an-object")),
-        ];
-
-        assert!(
-            should_execute_tools_in_parallel(&batch, None),
-            "tool calls lacking path arguments must not trigger a false-positive overlap"
-        );
+        let plan = plan_tool_batch(&calls_named(&names), &ParallelSafety::new(None));
+        let mut next = 0;
+        for segment in &plan {
+            let range = match segment {
+                BatchSegment::Parallel(r) | BatchSegment::Sequential(r) => r,
+            };
+            assert_eq!(range.start, next, "gap or overlap in {plan:?}");
+            assert!(range.end > range.start, "empty segment in {plan:?}");
+            next = range.end;
+        }
+        assert_eq!(next, names.len());
     }
 
     // ── Plan emission tests ────────────────────────────────────────────────

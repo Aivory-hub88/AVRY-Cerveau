@@ -65,8 +65,8 @@ pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_pro
 
 use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
 use crate::agent::tool_execution::{
-    ToolDispatchContext, execute_tools_parallel, execute_tools_sequential,
-    should_execute_tools_in_parallel,
+    BatchSegment, ParallelSafety, ToolDispatchContext, describe_plan, execute_tools_planned,
+    plan_tool_batch,
 };
 use crate::security::ingress::{IngressPolicy, ingress_policy};
 use crate::util::truncate_with_ellipsis;
@@ -1034,8 +1034,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         // When multiple tool calls are present and interactive CLI approval is not needed, run
         // tool executions concurrently for lower wall-clock latency.
-        let allow_parallel_execution =
-            parallel_tools && should_execute_tools_in_parallel(&tool_calls, approval);
         let PreparedToolCalls {
             mut ordered_results,
             executable_indices,
@@ -1062,43 +1060,41 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         let execution_result = crate::approval::scope_delegation_approval(
             delegation_approval,
             crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
-                if allow_parallel_execution && executable_calls.len() > 1 {
-                    let meta = ctx.meta();
-                    let dispatch = ToolDispatchContext {
-                        tools_registry,
-                        activated_tools,
-                        excluded_tools,
-                        model_switch_callback: model_switch_callback.as_ref(),
-                    };
-                    execute_tools_parallel(
+                let meta = ctx.meta();
+                let dispatch = ToolDispatchContext {
+                    tools_registry,
+                    activated_tools,
+                    excluded_tools,
+                    model_switch_callback: model_switch_callback.as_ref(),
+                };
+                // Deny-by-default: only known read-only tools run concurrently;
+                // every other call is a barrier that runs alone, in order.
+                let plan = if parallel_tools {
+                    plan_tool_batch(
                         &executable_calls,
-                        dispatch,
-                        &meta,
-                        observer,
-                        cancellation_token.as_ref(),
-                        receipt_generator,
-                        ctx.event_tx,
+                        &ParallelSafety::new(config.map(|c| &c.tool_concurrency)),
                     )
-                    .await
                 } else {
-                    let meta = ctx.meta();
-                    let dispatch = ToolDispatchContext {
-                        tools_registry,
-                        activated_tools,
-                        excluded_tools,
-                        model_switch_callback: model_switch_callback.as_ref(),
-                    };
-                    execute_tools_sequential(
-                        &executable_calls,
-                        dispatch,
-                        &meta,
-                        observer,
-                        cancellation_token.as_ref(),
-                        receipt_generator,
-                        ctx.event_tx,
-                    )
-                    .await
+                    vec![BatchSegment::Sequential(0..executable_calls.len())]
+                };
+                if executable_calls.len() > 1 {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        &format!("tool batch plan: {}", describe_plan(&plan))
+                    );
                 }
+                execute_tools_planned(
+                    &executable_calls,
+                    &plan,
+                    dispatch,
+                    &meta,
+                    observer,
+                    cancellation_token.as_ref(),
+                    receipt_generator,
+                    ctx.event_tx,
+                )
+                .await
             }),
         )
         .await;
