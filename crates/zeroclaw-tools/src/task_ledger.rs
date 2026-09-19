@@ -474,7 +474,10 @@ impl Tool for TaskListTool {
     fn description(&self) -> &str {
         "List your own tracked tasks (from task_create), optionally filtered to one status. \
          Call this with no filter at the start of a new session to recall what you were in the \
-         middle of -- it's a row scan of exact state, not a best-effort semantic search."
+         middle of -- it's a row scan of exact state, not a best-effort semantic search. \
+         Set scope=\"session\" to list EVERY agent's tasks in this conversation (yours and the \
+         specialists' you delegated to, with who owns each): that is how you check whether \
+         delegated work is finished. By default (scope=\"mine\") you only ever see your own."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -485,6 +488,12 @@ impl Tool for TaskListTool {
                     "type": "string",
                     "enum": ["todo", "in_progress", "blocked", "done"],
                     "description": "Omit to list every task regardless of status."
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["mine", "session"],
+                    "default": "mine",
+                    "description": "mine = only your own tasks (default). session = every agent's tasks in this conversation session, each labelled with its owner."
                 }
             }
         })
@@ -528,26 +537,64 @@ impl Tool for TaskListTool {
             None => None,
         };
 
-        match self
-            .ctx
-            .ledger
-            .list_tasks(&self.ctx.tenant_id, &self.ctx.agent_type, status)
-            .await
-        {
+        let session_scope = match args.get("scope").and_then(|v| v.as_str()) {
+            None | Some("mine") => false,
+            Some("session") => true,
+            Some(other) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!(
+                        "'scope' must be \"mine\" or \"session\" -- got '{other}'"
+                    )),
+                });
+            }
+        };
+
+        let fetched = if session_scope {
+            let Some(session_id) = self.ctx.session_id.as_deref() else {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(
+                        "scope=\"session\" needs a conversation session, and this turn has none. \
+                         Use scope=\"mine\" (your own tasks) instead."
+                            .to_string(),
+                    ),
+                });
+            };
+            self.ctx
+                .ledger
+                .list_session_tasks(&self.ctx.tenant_id, session_id, status)
+                .await
+        } else {
+            self.ctx
+                .ledger
+                .list_tasks(&self.ctx.tenant_id, &self.ctx.agent_type, status)
+                .await
+        };
+
+        match fetched {
             Ok(tasks) => {
                 if tasks.is_empty() {
                     return Ok(ToolResult {
                         success: true,
                         output: ToolOutput::json_with_text(
                             json!({"tasks": []}),
-                            "No tracked tasks.",
+                            if session_scope {
+                                "No tracked tasks in this session."
+                            } else {
+                                "No tracked tasks."
+                            },
                         ),
                         error: None,
                     });
                 }
                 let data = json!({
+                    "scope": if session_scope { "session" } else { "mine" },
                     "tasks": tasks.iter().map(|t| json!({
                         "task_id": t.task_id,
+                        "agent_type": t.agent_type,
                         "title": t.title,
                         "status": t.status.as_str(),
                         "priority": t.priority.as_str(),
@@ -560,9 +607,17 @@ impl Tool for TaskListTool {
                     if !text.is_empty() {
                         text.push('\n');
                     }
+                    // The owner matters only when the list spans agents; for
+                    // scope=mine the line keeps its long-standing shape.
+                    let owner = if session_scope {
+                        format!(" ({})", t.agent_type)
+                    } else {
+                        String::new()
+                    };
                     text.push_str(&format!(
-                        "[{}] {} ({}) -- {}",
+                        "[{}]{} {} ({}) -- {}",
                         t.status.as_str(),
+                        owner,
                         t.title,
                         t.task_id,
                         t.blocked_reason.as_deref().unwrap_or("")
@@ -642,5 +697,211 @@ mod update_outcome_tests {
             "phantom cancelled action"
         );
         assert!(!should_notify(TaskStatus::Blocked, StoppedByOperator));
+    }
+}
+
+/// `task_list` as the model sees it, against a real Postgres. Needs
+/// `CERVEAU_TEST_PG_URL` (a no-op otherwise); every row is keyed by a fresh tenant
+/// so runs and other tests cannot see each other.
+#[cfg(test)]
+mod task_list_scope_tests {
+    use super::*;
+
+    /// One ledger for every test in this module: `connect` runs DDL, and several
+    /// tests connecting to the same schema at once would race on it (the daemon
+    /// connects once, at start-up).
+    async fn ledger() -> Option<Arc<AgentTaskLedger>> {
+        static LEDGER: tokio::sync::OnceCell<Option<Arc<AgentTaskLedger>>> =
+            tokio::sync::OnceCell::const_new();
+        LEDGER
+            .get_or_init(|| async {
+                let url = std::env::var("CERVEAU_TEST_PG_URL")
+                    .ok()
+                    .filter(|s| !s.is_empty())?;
+                Some(Arc::new(
+                    AgentTaskLedger::connect(&url, "public")
+                        .await
+                        .expect("connect"),
+                ))
+            })
+            .await
+            .clone()
+    }
+
+    fn unique(prefix: &str) -> String {
+        format!("{prefix}-{}", uuid::Uuid::new_v4())
+    }
+
+    async fn list(tool: &TaskListTool, args: serde_json::Value) -> ToolResult {
+        tool.execute(args)
+            .await
+            .expect("task_list never errors out of band")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_scope_lets_an_orchestrator_see_what_it_delegated() {
+        let Some(ledger) = ledger().await else {
+            eprintln!("CERVEAU_TEST_PG_URL unset — skipping task_list scope test");
+            return;
+        };
+        let tenant = unique("tenant");
+        let session = unique("session");
+        ledger
+            .create_task(
+                &tenant,
+                "chief_of_staff",
+                Some(&session),
+                "AIRA-orch: qualify leads",
+                TaskPriority::High,
+            )
+            .await
+            .unwrap();
+        let child = ledger
+            .create_task(
+                &tenant,
+                "leads_qualifier",
+                Some(&session),
+                "qualify the new leads",
+                TaskPriority::Normal,
+            )
+            .await
+            .unwrap();
+        ledger
+            .update_status(&tenant, &child, TaskStatus::Done, None)
+            .await
+            .unwrap();
+
+        let aira = TaskListTool::new(
+            Arc::clone(&ledger),
+            tenant.clone(),
+            "chief_of_staff".into(),
+            Some(session.clone()),
+        );
+
+        // The real schema advertises the parameter, defaulting to the safe scope.
+        let schema = aira.parameters_schema();
+        assert_eq!(schema["properties"]["scope"]["default"], "mine");
+        assert_eq!(
+            schema["properties"]["scope"]["enum"],
+            json!(["mine", "session"])
+        );
+
+        // Default scope is unchanged: only her own rows, in the long-standing shape.
+        let mine = list(&aira, json!({})).await;
+        assert!(mine.success, "{mine:?}");
+        let text = mine.output.to_string();
+        assert!(text.contains("AIRA-orch: qualify leads"));
+        assert!(
+            !text.contains("qualify the new leads"),
+            "scope=mine must not show a specialist's row: {text}"
+        );
+        assert!(
+            text.starts_with("[todo] AIRA-orch"),
+            "mine keeps its old line shape: {text}"
+        );
+
+        // scope=session shows the specialist's finished child, labelled with its owner.
+        let all = list(&aira, json!({"scope": "session"})).await;
+        assert!(all.success, "{all:?}");
+        let text = all.output.to_string();
+        assert!(
+            text.contains("[done] (leads_qualifier) qualify the new leads"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[todo] (chief_of_staff) AIRA-orch: qualify leads"),
+            "{text}"
+        );
+        let data = all.output.data().expect("structured data");
+        assert_eq!(data["scope"], "session");
+        assert!(
+            data["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["agent_type"] == "leads_qualifier")
+        );
+
+        // The status filter composes with the scope.
+        let done = list(&aira, json!({"scope": "session", "status": "done"})).await;
+        let text = done.output.to_string();
+        assert!(
+            text.contains("qualify the new leads") && !text.contains("AIRA-orch"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_scope_never_crosses_tenants_or_sessions() {
+        let Some(ledger) = ledger().await else { return };
+        let (tenant, other_tenant) = (unique("tenant"), unique("tenant"));
+        let session = unique("session");
+        ledger
+            .create_task(
+                &other_tenant,
+                "chief_of_staff",
+                Some(&session),
+                "SECRET other tenant",
+                TaskPriority::Normal,
+            )
+            .await
+            .unwrap();
+        ledger
+            .create_task(
+                &tenant,
+                "chief_of_staff",
+                Some("a-different-session"),
+                "other session",
+                TaskPriority::Normal,
+            )
+            .await
+            .unwrap();
+        ledger
+            .create_task(
+                &tenant,
+                "chief_of_staff",
+                Some(&session),
+                "mine in this session",
+                TaskPriority::Normal,
+            )
+            .await
+            .unwrap();
+        let tool = TaskListTool::new(
+            Arc::clone(&ledger),
+            tenant,
+            "chief_of_staff".into(),
+            Some(session),
+        );
+        let text = list(&tool, json!({"scope": "session"}))
+            .await
+            .output
+            .to_string();
+        assert!(text.contains("mine in this session"));
+        assert!(!text.contains("SECRET"), "{text}");
+        assert!(!text.contains("other session"), "{text}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_scope_without_a_session_and_bad_scopes_explain_themselves() {
+        let Some(ledger) = ledger().await else { return };
+        let no_session = TaskListTool::new(
+            Arc::clone(&ledger),
+            unique("t"),
+            "chief_of_staff".into(),
+            None,
+        );
+        let r = list(&no_session, json!({"scope": "session"})).await;
+        assert!(!r.success);
+        let error = r.error.unwrap();
+        assert!(
+            error.contains("needs a conversation session") && error.contains("scope=\"mine\""),
+            "{error}"
+        );
+        // The default still works without a session.
+        assert!(list(&no_session, json!({})).await.success);
+
+        let bad = list(&no_session, json!({"scope": "everyone"})).await;
+        assert!(!bad.success);
+        assert!(bad.error.unwrap().contains("'scope' must be"));
     }
 }

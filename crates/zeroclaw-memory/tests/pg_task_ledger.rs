@@ -918,3 +918,226 @@ async fn ledger_reconnects_after_its_connection_is_killed() {
 
     exec(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE;")).await;
 }
+
+// ── Session-wide listing: how an orchestrator sees the work it delegated ──
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_listing_shows_every_agents_tasks_in_that_session_only() {
+    let Some(url) = pg_url() else {
+        eprintln!("CERVEAU_TEST_PG_URL unset — skipping session listing test");
+        return;
+    };
+    let schema = "cerveau_task_ledger_session_test";
+    exec(&format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema};"
+    ))
+    .await;
+    let l = AgentTaskLedger::connect(&url, schema)
+        .await
+        .expect("connect");
+
+    // Session s1 of tenant t1: an orchestrator's parent, a specialist's finished
+    // delegation (archived), a specialist's blocked one, and a plain finished task.
+    let parent = l
+        .create_task(
+            "t1",
+            "chief_of_staff",
+            Some("s1"),
+            "AIRA-orch: qualify leads",
+            TaskPriority::High,
+        )
+        .await
+        .unwrap();
+    l.update_status("t1", &parent, TaskStatus::InProgress, None)
+        .await
+        .unwrap();
+    let done_child = l
+        .create_delegated_task(NewDelegatedTask {
+            tenant_id: "t1",
+            agent_type: "leads_qualifier",
+            session_id: Some("s1"),
+            title: "Delegated to leads_qualifier: qualify",
+            delegated_by: "chief_of_staff",
+            delegation_id: "d-done",
+            context_id: None,
+            status: TaskStatus::InProgress,
+            outcome: None,
+            blocked_reason: None,
+            result_summary: None,
+        })
+        .await
+        .unwrap();
+    l.finish_delegation(
+        "d-done",
+        DelegationEnd::Completed {
+            summary: Some("3 leads".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let blocked_child = l
+        .create_task(
+            "t1",
+            "finance_invoice_ops",
+            Some("s1"),
+            "send invoice",
+            TaskPriority::Normal,
+        )
+        .await
+        .unwrap();
+    l.update_status(
+        "t1",
+        &blocked_child,
+        TaskStatus::Blocked,
+        Some("waiting for approval"),
+    )
+    .await
+    .unwrap();
+    let plain_done = l
+        .create_task(
+            "t1",
+            "customer_service",
+            Some("s1"),
+            "reply to ticket",
+            TaskPriority::Normal,
+        )
+        .await
+        .unwrap();
+    l.update_status("t1", &plain_done, TaskStatus::Done, None)
+        .await
+        .unwrap();
+
+    // Things that must NOT appear: another session, another tenant (live and archived).
+    let other_session = l
+        .create_task(
+            "t1",
+            "chief_of_staff",
+            Some("s2"),
+            "different session",
+            TaskPriority::Normal,
+        )
+        .await
+        .unwrap();
+    let foreign_live = l
+        .create_task(
+            "t2",
+            "chief_of_staff",
+            Some("s1"),
+            "other tenant live",
+            TaskPriority::Normal,
+        )
+        .await
+        .unwrap();
+    let foreign_done = l
+        .create_task(
+            "t2",
+            "leads_qualifier",
+            Some("s1"),
+            "other tenant done",
+            TaskPriority::Normal,
+        )
+        .await
+        .unwrap();
+    l.update_status("t2", &foreign_done, TaskStatus::Done, None)
+        .await
+        .unwrap();
+    // A corrupt archive row must not hide the good ones.
+    exec(&format!(
+        "INSERT INTO {schema}.agent_tasks_archive (task_id, tenant_id, agent_type, payload) \
+         VALUES ('corrupt', 't1', 'x', '\\x00010203')"
+    ))
+    .await;
+
+    let all = l
+        .list_session_tasks("t1", "s1", None)
+        .await
+        .expect("list session");
+    let ids: Vec<&str> = all.iter().map(|t| t.task_id.as_str()).collect();
+    for expected in [&parent, &done_child, &blocked_child, &plain_done] {
+        assert!(
+            ids.contains(&expected.as_str()),
+            "missing {expected}: {ids:?}"
+        );
+    }
+    for forbidden in [&other_session, &foreign_live, &foreign_done] {
+        assert!(
+            !ids.contains(&forbidden.as_str()),
+            "leaked {forbidden}: {ids:?}"
+        );
+    }
+    assert_eq!(all.len(), 4, "{ids:?}");
+    let owners: std::collections::BTreeSet<&str> =
+        all.iter().map(|t| t.agent_type.as_str()).collect();
+    assert_eq!(
+        owners,
+        [
+            "chief_of_staff",
+            "customer_service",
+            "finance_invoice_ops",
+            "leads_qualifier"
+        ]
+        .into_iter()
+        .collect(),
+        "the list spans every agent, each labelled with its owner"
+    );
+    assert!(
+        all.windows(2).all(|w| w[0].updated_at >= w[1].updated_at),
+        "newest first"
+    );
+    let finished = all.iter().find(|t| t.task_id == done_child).unwrap();
+    assert_eq!(finished.status, TaskStatus::Done);
+    assert_eq!(
+        finished.result_summary.as_deref(),
+        Some("3 leads"),
+        "the result travels with the archived row"
+    );
+
+    // Status filters.
+    let only_done = l
+        .list_session_tasks("t1", "s1", Some(TaskStatus::Done))
+        .await
+        .unwrap();
+    assert_eq!(only_done.len(), 2, "two finished in s1: {only_done:?}");
+    assert!(only_done.iter().all(|t| t.status == TaskStatus::Done));
+    let only_blocked = l
+        .list_session_tasks("t1", "s1", Some(TaskStatus::Blocked))
+        .await
+        .unwrap();
+    assert_eq!(only_blocked.len(), 1);
+    assert_eq!(
+        only_blocked[0].blocked_reason.as_deref(),
+        Some("waiting for approval")
+    );
+    let only_open = l
+        .list_session_tasks("t1", "s1", Some(TaskStatus::InProgress))
+        .await
+        .unwrap();
+    assert_eq!(only_open.len(), 1);
+    assert_eq!(only_open[0].task_id, parent);
+
+    // Unknown session / wrong tenant: empty, never an error and never someone else's rows.
+    assert!(
+        l.list_session_tasks("t1", "no-such-session", None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        l.list_session_tasks("t3", "s1", None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // t2 sees only its own rows in the same-named session.
+    let t2: Vec<String> = l
+        .list_session_tasks("t2", "s1", None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.task_id)
+        .collect();
+    assert_eq!(t2.len(), 2);
+    assert!(t2.contains(&foreign_live) && t2.contains(&foreign_done));
+
+    exec(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE;")).await;
+}
