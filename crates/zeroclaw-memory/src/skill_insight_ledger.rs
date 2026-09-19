@@ -28,6 +28,7 @@
 //! schema and `delete_insight` are here so Phase 3 doesn't need a migration
 //! to add them.
 
+use crate::pg_live::LiveClient;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
@@ -168,7 +169,7 @@ impl<T: Send + 'static> Drop for DropOnThread<T> {
 /// `PostgresMemory`/`AgentTaskLedger` — same one-extra-connection tradeoff
 /// those make, well inside the tuned 200-connection budget.
 pub struct AgentSkillInsightLedger {
-    client: DropOnThread<Arc<Mutex<Client>>>,
+    client: DropOnThread<Arc<Mutex<LiveClient>>>,
     schema: String,
 }
 
@@ -177,6 +178,7 @@ impl AgentSkillInsightLedger {
     /// same libpq key=value DSN every other Cerveau Postgres consumer uses.
     pub async fn connect(db_url: &str, schema: &str) -> Result<Self> {
         let db_url = db_url.to_string();
+        let reconnect_url = db_url.clone();
         let schema_owned = schema.to_string();
         let client = run_on_os_thread(move || -> Result<Client> {
             let mut client =
@@ -202,7 +204,7 @@ impl AgentSkillInsightLedger {
         })
         .await?;
         Ok(Self {
-            client: DropOnThread::new(Arc::new(Mutex::new(client))),
+            client: DropOnThread::new(Arc::new(Mutex::new(LiveClient::new(client, reconnect_url)))),
             schema: schema.to_string(),
         })
     }
@@ -228,7 +230,8 @@ impl AgentSkillInsightLedger {
         let signal = signal.to_string();
         let id_out = insight_id.clone();
         run_on_os_thread(move || -> Result<()> {
-            let mut client = client.lock();
+            let mut live = client.lock();
+            let client = live.ready()?;
             client.execute(
                 &format!(
                     r#"INSERT INTO "{schema}".skill_insights
@@ -266,7 +269,8 @@ impl AgentSkillInsightLedger {
         let agent_type = agent_type.to_string();
         let status_str = status.map(|s| s.as_str().to_string());
         run_on_os_thread(move || -> Result<Vec<SkillInsight>> {
-            let mut client = client.lock();
+            let mut live = client.lock();
+            let client = live.ready()?;
             let rows = match &status_str {
                 Some(s) => client.query(
                     &format!(
@@ -319,7 +323,8 @@ impl AgentSkillInsightLedger {
         let tenant_id = tenant_id.to_string();
         let insight_id = insight_id.to_string();
         let rows = run_on_os_thread(move || -> Result<u64> {
-            let mut client = client.lock();
+            let mut live = client.lock();
+            let client = live.ready()?;
             let rows = client.execute(
                 &format!(
                     r#"DELETE FROM "{schema}".skill_insights WHERE insight_id = $1 AND tenant_id = $2"#
