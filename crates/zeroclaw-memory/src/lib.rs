@@ -12,6 +12,8 @@ pub mod audit;
 pub mod backend;
 pub mod budget;
 #[cfg(feature = "memory-postgres")]
+pub(crate) mod pg_live;
+#[cfg(feature = "memory-postgres")]
 pub mod capability_graph;
 pub mod chunker;
 pub mod classify;

@@ -21,6 +21,7 @@
 //! A task is never deleted, only moved to `done` — the ledger doubles as
 //! its own audit trail.
 
+use crate::pg_live::LiveClient;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
@@ -457,7 +458,7 @@ impl<T: Send + 'static> Drop for DropOnThread<T> {
 /// also hold — same tradeoff `PgCapabilityGraph` makes (one extra
 /// long-lived connection, well inside the tuned 200-connection budget).
 pub struct AgentTaskLedger {
-    client: DropOnThread<Arc<Mutex<Client>>>,
+    client: DropOnThread<Arc<Mutex<LiveClient>>>,
     schema: String,
 }
 
@@ -467,6 +468,7 @@ impl AgentTaskLedger {
     /// (NOT a `postgresql://` URL — see CERVEAU-STATUS.md §7).
     pub async fn connect(db_url: &str, schema: &str) -> Result<Self> {
         let db_url = db_url.to_string();
+        let reconnect_url = db_url.clone();
         let schema_owned = schema.to_string();
         // Connect AND create-table-if-missing on the SAME spawned OS thread,
         // in one continuous synchronous call chain — see
@@ -526,7 +528,7 @@ impl AgentTaskLedger {
         })
         .await?;
         Ok(Self {
-            client: DropOnThread::new(Arc::new(Mutex::new(client))),
+            client: DropOnThread::new(Arc::new(Mutex::new(LiveClient::new(client, reconnect_url)))),
             schema: schema.to_string(),
         })
     }
@@ -571,7 +573,8 @@ impl AgentTaskLedger {
         let session = session.to_string();
         let older_than_minutes = ORPHAN_PARK_AFTER_MINUTES.to_string();
         run_on_os_thread(move || -> Result<u64> {
-            let mut client = client.lock();
+            let mut live = client.lock();
+            let client = live.ready()?;
             let rows = client.execute(
                 &format!(
                     r#"UPDATE "{schema}".agent_tasks
@@ -609,7 +612,8 @@ impl AgentTaskLedger {
         let priority_str = priority.as_str().to_string();
         let id_out = task_id.clone();
         run_on_os_thread(move || -> Result<()> {
-            let mut client = client.lock();
+            let mut live = client.lock();
+            let client = live.ready()?;
             client.execute(
                 &format!(
                     r#"INSERT INTO "{schema}".agent_tasks
@@ -665,7 +669,8 @@ impl AgentTaskLedger {
         let schema_probe = schema.clone();
         let client_probe = Arc::clone(self.client.get());
         let rows = run_on_os_thread(move || -> Result<u64> {
-            let mut client = client.lock();
+            let mut live = client.lock();
+            let client = live.ready()?;
             let rows = client.execute(
                 &format!(
                     r#"UPDATE "{schema}".agent_tasks
@@ -679,7 +684,8 @@ impl AgentTaskLedger {
         .await?;
         if rows == 0 {
             let missing = run_on_os_thread(move || -> Result<MissingTask> {
-                let mut client = client_probe.lock();
+                let mut live = client_probe.lock();
+                let client = live.ready()?;
                 let row = client.query_one(
                     &format!(
                         r#"SELECT
@@ -723,7 +729,8 @@ impl AgentTaskLedger {
         let task_id_owned = task_id.to_string();
         let task_id_for_error = task_id_owned.clone();
         run_on_os_thread(move || -> Result<StatusUpdate> {
-            let mut client = client.lock();
+            let mut live = client.lock();
+            let client = live.ready()?;
             let mut txn = client.transaction()?;
 
             let row = txn.query_opt(
@@ -786,7 +793,8 @@ impl AgentTaskLedger {
         let tenant_id = tenant_id.to_string();
         let agent_type = agent_type.to_string();
         run_on_os_thread(move || -> Result<Vec<AgentTask>> {
-            let mut client = client.lock();
+            let mut live = client.lock();
+            let client = live.ready()?;
             let rows = client.query(
                 &format!(
                     r#"SELECT payload FROM "{schema}".agent_tasks_archive
@@ -821,7 +829,8 @@ impl AgentTaskLedger {
         let client = Arc::clone(self.client.get());
         let schema = self.schema.clone();
         run_on_os_thread(move || -> Result<u64> {
-            let mut client = client.lock();
+            let mut live = client.lock();
+            let client = live.ready()?;
             let rows = client.execute(
                 &format!(
                     r#"DELETE FROM "{schema}".agent_tasks_archive
@@ -900,7 +909,8 @@ impl AgentTaskLedger {
         let outcome = new.outcome.map(|o| o.as_str().to_string());
         let result_summary = new.result_summary.map(truncate_summary);
         run_on_os_thread(move || -> Result<()> {
-            let mut client = client.lock();
+            let mut live = client.lock();
+            let client = live.ready()?;
             client.execute(
                 &format!(
                     r#"INSERT INTO "{schema}".agent_tasks
@@ -949,7 +959,8 @@ impl AgentTaskLedger {
         let delegated_by = delegated_by.to_string();
         let context_id = context_id.map(str::to_string);
         run_on_os_thread(move || -> Result<AdoptResult> {
-            let mut client = client.lock();
+            let mut live = client.lock();
+            let client = live.ready()?;
             let updated = client.execute(
                 &format!(
                     r#"UPDATE "{schema}".agent_tasks
@@ -1017,7 +1028,8 @@ impl AgentTaskLedger {
         let schema = self.schema.clone();
         let delegation_id = delegation_id.to_string();
         run_on_os_thread(move || -> Result<bool> {
-            let mut client = client.lock();
+            let mut live = client.lock();
+            let client = live.ready()?;
             match end {
                 DelegationEnd::Completed { summary } => {
                     let summary = summary.as_deref().map(truncate_summary);
@@ -1090,7 +1102,8 @@ impl AgentTaskLedger {
         let schema = self.schema.clone();
         let delegation_id = delegation_id.to_string();
         run_on_os_thread(move || -> Result<Option<TaskStatus>> {
-            let mut client = client.lock();
+            let mut live = client.lock();
+            let client = live.ready()?;
             let row = client.query_opt(
                 &format!(r#"SELECT status FROM "{schema}".agent_tasks WHERE delegation_id = $1"#),
                 &[&delegation_id],
@@ -1110,7 +1123,8 @@ impl AgentTaskLedger {
         let client = Arc::clone(self.client.get());
         let schema = self.schema.clone();
         run_on_os_thread(move || -> Result<Vec<String>> {
-            let mut client = client.lock();
+            let mut live = client.lock();
+            let client = live.ready()?;
             let rows = client.query(
                 &format!(
                     r#"SELECT delegation_id FROM "{schema}".agent_tasks
@@ -1133,7 +1147,8 @@ impl AgentTaskLedger {
         let tenant_id = tenant_id.to_string();
         let task_id = task_id.to_string();
         run_on_os_thread(move || -> Result<Option<AgentTask>> {
-            let mut client = client.lock();
+            let mut live = client.lock();
+            let client = live.ready()?;
             let row = client.query_opt(
                 &format!(
                     r#"SELECT {TASK_COLUMNS}
@@ -1174,7 +1189,8 @@ impl AgentTaskLedger {
         let agent_type = agent_type_owned.clone();
         let status_str = status.map(|s| s.as_str().to_string());
         let mut out = run_on_os_thread(move || -> Result<Vec<AgentTask>> {
-            let mut client = client.lock();
+            let mut live = client.lock();
+            let client = live.ready()?;
             let rows = match &status_str {
                 Some(s) => client.query(
                     &format!(

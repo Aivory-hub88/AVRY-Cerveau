@@ -25,6 +25,7 @@
 //! `avry-postgres` — see CERVEAU-STATUS.md §6; this uses plain weighted
 //! co-occurrence instead, which needs no vector extension at all).
 
+use crate::pg_live::LiveClient;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -47,8 +48,12 @@ pub trait CapabilityGraphRanker: Send + Sync {
     /// `recent` (tool names already activated earlier this session).
     /// Returns the same set of names, reordered — never adds, removes, or
     /// deduplicates. On any backend error, returns `candidates` unchanged.
-    async fn rerank(&self, tenant_id: &str, candidates: &[String], recent: &[String])
-    -> Vec<String>;
+    async fn rerank(
+        &self,
+        tenant_id: &str,
+        candidates: &[String],
+        recent: &[String],
+    ) -> Vec<String>;
 
     /// Record that `activated` were surfaced together by one `tool_search`
     /// call (keyword match or multi-name `select:`) — the proxy signal for
@@ -170,7 +175,7 @@ impl<T: Send + 'static> Drop for DropOnThread<T> {
 /// long-lived connection (well inside the tuned 200-connection budget — see
 /// memory `aivory-capacity-optimizations`).
 pub struct PgCapabilityGraph {
-    client: DropOnThread<Arc<Mutex<Client>>>,
+    client: DropOnThread<Arc<Mutex<LiveClient>>>,
     schema: String,
 }
 
@@ -181,6 +186,7 @@ impl PgCapabilityGraph {
     /// password contains `@`/`#`).
     pub async fn connect(db_url: &str, schema: &str) -> Result<Self> {
         let db_url = db_url.to_string();
+        let reconnect_url = db_url.clone();
         let schema_owned = schema.to_string();
         // Connect AND run schema init on the SAME spawned OS thread, in one
         // continuous synchronous call chain — mirrors
@@ -222,7 +228,7 @@ impl PgCapabilityGraph {
         })
         .await?;
         Ok(Self {
-            client: DropOnThread::new(Arc::new(Mutex::new(client))),
+            client: DropOnThread::new(Arc::new(Mutex::new(LiveClient::new(client, reconnect_url)))),
             schema: schema.to_string(),
         })
     }
@@ -245,7 +251,8 @@ impl CapabilityGraphRanker for PgCapabilityGraph {
         let candidates_owned = candidates.to_vec();
         let recent_owned = recent.to_vec();
         let result: Result<HashMap<String, f64>> = run_on_os_thread(move || {
-            let mut client = client.lock();
+            let mut live = client.lock();
+            let client = live.ready()?;
             let rows = client.query(
                 &format!(
                     r#"SELECT tool_a, tool_b, weight FROM "{schema}".kg_capability_edges
@@ -296,7 +303,8 @@ impl CapabilityGraphRanker for PgCapabilityGraph {
         let schema = self.schema.clone();
         let tenant_id = tenant_id.to_string();
         let result: Result<()> = run_on_os_thread(move || {
-            let mut client = client.lock();
+            let mut live = client.lock();
+            let client = live.ready()?;
             let mut txn = client.transaction()?;
             for (a, b) in &pairs {
                 txn.execute(

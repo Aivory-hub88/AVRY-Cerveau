@@ -829,3 +829,92 @@ async fn a_pre_a2_table_upgrades_in_place() {
 
     exec(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE;")).await;
 }
+
+// ── Connection loss: the ledger heals itself ─────────────────────────────
+
+/// Terminate every other backend of the test database — what a Postgres restart,
+/// a failover or a firewall killing an idle connection looks like to the ledger.
+async fn kill_other_connections() {
+    let url = pg_url().unwrap();
+    tokio::task::spawn_blocking(move || {
+        let mut c = postgres::Client::connect(&url, postgres::NoTls).expect("admin connect");
+        c.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = current_database() AND pid <> pg_backend_pid()",
+            &[],
+        )
+        .expect("terminate backends");
+    })
+    .await
+    .expect("admin join");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ledger_reconnects_after_its_connection_is_killed() {
+    let Some(url) = pg_url() else {
+        eprintln!("CERVEAU_TEST_PG_URL unset — skipping ledger reconnect test");
+        return;
+    };
+    let schema = "cerveau_task_ledger_reconnect_test";
+    exec(&format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema};"
+    ))
+    .await;
+    let ledger = AgentTaskLedger::connect(&url, schema)
+        .await
+        .expect("connect");
+    let id = ledger
+        .create_task("t", "a", Some("s"), "before the drop", TaskPriority::Normal)
+        .await
+        .expect("works before the drop");
+
+    // A real outage: the ledger is idle when its connection dies. Wait past the idle
+    // check, then use every kind of operation: none may stay broken.
+    kill_other_connections().await;
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+    let listed = ledger
+        .list_tasks("t", "a", None)
+        .await
+        .expect("a read heals the connection and succeeds");
+    assert_eq!(listed.len(), 1, "no data was lost: {listed:?}");
+    ledger
+        .update_status("t", &id, TaskStatus::InProgress, None)
+        .await
+        .expect("a write works on the healed connection");
+    ledger
+        .create_task("t", "a", Some("s"), "after the drop", TaskPriority::Normal)
+        .await
+        .expect("create works after the drop");
+    assert_eq!(ledger.list_tasks("t", "a", None).await.unwrap().len(), 2);
+
+    // A drop that lands right before a call (the client has not noticed yet) may fail
+    // that ONE call — it must not fail the ones after it.
+    kill_other_connections().await;
+    let _maybe_failed = ledger.list_tasks("t", "a", None).await;
+    for attempt in 1..=3 {
+        if ledger.list_tasks("t", "a", None).await.is_ok() {
+            break;
+        }
+        assert!(attempt < 3, "still broken after {attempt} attempts");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    // The archive path (a transaction) and the delegation path heal too.
+    kill_other_connections().await;
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    ledger
+        .update_status("t", &id, TaskStatus::Done, None)
+        .await
+        .expect("a transaction (archive on done) works after a drop");
+    assert!(
+        ledger
+            .list_tasks("t", "a", Some(TaskStatus::Done))
+            .await
+            .unwrap()
+            .iter()
+            .any(|t| t.task_id == id)
+    );
+
+    exec(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE;")).await;
+}
