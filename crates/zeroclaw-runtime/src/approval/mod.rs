@@ -90,6 +90,40 @@ pub enum ApprovalRequirement {
     Pending,
 }
 
+// ── Delegation hand-off ──────────────────────────────────────────
+
+tokio::task_local! {
+    /// The approval infrastructure of the turn that is currently executing a
+    /// `delegate` tool call, so the delegated sub-turn can be gated by the
+    /// same deployment-level risk taxonomy instead of running with no
+    /// approval manager at all.
+    ///
+    /// Holds a *template* (see [`ApprovalManager::delegation_template`]): the
+    /// parent's interactivity mode, `[tool_risk_tiers]`, F-2 ledger and
+    /// pending-approval store, with an empty policy. The delegate derives its
+    /// own manager from it with the target's risk profile. Task-locals are not
+    /// inherited by `spawn`, so spawned delegate paths re-scope it explicitly.
+    static DELEGATION_APPROVAL: Arc<ApprovalManager>;
+}
+
+/// The delegation approval template of the current task, if a parent turn
+/// scoped one. `None` outside a turn that carries an approval manager.
+pub fn current_delegation_approval() -> Option<Arc<ApprovalManager>> {
+    DELEGATION_APPROVAL.try_with(Arc::clone).ok()
+}
+
+/// Run `fut` with `template` as the current delegation approval template.
+/// `None` runs `fut` unchanged (the parent has no approval manager).
+pub async fn scope_delegation_approval<F: std::future::Future>(
+    template: Option<Arc<ApprovalManager>>,
+    fut: F,
+) -> F::Output {
+    match template {
+        Some(template) => DELEGATION_APPROVAL.scope(template, fut).await,
+        None => fut.await,
+    }
+}
+
 // ── ApprovalManager ──────────────────────────────────────────────
 
 pub struct ApprovalManager {
@@ -213,6 +247,16 @@ impl ApprovalManager {
             idem_ledger: self.idem_ledger.clone(),
             pending_store: self.pending_store.clone(),
         }
+    }
+
+    /// A policy-less copy of this manager's *infrastructure* — interactivity
+    /// mode, risk taxonomy, F-2 ledger, pending-approval store — for
+    /// [`scope_delegation_approval`]. The delegate derives the real manager from
+    /// it with [`Self::derive_for_risk_profile`], so an `Irreversible` tool
+    /// called inside a delegated sub-turn is parked exactly as it would be in a
+    /// direct turn.
+    pub fn delegation_template(&self) -> Arc<Self> {
+        Arc::new(self.derive_for_risk_profile(&RiskProfileConfig::default()))
     }
 
     /// Returns `true` when this manager operates in non-interactive mode
@@ -687,6 +731,49 @@ mod tests {
                 );
             })
             .await;
+    }
+
+    #[test]
+    fn delegation_template_carries_infrastructure_but_no_policy() {
+        let store = Arc::new(PendingApprovalsStore::new_in_memory().unwrap());
+        let parent_profile = RiskProfileConfig {
+            auto_approve: vec!["crm_note".into()],
+            ..supervised_config()
+        };
+        let parent = ApprovalManager::for_non_interactive(&parent_profile).with_risk_taxonomy(
+            zeroclaw_config::schema::ToolRiskTiersConfig {
+                irreversible: vec!["wire_money".to_string()],
+                reversible: vec!["crm_note".to_string()],
+            },
+            None,
+            Some(store),
+        );
+        let template = parent.delegation_template();
+        // Infrastructure survives...
+        assert!(template.is_non_interactive());
+        assert!(template.pending_store().is_some());
+        assert_eq!(template.risk_tier("wire_money"), ToolRiskTier::Irreversible);
+        // ...the parent's policy does not: `crm_note` was auto-approved by the
+        // parent's profile but the template grants nothing.
+        assert_eq!(
+            parent.approval_requirement("crm_note"),
+            ApprovalRequirement::Approved
+        );
+        assert_ne!(
+            template.approval_requirement("crm_note"),
+            ApprovalRequirement::Approved
+        );
+        // A manager derived from it for a target enforces the deployment floor
+        // regardless of that target's own `auto_approve`.
+        let target = RiskProfileConfig {
+            auto_approve: vec!["wire_money".into()],
+            ..supervised_config()
+        };
+        let derived = template.derive_for_risk_profile(&target);
+        assert_eq!(
+            derived.approval_requirement("wire_money"),
+            ApprovalRequirement::Pending
+        );
     }
 
     #[test]

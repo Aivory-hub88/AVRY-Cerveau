@@ -1025,7 +1025,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         .await?;
 
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
-        let execution_result =
+        // A `delegate` call runs a sub-turn that must be gated by this turn's
+        // approval infrastructure (risk tiers, F-2 ledger, pending store);
+        // hand it over only when a delegate call is actually in this batch.
+        let delegation_approval = ctx
+            .approval
+            .filter(|_| executable_calls.iter().any(|call| call.name == "delegate"))
+            .map(crate::approval::ApprovalManager::delegation_template);
+        let execution_result = crate::approval::scope_delegation_approval(
+            delegation_approval,
             crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
                 if allow_parallel_execution && executable_calls.len() > 1 {
                     let meta = ctx.meta();
@@ -1064,8 +1072,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     )
                     .await
                 }
-            })
-            .await;
+            }),
+        )
+        .await;
         let executed_slots = match execution_result {
             Ok(slots) => slots,
             Err(e) if is_tool_loop_cancelled(&e) => {

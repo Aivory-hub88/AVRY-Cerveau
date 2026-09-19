@@ -179,6 +179,63 @@ fn delegate_memory_tenant_id(tenant: &crate::agent::tenant::TenantContext, targe
     }
 }
 
+/// The tenant overlay a delegate sub-turn runs under. When the target is one
+/// of the product agent types the overlay's `agent_type` is relabelled to the
+/// TARGET so ledger rows, skill bundles and velocity budgets attribute to the
+/// specialist doing the work (the dashboard matches rows by exact agent_type);
+/// `tenant_id`/`platform_user_id` stay parental so principal continuity holds.
+/// Host-brain targets keep the parent overlay unchanged.
+fn delegate_tenant_overlay(
+    parent: Arc<crate::agent::tenant::TenantContext>,
+    target: &str,
+) -> Arc<crate::agent::tenant::TenantContext> {
+    if PRODUCT_AGENT_TYPES.contains(&target) {
+        Arc::new(crate::agent::tenant::TenantContext {
+            tenant_id: parent.tenant_id.clone(),
+            platform_user_id: parent.platform_user_id.clone(),
+            agent_type: target.to_string(),
+            persona: parent.persona.clone(),
+            connected_toolkits: parent.connected_toolkits.clone(),
+            disabled_toolkits: parent.disabled_toolkits.clone(),
+            tenant_custom_mcp_servers: parent.tenant_custom_mcp_servers.clone(),
+        })
+    } else {
+        parent
+    }
+}
+
+/// Task-local context a spawned delegate must carry across `spawn` (which
+/// does not inherit task-locals): tenant identity, turn origin, and the
+/// parent's approval infrastructure. Captured on the caller's task, then
+/// re-scoped inside the spawned future.
+struct DelegateAmbient {
+    tenant: Option<Arc<crate::agent::tenant::TenantContext>>,
+    origin: Option<Arc<crate::agent::tenant::TurnOriginContext>>,
+    approval: Option<Arc<crate::approval::ApprovalManager>>,
+}
+
+impl DelegateAmbient {
+    fn capture(target: &str) -> Self {
+        Self {
+            tenant: crate::agent::tenant::current_tenant()
+                .map(|parent| delegate_tenant_overlay(parent, target)),
+            origin: crate::agent::tenant::current_turn_origin(),
+            approval: crate::approval::current_delegation_approval(),
+        }
+    }
+
+    async fn scope<F: std::future::Future>(self, fut: F) -> F::Output {
+        crate::approval::scope_delegation_approval(
+            self.approval,
+            crate::agent::tenant::TENANT_CONTEXT.scope(
+                self.tenant,
+                crate::agent::tenant::TURN_ORIGIN_CONTEXT.scope(self.origin, fut),
+            ),
+        )
+        .await
+    }
+}
+
 pub struct DelegateTool {
     agents: Arc<HashMap<String, AliasedAgentConfig>>,
     security: Arc<SecurityPolicy>,
@@ -1682,31 +1739,12 @@ impl DelegateTool {
         // agent_type). `tenant_id`/`platform_user_id` stay parental —
         // memory dimension and principal continuity must not split.
         // Host-brain targets keep the parent overlay unchanged.
-        let tenant_overlay = crate::agent::tenant::current_tenant().map(|t| {
-            if PRODUCT_AGENT_TYPES.contains(&agent_name_owned.as_str()) {
-                std::sync::Arc::new(crate::agent::tenant::TenantContext {
-                    tenant_id: t.tenant_id.clone(),
-                    platform_user_id: t.platform_user_id.clone(),
-                    agent_type: agent_name_owned.clone(),
-                    persona: t.persona.clone(),
-                    connected_toolkits: t.connected_toolkits.clone(),
-                    disabled_toolkits: t.disabled_toolkits.clone(),
-                    tenant_custom_mcp_servers: t.tenant_custom_mcp_servers.clone(),
-                })
-            } else {
-                t
-            }
-        });
-        let turn_origin_overlay = crate::agent::tenant::current_turn_origin();
+        let ambient = DelegateAmbient::capture(&agent_name_owned);
 
         zeroclaw_spawn::spawn!(
             scope_delegate_session_key(parent_session_key, async move {
-                crate::agent::tenant::TENANT_CONTEXT
-                    .scope(
-                        tenant_overlay,
-                        crate::agent::tenant::TURN_ORIGIN_CONTEXT.scope(
-                            turn_origin_overlay,
-                            async move {
+                ambient
+                    .scope(async move {
                 let inner = DelegateTool {
                     agents,
                     security,
@@ -1858,9 +1896,7 @@ impl DelegateTool {
                 Self::background_task_cancels()
                     .lock()
                     .remove(&task_id_clone);
-                            }
-                        )
-                    )
+                    })
                     .await
             })
             .instrument(::zeroclaw_log::attribution_span!(
@@ -1999,6 +2035,10 @@ impl DelegateTool {
             let session_key = parent_session_key.clone();
             let memory = self.memory.clone();
             let __zc_delegate_alias = agent_name.clone();
+            // `spawn` drops task-locals: without this the parallel sub-turn ran
+            // with no tenant context (shared host memory, vanilla MCP grants)
+            // and no approval gate.
+            let ambient = DelegateAmbient::capture(&agent_name);
 
             handles.push(zeroclaw_spawn::spawn!(
                 async move {
@@ -2023,15 +2063,16 @@ impl DelegateTool {
                         caller_alias,
                     };
                     let agent_name_for_return = agent_name.clone();
-                    let result = scope_delegate_session_key(session_key, async move {
-                        crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
-                            .scope(receipt_scope, async move {
-                                Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
-                                    .await
-                            })
-                            .await
-                    })
-                    .await;
+                    let result = ambient
+                        .scope(scope_delegate_session_key(session_key, async move {
+                            crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+                                .scope(receipt_scope, async move {
+                                    Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
+                                        .await
+                                })
+                                .await
+                        }))
+                        .await;
                     (agent_name_for_return, result)
                 }
                 .instrument(::zeroclaw_log::attribution_span!(
@@ -2840,6 +2881,16 @@ impl DelegateTool {
         // Only the label changes — same tracker, same pricing, same turn-usage
         // accumulator, and budget enforcement never reads the alias.
         let sub_cost_ctx = crate::agent::cost::reattributed_cost_context(agent_name);
+        // Gate the sub-turn by the parent turn's approval infrastructure under
+        // the TARGET's own risk profile — the policy that agent would have if a
+        // user talked to it directly. Without a manager here every tool the
+        // target held ran ungated, including `Irreversible`-tier ones.
+        let sub_approval = crate::approval::current_delegation_approval().and_then(|parent| {
+            let profile_name: &str = &agent_config.risk_profile;
+            self.risk_profiles
+                .get(profile_name)
+                .map(|profile| parent.derive_for_risk_profile(profile))
+        });
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
@@ -2857,7 +2908,7 @@ impl DelegateTool {
                             tools_registry: &sub_tools,
                             observer: &noop_observer,
                             silent: true,
-                            approval: None,
+                            approval: sub_approval.as_ref(),
                             multimodal_config: &self.multimodal_config,
                             // Full config so the delegated sub-agent's vision route
                             // resolves the configured `vision_model_provider`'s alias
@@ -2871,7 +2922,6 @@ impl DelegateTool {
                             // an independent target with granted deferred-MCP bundles).
                             activated_tools: sub_activated.as_ref(),
                             model_switch_callback: None,
-                            // delegate subagents don't support approval
                             receipt_generator,
                         },
                         ResolvedRuntimeKnobs {
@@ -3031,7 +3081,7 @@ mod tests {
     use zeroclaw_memory::{AgentScopedMemory, SqliteMemory};
     use zeroclaw_providers::{ChatRequest, ChatResponse, ToolCall};
 
-    zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool);
+    zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool, CountingEchoTool);
 
     #[tokio::test]
     async fn reconciled_loss_label_surfaces_registry_truth() {
@@ -4892,6 +4942,180 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// A tool named `echo_tool` that counts real executions, so a test can
+    /// tell "ran" from "was parked/denied".
+    struct CountingEchoTool(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait]
+    impl Tool for CountingEchoTool {
+        fn name(&self) -> &str {
+            "echo_tool"
+        }
+        fn description(&self) -> &str {
+            "Counts executions."
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {"value": {"type": "string"}}})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: "executed".to_string().into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Run one agentic delegate hop whose model calls `echo_tool` once, under a
+    /// parent approval template built from `tiers`, with the target's risk
+    /// profile granting `auto_approve`. Returns `(executions, pending rows)`.
+    async fn run_gated_delegate(
+        tiers: zeroclaw_config::schema::ToolRiskTiersConfig,
+        auto_approve: Vec<String>,
+        with_parent_approval: bool,
+    ) -> (
+        usize,
+        Vec<crate::control_plane::pending_approvals::PendingApproval>,
+    ) {
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = Arc::new(
+            crate::control_plane::pending_approvals::PendingApprovalsStore::new_in_memory()
+                .unwrap(),
+        );
+        let parent =
+            crate::approval::ApprovalManager::for_non_interactive(&RiskProfileConfig::default())
+                .with_risk_taxonomy(tiers, None, Some(Arc::clone(&store)));
+        let template = with_parent_approval.then(|| parent.delegation_template());
+
+        let mut risk_profiles = agentic_risk_profiles(vec!["echo_tool".to_string()]);
+        risk_profiles.get_mut("agentic_test").unwrap().auto_approve = auto_approve;
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(risk_profiles)
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(CountingEchoTool(
+                Arc::clone(&executions),
+            ))])));
+        let config = agentic_agent_config();
+        let model_provider = OneToolThenFinalModelProvider;
+
+        let result = crate::approval::scope_delegation_approval(template, async {
+            tool.execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap()
+        })
+        .await;
+        assert!(
+            result.success,
+            "delegate hop itself must complete: {result:?}"
+        );
+        let ran = executions.load(std::sync::atomic::Ordering::SeqCst);
+        (ran, store.list(Some("pending")).unwrap())
+    }
+
+    fn echo_tiers(irreversible: bool) -> zeroclaw_config::schema::ToolRiskTiersConfig {
+        zeroclaw_config::schema::ToolRiskTiersConfig {
+            irreversible: if irreversible {
+                vec!["echo_tool".to_string()]
+            } else {
+                Vec::new()
+            },
+            reversible: if irreversible {
+                Vec::new()
+            } else {
+                vec!["echo_tool".to_string()]
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn delegate_sub_turn_parks_irreversible_tool_instead_of_running_it() {
+        // The bug: the sub-loop ran with `approval: None`, so an `Irreversible`
+        // tool executed straight through. Even an `auto_approve` grant on the
+        // target must not lift the hard floor.
+        let (ran, pending) =
+            run_gated_delegate(echo_tiers(true), vec!["echo_tool".to_string()], true).await;
+        assert_eq!(
+            ran, 0,
+            "irreversible tool must not execute inside a delegate"
+        );
+        assert_eq!(pending.len(), 1, "it must be parked as a pending approval");
+        assert_eq!(pending[0].tool_name, "echo_tool");
+    }
+
+    #[tokio::test]
+    async fn delegate_sub_turn_runs_auto_approved_reversible_tool() {
+        let (ran, pending) =
+            run_gated_delegate(echo_tiers(false), vec!["echo_tool".to_string()], true).await;
+        assert_eq!(ran, 1, "an auto-approved reversible tool must still run");
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delegate_sub_turn_denies_reversible_tool_the_target_did_not_auto_approve() {
+        // Policy comes from the TARGET's risk profile, non-interactively: not
+        // auto-approved => denied, and no pending row (that is Irreversible only).
+        let (ran, pending) = run_gated_delegate(echo_tiers(false), Vec::new(), true).await;
+        assert_eq!(ran, 0);
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delegate_without_a_parent_approval_manager_is_unchanged() {
+        // Vanilla / no-approval parents keep the pre-existing behaviour, so the
+        // change is inert for every caller that never had a manager.
+        let (ran, pending) = run_gated_delegate(echo_tiers(true), Vec::new(), false).await;
+        assert_eq!(ran, 1);
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawned_delegate_keeps_tenant_and_approval_context() {
+        // `spawn` drops task-locals. The parallel/background paths must carry
+        // tenant identity (relabelled to the target for product types), turn
+        // origin and the approval template across it.
+        let parent =
+            crate::approval::ApprovalManager::for_non_interactive(&RiskProfileConfig::default());
+        let ambient = crate::agent::tenant::TENANT_CONTEXT
+            .scope(
+                tenant_ctx("user1", "chief_of_staff"),
+                crate::approval::scope_delegation_approval(
+                    Some(parent.delegation_template()),
+                    async { DelegateAmbient::capture("leads_qualifier") },
+                ),
+            )
+            .await;
+        let (tenant, has_approval) = tokio::spawn(ambient.scope(async {
+            (
+                crate::agent::tenant::current_tenant()
+                    .map(|t| (t.tenant_id.clone(), t.agent_type.clone())),
+                crate::approval::current_delegation_approval().is_some(),
+            )
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            tenant,
+            Some((
+                "user1.chief_of_staff".to_string(),
+                "leads_qualifier".to_string()
+            )),
+            "tenant survives spawn, agent_type relabelled to the target"
+        );
+        assert!(has_approval, "approval template survives spawn");
+        // Outside the scope nothing leaks.
+        assert!(crate::agent::tenant::current_tenant().is_none());
+        assert!(crate::approval::current_delegation_approval().is_none());
     }
 
     #[tokio::test]
