@@ -55,6 +55,10 @@ pub(crate) async fn record_executed_outcomes(
             }
         }
 
+        // Feed the cross-turn circuit breaker (executed calls only: a call the
+        // breaker short-circuited never reaches here, so it cannot count itself).
+        super::tool_breaker::record_outcome(ctx, &call.name, &outcome);
+
         // The pending ToolCall and terminal ToolResult are emitted by the
         // executor (execute_one_tool) at dispatch and completion time so serial
         // batches interleave call->result per tool. Post-exec only records the

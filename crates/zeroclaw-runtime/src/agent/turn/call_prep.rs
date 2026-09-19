@@ -141,6 +141,26 @@ pub(crate) async fn prepare_tool_calls(
             continue;
         }
 
+        // ── Circuit breaker: the tool's SERVER has been failing ─────────
+        // After N consecutive server-side failures (across turns) for this
+        // tenant, answer with "temporarily unavailable, do not retry" instead
+        // of calling a dead server again. Never enters hooks/approval/execution.
+        if let Some(outcome) = super::tool_breaker::check_open(ctx, &call.name) {
+            if let Some(tx) = ctx.on_delta {
+                let _ = tx
+                    .send(StreamDelta::Status(format!(
+                        "\u{274c} {}: {}\n",
+                        call.name, outcome.output
+                    )))
+                    .await;
+            }
+            if let Some(tx) = ctx.event_tx {
+                emit_tool_call_pair(tx, call, &outcome).await;
+            }
+            ordered_results[idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
+            continue;
+        }
+
         // ── Hook: before_tool_call (modifying) ──────────
         let mut tool_name = call.name.clone();
         let mut tool_args = call.arguments.clone();
@@ -583,6 +603,138 @@ mod tests {
             "error_reason should carry the parse failure: {:?}",
             outcome.error_reason
         );
+    }
+
+    fn breaker_call(name: &str) -> ParsedToolCall {
+        ParsedToolCall {
+            name: name.to_string(),
+            arguments: serde_json::json!({"thread_id": "t-1"}),
+            tool_call_id: Some("call_b".to_string()),
+            arguments_parse_error: None,
+        }
+    }
+
+    fn outcome(success: bool, text: &str) -> crate::agent::tool_execution::ToolExecutionOutcome {
+        crate::agent::tool_execution::ToolExecutionOutcome {
+            output: text.to_string(),
+            success,
+            error_reason: (!success).then(|| text.to_string()),
+            duration: std::time::Duration::ZERO,
+            receipt: None,
+            output_data: None,
+        }
+    }
+
+    /// Feed `n` executed outcomes for `tool` through the real post-execution path.
+    async fn feed_outcomes(
+        ctx: &TurnCtx<'_>,
+        tool: &str,
+        n: usize,
+        success: bool,
+        text: &str,
+    ) {
+        for _ in 0..n {
+            let calls = vec![breaker_call(tool)];
+            let mut ordered = vec![None];
+            crate::agent::turn::post_exec::record_executed_outcomes(
+                ctx,
+                &[0],
+                &calls,
+                vec![outcome(success, text)],
+                &[None],
+                &mut ordered,
+                0,
+            )
+            .await;
+        }
+    }
+
+    async fn prepared_for(ctx: &TurnCtx<'_>, tool: &str) -> PreparedToolCalls {
+        let calls = vec![breaker_call(tool)];
+        prepare_tool_calls(
+            ctx,
+            &calls,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            0,
+            false,
+        )
+        .await
+        .expect("prepare_tool_calls should not error")
+    }
+
+    #[tokio::test]
+    async fn a_dead_mcp_server_is_short_circuited_after_five_server_failures() {
+        let dedup_exempt_tools: Vec<String> = Vec::new();
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let ctx = test_ctx("turn-breaker-open", &dedup_exempt_tools, &pacing);
+        let tool = "brk_dead__get_thread_memory";
+
+        feed_outcomes(
+            &ctx,
+            tool,
+            5,
+            false,
+            "MCP server `brk_dead` error during tool call `get_thread_memory`: HTTP 502",
+        )
+        .await;
+
+        let prepared = prepared_for(&ctx, tool).await;
+        assert!(prepared.executable_indices.is_empty(), "must not reach the dead server");
+        let (_, id, blocked) = prepared.ordered_results.into_iter().next().flatten().expect("result");
+        assert_eq!(id.as_deref(), Some("call_b"));
+        assert!(!blocked.success);
+        assert!(blocked.output.contains("temporarily unavailable"), "{}", blocked.output);
+        assert!(blocked.output.contains("HTTP 502"), "cause must reach the model: {}", blocked.output);
+        assert!(blocked.output.contains("Do not retry"), "{}", blocked.output);
+
+        // A different tool of the same server-shaped name is unaffected.
+        let other = prepared_for(&ctx, "brk_dead__search_mail").await;
+        assert_eq!(other.executable_indices, vec![0]);
+    }
+
+    #[tokio::test]
+    async fn answers_with_errors_or_successes_never_open_the_breaker() {
+        let dedup_exempt_tools: Vec<String> = Vec::new();
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let ctx = test_ctx("turn-breaker-closed", &dedup_exempt_tools, &pacing);
+
+        // The server ANSWERS with an error every time ("not found"): it is alive.
+        let answering = "brk_alive__get_thread";
+        feed_outcomes(
+            &ctx,
+            answering,
+            8,
+            false,
+            "MCP `get_thread` (server `brk_alive`) returned isError: thread not found",
+        )
+        .await;
+        assert_eq!(prepared_for(&ctx, answering).await.executable_indices, vec![0]);
+
+        // Four server failures, one success, four more: never five in a row.
+        let flaky = "brk_flaky__search";
+        let down = "MCP server `brk_flaky` timed out after 30s before writing tool call `search`";
+        feed_outcomes(&ctx, flaky, 4, false, down).await;
+        feed_outcomes(&ctx, flaky, 1, true, "ok").await;
+        feed_outcomes(&ctx, flaky, 4, false, down).await;
+        assert_eq!(prepared_for(&ctx, flaky).await.executable_indices, vec![0]);
+    }
+
+    #[tokio::test]
+    async fn breaker_threshold_zero_disables_it_and_builtins_are_exempt() {
+        let dedup_exempt_tools: Vec<String> = Vec::new();
+        let mut pacing = zeroclaw_config::schema::PacingConfig::default();
+        pacing.tool_breaker_threshold = 0;
+        let ctx = test_ctx("turn-breaker-off", &dedup_exempt_tools, &pacing);
+        let down = "MCP server `brk_off` error during tool call `t`";
+        feed_outcomes(&ctx, "brk_off__t", 10, false, down).await;
+        assert_eq!(prepared_for(&ctx, "brk_off__t").await.executable_indices, vec![0]);
+
+        // Built-ins (no `server__tool` shape) have no remote server to be down.
+        let pacing_on = zeroclaw_config::schema::PacingConfig::default();
+        let ctx_on = test_ctx("turn-breaker-builtin", &dedup_exempt_tools, &pacing_on);
+        feed_outcomes(&ctx_on, "brk_builtin", 10, false, down).await;
+        assert_eq!(prepared_for(&ctx_on, "brk_builtin").await.executable_indices, vec![0]);
     }
 
     /// A normal, successfully-parsed call must be unaffected by the new

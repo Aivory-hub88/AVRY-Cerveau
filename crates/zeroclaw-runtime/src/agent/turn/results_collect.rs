@@ -108,9 +108,13 @@ pub(crate) fn collect_tool_results(
                 .map(|c| &c.arguments)
                 .unwrap_or(&serde_json::Value::Null);
             let det_result = if outcome.success {
+                loop_detector.note_success(&tool_name);
                 loop_detector.record(&tool_name, args, &outcome.output)
             } else {
-                crate::agent::loop_detector::LoopDetectionResult::Ok
+                // Failures used to be invisible to every pattern. Count a tool
+                // failing again and again (any arguments) so it cannot burn the
+                // whole iteration budget.
+                loop_detector.record_failure(&tool_name, &outcome.output)
             };
             match det_result {
                 crate::agent::loop_detector::LoopDetectionResult::Ok => {}
@@ -190,29 +194,37 @@ pub(crate) fn collect_tool_results(
                         ScanOutcome::Suspicious { patterns, score } => {
                             ::zeroclaw_log::record!(
                                 WARN,
-                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                    .with_category(::zeroclaw_log::EventCategory::Tool)
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                    .with_attrs(::serde_json::json!({
-                                        "tool": tool_name,
-                                        "patterns": patterns,
-                                        "score": score,
-                                    })),
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_category(::zeroclaw_log::EventCategory::Tool)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "tool": tool_name,
+                                    "patterns": patterns,
+                                    "score": score,
+                                })),
                                 "MCP tool result flagged suspicious by prompt guard"
                             );
                             sanitized
                         }
-                        ScanOutcome::Sanitized { patterns, score, .. } => {
+                        ScanOutcome::Sanitized {
+                            patterns, score, ..
+                        } => {
                             ::zeroclaw_log::record!(
                                 WARN,
-                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                    .with_category(::zeroclaw_log::EventCategory::Tool)
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                    .with_attrs(::serde_json::json!({
-                                        "tool": tool_name,
-                                        "patterns": patterns,
-                                        "score": score,
-                                    })),
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_category(::zeroclaw_log::EventCategory::Tool)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "tool": tool_name,
+                                    "patterns": patterns,
+                                    "score": score,
+                                })),
                                 "MCP tool result redacted by prompt guard (Sanitize)"
                             );
                             sanitized
@@ -220,13 +232,16 @@ pub(crate) fn collect_tool_results(
                         ScanOutcome::Blocked { reason } => {
                             ::zeroclaw_log::record!(
                                 WARN,
-                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                                    .with_category(::zeroclaw_log::EventCategory::Tool)
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                    .with_attrs(::serde_json::json!({
-                                        "tool": tool_name,
-                                        "reason": reason,
-                                    })),
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Reject
+                                )
+                                .with_category(::zeroclaw_log::EventCategory::Tool)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "tool": tool_name,
+                                    "reason": reason,
+                                })),
                                 "MCP tool result blocked by prompt guard"
                             );
                             // The tool call itself succeeded — this is our
@@ -236,7 +251,9 @@ pub(crate) fn collect_tool_results(
                             // model sees is replaced with a clear,
                             // explainable notice instead of a dropped or
                             // silently-mangled answer (plan doc §3.4).
-                            format!("[content withheld: blocked by prompt-injection guard — {reason}]")
+                            format!(
+                                "[content withheld: blocked by prompt-injection guard — {reason}]"
+                            )
                         }
                         ScanOutcome::Safe => sanitized,
                     }
@@ -397,6 +414,113 @@ mod tests {
             "turn-test",
             None,
         )
+    }
+
+    /// One collection pass over `n` FAILED calls of `tool`, each with a different
+    /// argument AND a different error text (so no identical-result pattern can fire).
+    fn run_failures(
+        tool: &str,
+        n: usize,
+        history: &mut Vec<ChatMessage>,
+        detector: &mut LoopDetector,
+    ) -> Result<CollectedResults> {
+        let ignore: HashSet<&str> = HashSet::new();
+        let mut tool_calls = Vec::new();
+        let mut ordered = Vec::new();
+        for i in 0..n {
+            tool_calls.push(ParsedToolCall {
+                name: tool.to_string(),
+                arguments: serde_json::json!({ "thread_id": format!("thread-{i}") }),
+                tool_call_id: None,
+                arguments_parse_error: None,
+            });
+            ordered.push(Some((
+                tool.to_string(),
+                None,
+                outcome(
+                    &format!("MCP server `srv` error during tool call `t`: HTTP 502 (request {i})"),
+                    false,
+                ),
+            )));
+        }
+        collect_tool_results(
+            ordered,
+            &tool_calls,
+            history,
+            detector,
+            &ignore,
+            10_000,
+            None,
+            "test-model",
+            0,
+            "turn-test",
+            None,
+        )
+    }
+
+    #[test]
+    fn a_mcp_tool_failing_repeatedly_is_warned_blocked_then_stops_the_turn() {
+        // The production shape: one tool, fresh arguments and fresh error text every
+        // call. Nothing in the detector used to see failures at all.
+        let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        let mut history: Vec<ChatMessage> = Vec::new();
+        assert!(run_failures("srv__get_thread_memory", 2, &mut history, &mut detector).is_ok());
+        assert!(history.is_empty(), "two failures are tolerated silently");
+        assert!(run_failures("srv__get_thread_memory", 1, &mut history, &mut detector).is_ok());
+        assert!(
+            history
+                .iter()
+                .any(|m| m.content.contains("[Loop Detection]")
+                    && m.content.contains("failed 3 times in a row")),
+            "third failure warns: {history:?}"
+        );
+        assert!(run_failures("srv__get_thread_memory", 1, &mut history, &mut detector).is_ok());
+        assert!(
+            history.iter().any(|m| m.content.contains("BLOCKED")),
+            "fourth is blocked: {history:?}"
+        );
+        let fifth = run_failures("srv__get_thread_memory", 1, &mut history, &mut detector);
+        assert!(
+            fifth.is_err(),
+            "fifth consecutive failure must end the turn (graceful wrap-up handles the break)"
+        );
+    }
+
+    #[test]
+    fn interleaved_success_resets_and_builtin_failures_stay_exempt() {
+        let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        let mut history: Vec<ChatMessage> = Vec::new();
+        run_failures("srv__t", 2, &mut history, &mut detector).unwrap();
+        // A success of the same tool resets its streak.
+        let ignore: HashSet<&str> = HashSet::new();
+        let ok_call = vec![ParsedToolCall {
+            name: "srv__t".into(),
+            arguments: serde_json::json!({"thread_id": "good"}),
+            tool_call_id: None,
+            arguments_parse_error: None,
+        }];
+        collect_tool_results(
+            vec![Some(("srv__t".into(), None, outcome("fine", true)))],
+            &ok_call,
+            &mut history,
+            &mut detector,
+            &ignore,
+            10_000,
+            None,
+            "m",
+            0,
+            "t",
+            None,
+        )
+        .unwrap();
+        run_failures("srv__t", 2, &mut history, &mut detector).unwrap();
+        assert!(
+            history.is_empty(),
+            "2 + success + 2 never reaches 3 in a row: {history:?}"
+        );
+        // Built-ins (no `server__tool` shape) fail as a normal part of probing.
+        let mut fresh = LoopDetector::new(LoopDetectorConfig::default());
+        assert!(run_failures("file_read", 8, &mut Vec::new(), &mut fresh).is_ok());
     }
 
     #[test]
@@ -582,11 +706,13 @@ mod tests {
     #[test]
     fn mcp_tool_result_is_withheld_when_its_server_is_configured_to_block() {
         let mut mcp_config = zeroclaw_config::schema::McpConfig::default();
-        mcp_config.servers.push(zeroclaw_config::schema::McpServerConfig {
-            name: "avry-mail".to_string(),
-            content_safety_action: Some("block".to_string()),
-            ..Default::default()
-        });
+        mcp_config
+            .servers
+            .push(zeroclaw_config::schema::McpServerConfig {
+                name: "avry-mail".to_string(),
+                content_safety_action: Some("block".to_string()),
+                ..Default::default()
+            });
 
         let result = collect_single_with_safety(
             "avry-mail__get_thread_memory",
@@ -601,11 +727,13 @@ mod tests {
     #[test]
     fn per_server_block_config_does_not_affect_other_servers() {
         let mut mcp_config = zeroclaw_config::schema::McpConfig::default();
-        mcp_config.servers.push(zeroclaw_config::schema::McpServerConfig {
-            name: "avry-mail".to_string(),
-            content_safety_action: Some("block".to_string()),
-            ..Default::default()
-        });
+        mcp_config
+            .servers
+            .push(zeroclaw_config::schema::McpServerConfig {
+                name: "avry-mail".to_string(),
+                content_safety_action: Some("block".to_string()),
+                ..Default::default()
+            });
 
         // A DIFFERENT server (no override) on the same registry must stay
         // on the global default (Warn) — the block config is scoped to
