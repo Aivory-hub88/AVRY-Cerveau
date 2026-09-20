@@ -293,6 +293,14 @@ impl PostgresMemory {
             -- that query fast without widening the general-purpose indexes
             -- above to carry rows `recall()`'s normal callers rarely want.
             CREATE INDEX IF NOT EXISTS idx_memories_conversation_fts ON {qualified_table} USING gin(to_tsvector('simple', content)) WHERE category = 'conversation';
+
+            -- ADR-016 P1. All four are additive and nullable/defaulted, so the previous
+            -- binary ignores them and a rollback is safe. `importance` used to be added
+            -- only by the pgvector migration and was never written or read.
+            ALTER TABLE {qualified_table} ADD COLUMN IF NOT EXISTS importance REAL;
+            ALTER TABLE {qualified_table} ADD COLUMN IF NOT EXISTS superseded_by TEXT;
+            ALTER TABLE {qualified_table} ADD COLUMN IF NOT EXISTS access_count INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE {qualified_table} ADD COLUMN IF NOT EXISTS last_accessed_at TIMESTAMPTZ;
             "
         ))?;
 
@@ -440,6 +448,56 @@ impl PostgresMemory {
         Ok(())
     }
 
+    /// ADR-016 P1: count a recall hit against every returned row. Best effort by design: the
+    /// counters feed a future salience score, so losing an increment is harmless, while failing
+    /// or slowing a recall because of a bookkeeping write would not be.
+    fn touch_accessed(client: &mut Client, qualified_table: &str, entries: &[MemoryEntry]) {
+        if entries.is_empty() {
+            return;
+        }
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        let stmt = format!(
+            "UPDATE {qualified_table}
+                SET access_count = access_count + 1, last_accessed_at = now()
+              WHERE id = ANY($1)"
+        );
+        // Deliberately ignored, see above.
+        drop(client.execute(&stmt, &[&ids]));
+    }
+
+    /// Mark memories as superseded by another one (ADR-016 P1). Superseded rows are skipped by
+    /// recall and are the first to go when a tenant's budget is enforced, but they are **kept**
+    /// so a wrong call is reversible with [`Self::clear_superseded`]. Returns the number of rows
+    /// changed. Nothing calls this automatically yet; automatic contradiction detection is P4.
+    pub async fn mark_superseded(&self, ids: &[&str], superseded_by: &str) -> Result<u64> {
+        let ids: Vec<String> = ids.iter().map(|s| (*s).to_string()).collect();
+        let by = superseded_by.to_string();
+        let client = self.client.get().clone();
+        let qualified_table = self.qualified_table.clone();
+        run_on_os_thread(move || -> Result<u64> {
+            let mut client = client.get()?;
+            let stmt = format!(
+                "UPDATE {qualified_table} SET superseded_by = $2 WHERE id = ANY($1) AND id <> $2"
+            );
+            Ok(client.execute(&stmt, &[&ids, &by])?)
+        })
+        .await
+    }
+
+    /// Undo [`Self::mark_superseded`] for the given ids.
+    pub async fn clear_superseded(&self, ids: &[&str]) -> Result<u64> {
+        let ids: Vec<String> = ids.iter().map(|s| (*s).to_string()).collect();
+        let client = self.client.get().clone();
+        let qualified_table = self.qualified_table.clone();
+        run_on_os_thread(move || -> Result<u64> {
+            let mut client = client.get()?;
+            let stmt =
+                format!("UPDATE {qualified_table} SET superseded_by = NULL WHERE id = ANY($1)");
+            Ok(client.execute(&stmt, &[&ids])?)
+        })
+        .await
+    }
+
     fn row_to_entry(row: &Row) -> Result<MemoryEntry> {
         // Named access is used throughout so row_to_entry is immune to SELECT
         // column reordering and does not depend on matching the DDL ordering.
@@ -456,8 +514,17 @@ impl PostgresMemory {
             namespace: row
                 .try_get::<_, String>("namespace")
                 .unwrap_or_else(|_| "default".into()),
-            importance: row.try_get("importance").ok(),
-            superseded_by: None,
+            // REAL column, so read it as f32; asking for f64 is a type error that
+            // `.ok()` silently turned into None.
+            importance: row
+                .try_get::<_, Option<f32>>("importance")
+                .ok()
+                .flatten()
+                .map(f64::from),
+            superseded_by: row
+                .try_get::<_, Option<String>>("superseded_by")
+                .ok()
+                .flatten(),
             kind: None,
             pinned: false,
             tenant_id: None,
@@ -590,7 +657,7 @@ impl Memory for PostgresMemory {
             let rows = if pgvector_ready {
                 let stmt = format!(
                     "
-                    SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id,
+                    SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.importance, m.superseded_by,
                            (
                              (
                                CASE WHEN q.tsq IS NOT NULL AND to_tsvector('simple', m.key) @@ q.tsq
@@ -614,6 +681,7 @@ impl Memory for PostgresMemory {
                       END AS tsq
                     ) q
                     WHERE ($2::TEXT IS NULL OR m.session_id = $2)
+                      AND m.superseded_by IS NULL
                       AND ($1 = '' OR
                            (q.tsq IS NOT NULL AND to_tsvector('simple', m.key || ' ' || m.content) @@ q.tsq) OR
                            ($6::vector IS NOT NULL AND m.embedding IS NOT NULL))
@@ -630,7 +698,7 @@ impl Memory for PostgresMemory {
             } else {
                 let stmt = format!(
                     "
-                    SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id,
+                    SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.importance, m.superseded_by,
                            (
                              CASE WHEN q.tsq IS NOT NULL AND to_tsvector('simple', m.key) @@ q.tsq
                                THEN ts_rank_cd(to_tsvector('simple', m.key), q.tsq) * 2.0
@@ -649,6 +717,7 @@ impl Memory for PostgresMemory {
                       END AS tsq
                     ) q
                     WHERE ($2::TEXT IS NULL OR m.session_id = $2)
+                      AND m.superseded_by IS NULL
                       AND ($1 = '' OR (q.tsq IS NOT NULL
                            AND to_tsvector('simple', m.key || ' ' || m.content) @@ q.tsq))
                       AND ($4::TEXT::TIMESTAMPTZ IS NULL OR m.created_at >= $4::TEXT::TIMESTAMPTZ)
@@ -659,9 +728,12 @@ impl Memory for PostgresMemory {
                 );
                 client.query(&stmt, &[&query, &sid, &limit_i64, &since_owned, &until_owned])?
             };
-            rows.iter()
+            let entries = rows
+                .iter()
                 .map(Self::row_to_entry)
-                .collect::<Result<Vec<MemoryEntry>>>()
+                .collect::<Result<Vec<MemoryEntry>>>()?;
+            Self::touch_accessed(&mut client, &qualified_table, &entries);
+            Ok(entries)
         })
         .await
     }
@@ -696,7 +768,7 @@ impl Memory for PostgresMemory {
 
             let stmt = format!(
                 "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id,
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.importance, m.superseded_by,
                        CASE WHEN q.tsq IS NOT NULL AND to_tsvector('simple', m.content) @@ q.tsq
                          THEN ts_rank_cd(to_tsvector('simple', m.content), q.tsq)
                          ELSE 0.0 END AS score
@@ -739,7 +811,7 @@ impl Memory for PostgresMemory {
             let mut client = client.get()?;
             let stmt = format!(
                 "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.importance, m.superseded_by
                 FROM {qualified_table} m
                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
                 WHERE m.key = $1
@@ -764,7 +836,7 @@ impl Memory for PostgresMemory {
             let mut client = client.get()?;
             let stmt = format!(
                 "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.importance, m.superseded_by
                 FROM {qualified_table} m
                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
                 WHERE m.key = $1 AND m.agent_id = $2
@@ -793,7 +865,7 @@ impl Memory for PostgresMemory {
             let mut client = client.get()?;
             let stmt = format!(
                 "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.importance, m.superseded_by
                 FROM {qualified_table} m
                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
                 WHERE ($1::TEXT IS NULL OR m.category = $1)
@@ -837,7 +909,7 @@ impl Memory for PostgresMemory {
             let mut client = client.get()?;
             let stmt = format!(
                 "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.importance, m.superseded_by
                 FROM {qualified_table} m
                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
                 WHERE ($1::TEXT IS NULL OR m.category = $1)
@@ -929,7 +1001,7 @@ impl Memory for PostgresMemory {
             let mut client = client.get()?;
             let stmt = format!(
                 "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.importance, m.superseded_by
                 FROM {qualified_table} m
                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
                 WHERE m.agent_id = (SELECT id FROM {qualified_agents} WHERE alias = $1)
@@ -1028,7 +1100,7 @@ impl Memory for PostgresMemory {
         category: MemoryCategory,
         session_id: Option<&str>,
         _namespace: Option<&str>,
-        _importance: Option<f64>,
+        importance: Option<f64>,
         agent_id: Option<&str>,
     ) -> Result<()> {
         // Computed before the blocking closure: embedding is an async call
@@ -1045,6 +1117,14 @@ impl Memory for PostgresMemory {
         let qualified_agents = self.qualified_agents.clone();
         let key = key.to_string();
         let content = content.to_string();
+        // ADR-016 P1: persist importance. An explicit value (clamped) wins; otherwise the
+        // heuristic scorer supplies one, so the ranking and budget code that already orders
+        // by importance has something to order by.
+        let importance_explicit: Option<f32> = importance
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 1.0) as f32);
+        let importance_heuristic: f32 =
+            crate::importance::compute_importance(&content, &category) as f32;
         let category = Self::category_to_str(&category);
         let sid = session_id.map(str::to_string);
         let aid = agent_id.map(str::to_string);
@@ -1068,41 +1148,71 @@ impl Memory for PostgresMemory {
                 let stmt = format!(
                     "
                     INSERT INTO {qualified_table}
-                        (id, key, content, category, created_at, updated_at, session_id, agent_id, embedding)
+                        (id, key, content, category, created_at, updated_at, session_id, agent_id, embedding, importance)
                     VALUES
                         ($1, $2, $3, $4, $5, $6, $7,
                          COALESCE($8, (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)),
-                         $9)
+                         $9, COALESCE($10::REAL, $11::REAL))
                     ON CONFLICT (agent_id, key) DO UPDATE SET
                         content = EXCLUDED.content,
                         category = EXCLUDED.category,
                         updated_at = EXCLUDED.updated_at,
                         session_id = EXCLUDED.session_id,
-                        embedding = COALESCE(EXCLUDED.embedding, {qualified_table}.embedding)
+                        embedding = COALESCE(EXCLUDED.embedding, {qualified_table}.embedding),
+                        -- Re-storing a key never lowers an importance that was set on purpose.
+                        importance = COALESCE($10::REAL, {qualified_table}.importance, $11::REAL),
+                        -- A fresh write to a key revives it if it had been superseded.
+                        superseded_by = NULL
                     "
                 );
                 client.execute(
                     &stmt,
-                    &[&id, &key, &content, &category, &now, &now, &sid, &aid, &embedding],
+                    &[
+                        &id,
+                        &key,
+                        &content,
+                        &category,
+                        &now,
+                        &now,
+                        &sid,
+                        &aid,
+                        &embedding,
+                        &importance_explicit,
+                        &importance_heuristic,
+                    ],
                 )?;
             } else {
                 let stmt = format!(
                     "
                     INSERT INTO {qualified_table}
-                        (id, key, content, category, created_at, updated_at, session_id, agent_id)
+                        (id, key, content, category, created_at, updated_at, session_id, agent_id, importance)
                     VALUES
                         ($1, $2, $3, $4, $5, $6, $7,
-                         COALESCE($8, (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)))
+                         COALESCE($8, (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)),
+                         COALESCE($9::REAL, $10::REAL))
                     ON CONFLICT (agent_id, key) DO UPDATE SET
                         content = EXCLUDED.content,
                         category = EXCLUDED.category,
                         updated_at = EXCLUDED.updated_at,
-                        session_id = EXCLUDED.session_id
+                        session_id = EXCLUDED.session_id,
+                        importance = COALESCE($9::REAL, {qualified_table}.importance, $10::REAL),
+                        superseded_by = NULL
                     "
                 );
                 client.execute(
                     &stmt,
-                    &[&id, &key, &content, &category, &now, &now, &sid, &aid],
+                    &[
+                        &id,
+                        &key,
+                        &content,
+                        &category,
+                        &now,
+                        &now,
+                        &sid,
+                        &aid,
+                        &importance_explicit,
+                        &importance_heuristic,
+                    ],
                 )?;
             }
             Ok(())
@@ -1130,7 +1240,10 @@ impl Memory for PostgresMemory {
         // Computed before the blocking closure — see `store_with_agent`'s
         // same comment on why embedding can't happen inside
         // `run_on_os_thread`.
-        let query_vector = self.try_embed(&q, "recall_for_agents").await.map(pgvector::Vector::from);
+        let query_vector = self
+            .try_embed(&q, "recall_for_agents")
+            .await
+            .map(pgvector::Vector::from);
         let pgvector_ready = self.pgvector_ready;
         let vector_weight = self.vector_weight;
         let keyword_weight = self.keyword_weight;
@@ -1161,7 +1274,7 @@ impl Memory for PostgresMemory {
             let rows = if pgvector_ready {
                 let stmt = format!(
                     "
-                    SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id,
+                    SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.importance, m.superseded_by,
                            (
                              (
                                CASE WHEN q.tsq IS NOT NULL AND to_tsvector('simple', m.key) @@ q.tsq
@@ -1185,6 +1298,7 @@ impl Memory for PostgresMemory {
                       END AS tsq
                     ) q
                     WHERE ($2::TEXT IS NULL OR m.session_id = $2)
+                      AND m.superseded_by IS NULL
                       AND ($1 = '' OR
                            (q.tsq IS NOT NULL AND to_tsvector('simple', m.key || ' ' || m.content) @@ q.tsq) OR
                            ($7::vector IS NOT NULL AND m.embedding IS NOT NULL))
@@ -1202,7 +1316,7 @@ impl Memory for PostgresMemory {
             } else {
                 let stmt = format!(
                     "
-                    SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id,
+                    SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id, m.importance, m.superseded_by,
                            (
                              CASE WHEN q.tsq IS NOT NULL AND to_tsvector('simple', m.key) @@ q.tsq
                                THEN ts_rank_cd(to_tsvector('simple', m.key), q.tsq) * 2.0
@@ -1221,6 +1335,7 @@ impl Memory for PostgresMemory {
                       END AS tsq
                     ) q
                     WHERE ($2::TEXT IS NULL OR m.session_id = $2)
+                      AND m.superseded_by IS NULL
                       AND ($1 = '' OR (q.tsq IS NOT NULL
                            AND to_tsvector('simple', m.key || ' ' || m.content) @@ q.tsq))
                       AND m.agent_id = ANY($4)
@@ -1235,9 +1350,12 @@ impl Memory for PostgresMemory {
                     &[&q, &sid, &limit_i64, &allowed, &since_owned, &until_owned],
                 )?
             };
-            rows.iter()
+            let entries = rows
+                .iter()
                 .map(Self::row_to_entry)
-                .collect::<Result<Vec<MemoryEntry>>>()
+                .collect::<Result<Vec<MemoryEntry>>>()?;
+            Self::touch_accessed(&mut client, &qualified_table, &entries);
+            Ok(entries)
         })
         .await
     }
@@ -1573,7 +1691,8 @@ impl PostgresMemory {
                                  SELECT m.id, m.agent_id,
                                      row_number() OVER (
                                          PARTITION BY m.agent_id
-                                         ORDER BY m.importance DESC NULLS LAST, m.created_at DESC
+                                         ORDER BY (m.superseded_by IS NULL) DESC,
+                                                  m.importance DESC NULLS LAST, m.created_at DESC
                                      ) AS rn
                                  FROM {table} m WHERE m.category = $1
                              ) r
