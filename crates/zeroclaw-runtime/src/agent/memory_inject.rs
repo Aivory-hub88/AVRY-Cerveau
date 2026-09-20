@@ -249,6 +249,154 @@ fn should_skip_entry(key: &str, content: &str) -> bool {
     false
 }
 
+/// Counts-only comparison of what the recall filter kept versus what other filters would keep
+/// on the same candidate pool (ADR-016 §18). It exists to measure, in production and for a few
+/// days, how many recalled memories the current path throws away, before anyone changes it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ShadowCounts {
+    /// Candidates recalled for this turn (the pool the filter works on).
+    pub pool: usize,
+    /// Candidates the renderer would skip whatever the score (autosave notes, history blobs...).
+    pub ineligible: usize,
+    /// Kept by the arm that is not active when `rerank_enabled` is off: flat 7-day decay, then the floor.
+    pub decay_kept: usize,
+    /// Kept by the floor alone, no decay and no rerank.
+    pub floor_only_kept: usize,
+    /// Kept by the rerank blend at the configured floor.
+    pub rerank_kept: usize,
+    /// Kept by the rerank blend at a 0.3 floor.
+    pub rerank_f03_kept: usize,
+    /// Kept by rerank (configured floor) but not by the decay arm, and the reverse.
+    pub rerank_only: usize,
+    pub decay_only: usize,
+    pub score_max: Option<f64>,
+    pub score_p50: Option<f64>,
+}
+
+fn is_eligible(entry: &MemoryEntry, exclude_conversation: bool) -> bool {
+    !(exclude_conversation && matches!(entry.category, MemoryCategory::Conversation))
+        && !should_skip_entry(&entry.key, &entry.content)
+}
+
+fn passes_floor(entry: &MemoryEntry, floor: f64) -> bool {
+    entry.score.is_none_or(|score| score >= floor)
+}
+
+fn decay_kept_keys(
+    pool: &[MemoryEntry],
+    cfg: &MemoryInjectConfig,
+    exclude_conversation: bool,
+) -> Vec<String> {
+    let mut entries = pool.to_vec();
+    decay::apply_time_decay(&mut entries, decay::DEFAULT_HALF_LIFE_DAYS);
+    entries
+        .into_iter()
+        .filter(|e| {
+            passes_floor(e, cfg.min_relevance_score) && is_eligible(e, exclude_conversation)
+        })
+        .take(cfg.max_entries)
+        .map(|e| e.key)
+        .collect()
+}
+
+fn rerank_kept_keys(
+    pool: &[MemoryEntry],
+    cfg: &MemoryInjectConfig,
+    exclude_conversation: bool,
+    floor: f64,
+) -> Vec<String> {
+    let mut rerank_cfg = cfg.rerank;
+    rerank_cfg.min_relevance_score = floor;
+    rerank::run(pool.to_vec(), &rerank_cfg, |e| {
+        is_eligible(e, exclude_conversation)
+    })
+    .into_iter()
+    .take(cfg.max_entries)
+    .map(|e| e.key)
+    .collect()
+}
+
+pub(crate) fn shadow_counts(
+    pool: &[MemoryEntry],
+    cfg: &MemoryInjectConfig,
+    exclude_conversation: bool,
+) -> ShadowCounts {
+    let decay_kept = decay_kept_keys(pool, cfg, exclude_conversation);
+    let rerank_kept = rerank_kept_keys(pool, cfg, exclude_conversation, cfg.min_relevance_score);
+    let floor_only_kept = pool
+        .iter()
+        .filter(|e| {
+            passes_floor(e, cfg.min_relevance_score) && is_eligible(e, exclude_conversation)
+        })
+        .count()
+        .min(cfg.max_entries);
+    let mut scores: Vec<f64> = pool.iter().filter_map(|e| e.score).collect();
+    scores.sort_by(f64::total_cmp);
+    ShadowCounts {
+        pool: pool.len(),
+        ineligible: pool
+            .iter()
+            .filter(|e| !is_eligible(e, exclude_conversation))
+            .count(),
+        decay_kept: decay_kept.len(),
+        floor_only_kept,
+        rerank_kept: rerank_kept.len(),
+        rerank_f03_kept: rerank_kept_keys(pool, cfg, exclude_conversation, 0.3).len(),
+        rerank_only: rerank_kept
+            .iter()
+            .filter(|k| !decay_kept.contains(k))
+            .count(),
+        decay_only: decay_kept
+            .iter()
+            .filter(|k| !rerank_kept.contains(k))
+            .count(),
+        score_max: scores.last().copied(),
+        score_p50: scores.get(scores.len() / 2).copied(),
+    }
+}
+
+fn round3(v: Option<f64>) -> Option<f64> {
+    v.map(|x| (x * 1000.0).round() / 1000.0)
+}
+
+/// Emit the shadow comparison as one structured log event per recall. Counts and scores only:
+/// no keys, no content. Purely observational; it never touches what is injected.
+fn log_shadow_eval(
+    pool: &[MemoryEntry],
+    cfg: &MemoryInjectConfig,
+    exclude_conversation: bool,
+    injected: usize,
+    agent_alias: Option<&str>,
+    turn_id: &str,
+) {
+    let c = shadow_counts(pool, cfg, exclude_conversation);
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "adr": "ADR-016",
+                "active_arm": if cfg.rerank_enabled { "rerank" } else { "decay" },
+                "floor": cfg.min_relevance_score,
+                "max_entries": cfg.max_entries,
+                "agent_alias": agent_alias,
+                "turn_id": turn_id,
+                "pool": c.pool,
+                "ineligible": c.ineligible,
+                "injected": injected,
+                "decay_kept": c.decay_kept,
+                "floor_only_kept": c.floor_only_kept,
+                "rerank_kept": c.rerank_kept,
+                "rerank_f03_kept": c.rerank_f03_kept,
+                "rerank_only": c.rerank_only,
+                "decay_only": c.decay_only,
+                "score_max": round3(c.score_max),
+                "score_p50": round3(c.score_p50),
+            })),
+        "memory_inject shadow eval"
+    );
+}
+
 pub async fn render_memory_context(
     mem: &dyn Memory,
     observer: &dyn Observer,
@@ -315,6 +463,9 @@ pub async fn render_memory_context(
         turn_id: Some(turn.turn_id.to_string()),
     });
 
+    // Snapshot for the shadow evaluation below; both arms mutate `entries`.
+    let shadow_pool = entries.clone();
+
     if cfg.rerank_enabled {
         // Relevance plane: blend (retrieval + importance + recency), collapse
         // near-duplicates, optionally diversify via MMR, apply the floor, and
@@ -373,6 +524,15 @@ pub async fn render_memory_context(
         used_chars += line_chars;
         included += 1;
     }
+
+    log_shadow_eval(
+        &shadow_pool,
+        cfg,
+        exclude_conversation,
+        included,
+        turn.agent_alias,
+        &turn.turn_id.to_string(),
+    );
 
     if included > 0 {
         context.push_str(MEMORY_CONTEXT_CLOSE);
@@ -1888,5 +2048,107 @@ mod graph_knowledge_tests {
         assert_eq!(with_graph_knowledge(ctx.clone(), None), ctx);
         assert_eq!(with_graph_knowledge(ctx.clone(), Some("   ")), ctx);
         assert_eq!(with_graph_knowledge(String::new(), None), "");
+    }
+}
+
+#[cfg(test)]
+mod shadow_tests {
+    use super::*;
+
+    fn entry(key: &str, content: &str, category: MemoryCategory, age_days: i64) -> MemoryEntry {
+        MemoryEntry {
+            id: key.to_string(),
+            key: key.to_string(),
+            content: content.to_string(),
+            category,
+            timestamp: (chrono::Utc::now() - chrono::Duration::days(age_days)).to_rfc3339(),
+            session_id: None,
+            score: Some(0.5),
+            namespace: "default".into(),
+            importance: None,
+            superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
+            agent_alias: None,
+            agent_id: None,
+        }
+    }
+
+    fn pool() -> Vec<MemoryEntry> {
+        vec![
+            entry(
+                "rule_a",
+                "always invoice on the 25th",
+                MemoryCategory::Core,
+                0,
+            ),
+            entry(
+                "note_b",
+                "met the client on site",
+                MemoryCategory::Daily,
+                10,
+            ),
+            // Skipped by the renderer whatever its score.
+            entry("tool_c", "x <tool_result> y", MemoryCategory::Daily, 0),
+        ]
+    }
+
+    fn cfg(floor: f64) -> MemoryInjectConfig {
+        MemoryInjectConfig {
+            min_relevance_score: floor,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn counts_separate_the_decay_arm_from_the_rerank_arm() {
+        // Raw score 0.5. Decay: the 10-day-old daily note falls to about 0.19, below 0.4; the
+        // core row is evergreen. Rerank: 0.7*0.5 + 0.1*recency gives 0.45 for the core row and
+        // about 0.39 for the aged note, so it is also cut at 0.4 but survives at 0.3.
+        let c = shadow_counts(&pool(), &cfg(0.4), false);
+        assert_eq!(c.pool, 3);
+        assert_eq!(c.ineligible, 1);
+        assert_eq!(c.decay_kept, 1);
+        assert_eq!(
+            c.floor_only_kept, 2,
+            "the floor alone keeps both eligible rows"
+        );
+        assert_eq!(c.rerank_kept, 1);
+        assert_eq!(c.rerank_f03_kept, 2);
+        assert_eq!((c.rerank_only, c.decay_only), (0, 0));
+        assert_eq!(c.score_max, Some(0.5));
+        assert_eq!(c.score_p50, Some(0.5));
+    }
+
+    #[test]
+    fn counts_report_rows_only_one_arm_keeps() {
+        let c = shadow_counts(&pool(), &cfg(0.3), false);
+        assert_eq!(c.decay_kept, 1, "0.19 is below a 0.3 floor");
+        assert_eq!(c.rerank_kept, 2, "0.39 is above it");
+        assert_eq!((c.rerank_only, c.decay_only), (1, 0));
+    }
+
+    #[test]
+    fn counts_handle_an_empty_pool() {
+        let c = shadow_counts(&[], &cfg(0.4), false);
+        assert_eq!(
+            (
+                c.pool,
+                c.decay_kept,
+                c.rerank_kept,
+                c.score_max,
+                c.score_p50
+            ),
+            (0, 0, 0, None, None)
+        );
+    }
+
+    #[test]
+    fn conversation_rows_are_ineligible_when_excluded() {
+        let mut p = pool();
+        p.push(entry("chat", "hello", MemoryCategory::Conversation, 0));
+        assert_eq!(shadow_counts(&p, &cfg(0.4), true).ineligible, 2);
+        assert_eq!(shadow_counts(&p, &cfg(0.4), false).ineligible, 1);
     }
 }
