@@ -1,0 +1,621 @@
+{
+ "agents": [
+  "acme_leads",
+  "acme_chief",
+  "other_leads"
+ ],
+ "memories": [
+  {
+   "id": "m01",
+   "agent": "acme_leads",
+   "category": "core",
+   "age_days": 60,
+   "content": "Qualified lead threshold: company size above 200 employees and a named budget owner."
+  },
+  {
+   "id": "m02",
+   "agent": "acme_leads",
+   "category": "core",
+   "age_days": 75,
+   "content": "Never contact leads in the healthcare sector without legal review of the outreach text."
+  },
+  {
+   "id": "m03",
+   "agent": "acme_leads",
+   "category": "core",
+   "age_days": 90,
+   "content": "Preferred meeting slots for discovery calls are Tuesday and Thursday between 10:00 and 12:00 Jakarta time."
+  },
+  {
+   "id": "m04",
+   "agent": "acme_leads",
+   "category": "core",
+   "age_days": 45,
+   "content": "Pricing floor: Business tier is never discounted more than 15 percent without approval from the account executive."
+  },
+  {
+   "id": "m05",
+   "agent": "acme_leads",
+   "category": "core",
+   "age_days": 50,
+   "content": "Clients in Indonesia prefer proposals written in Bahasa Indonesia with figures in rupiah."
+  },
+  {
+   "id": "m06",
+   "agent": "acme_leads",
+   "category": "core",
+   "age_days": 80,
+   "content": "Escalate any lead that mentions a competitor contract renewal within 90 days to the head of sales."
+  },
+  {
+   "id": "m07",
+   "agent": "acme_leads",
+   "category": "core",
+   "age_days": 30,
+   "content": "Lead scoring: +20 for a job title of director or above, +10 for a visited pricing page, -30 for a free email domain."
+  },
+  {
+   "id": "m08",
+   "agent": "acme_leads",
+   "category": "core",
+   "age_days": 65,
+   "content": "Tenant timezone is Asia/Jakarta (UTC+7); daily reports go out at 08:00 local time."
+  },
+  {
+   "id": "m09",
+   "agent": "acme_leads",
+   "category": "core",
+   "age_days": 20,
+   "content": "Do not send follow-up emails on Indonesian public holidays or on weekends."
+  },
+  {
+   "id": "m10",
+   "agent": "acme_leads",
+   "category": "core",
+   "age_days": 100,
+   "content": "The CRM of record is Odoo; every qualified lead must have an Odoo opportunity before handover."
+  },
+  {
+   "id": "m11",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 1,
+   "content": "Call with PT Nusantara Logistik: interested in the workflow automation package, budget approved for Q4."
+  },
+  {
+   "id": "m12",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 2,
+   "content": "Sent proposal v2 to Bayu Santoso at Sinar Retail; awaiting reply on the rollout timeline."
+  },
+  {
+   "id": "m13",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 3,
+   "content": "Lead from webinar: Maria Wijaya, finance director at Kopi Kita, asked about invoice automation."
+  },
+  {
+   "id": "m14",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 5,
+   "content": "Kopi Kita requested a demo on Friday; the demo environment must include the invoice reconciliation flow."
+  },
+  {
+   "id": "m15",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 6,
+   "content": "Bounce rate on the September outreach batch was 4.2 percent, mostly from stale addresses."
+  },
+  {
+   "id": "m16",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 9,
+   "content": "PT Nusantara Logistik legal asked for a data processing addendum before signing."
+  },
+  {
+   "id": "m17",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 12,
+   "content": "Sinar Retail is comparing us with a competitor called RetailFlow; decision expected end of month."
+  },
+  {
+   "id": "m18",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 15,
+   "content": "Discovery call with Adi Prasetyo (CTO, Mitra Digital): concerned about data residency in Indonesia."
+  },
+  {
+   "id": "m19",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 18,
+   "content": "Mitra Digital wants an on-premise option; told them cloud only for now, will revisit in Q1."
+  },
+  {
+   "id": "m20",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 22,
+   "content": "Webinar on 3 September produced 41 registrants, 12 qualified as leads."
+  },
+  {
+   "id": "m21",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 28,
+   "content": "Follow-up sequence for cold leads changed from five touches to three touches."
+  },
+  {
+   "id": "m22",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 35,
+   "content": "Hotel Permata Group asked for a multi-branch pricing quote covering eight properties."
+  },
+  {
+   "id": "m23",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 41,
+   "content": "Hotel Permata Group chose the Business tier; contract signed on 14 August."
+  },
+  {
+   "id": "m24",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 55,
+   "content": "Onboarding call with Hotel Permata is scheduled; their admin contact is Ratna Kusuma."
+  },
+  {
+   "id": "m25",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 70,
+   "content": "Trade show in Surabaya generated 25 business cards; only 3 met the qualification threshold."
+  },
+  {
+   "id": "m26",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 4,
+   "content": "Rapat dengan Toko Maju Jaya: mereka tertarik paket otomasi laporan penjualan mingguan."
+  },
+  {
+   "id": "m27",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 8,
+   "content": "Pak Hendra dari Toko Maju Jaya minta diskon 20 persen, sudah kami tolak sesuai batas 15 persen."
+  },
+  {
+   "id": "m28",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 16,
+   "content": "Klien Bank Daerah Kalimantan meminta dokumen keamanan dan bukti sertifikasi sebelum demo."
+  },
+  {
+   "id": "m29",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 25,
+   "content": "Prospek dari LinkedIn: Sari Dewi, kepala operasional CV Berkah Tekstil, tanya integrasi dengan Odoo."
+  },
+  {
+   "id": "m30",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 33,
+   "content": "CV Berkah Tekstil butuh pelatihan untuk 15 karyawan sebelum go-live."
+  },
+  {
+   "id": "m31",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 48,
+   "content": "Renewal risk: Warung Digital contract ends in October, usage dropped 40 percent last month."
+  },
+  {
+   "id": "m32",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 10,
+   "content": "Support ticket from Kopi Kita: the invoice PDF export shows the wrong currency symbol."
+  },
+  {
+   "id": "m33",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 14,
+   "content": "Weekly pipeline review: 9 open opportunities, total forecast value 1.2 billion rupiah."
+  },
+  {
+   "id": "m34",
+   "agent": "acme_leads",
+   "category": "daily",
+   "age_days": 60,
+   "content": "Quarterly target for new logos is 12; we closed 7 by the end of the previous quarter."
+  },
+  {
+   "id": "b01",
+   "agent": "acme_chief",
+   "category": "core",
+   "age_days": 95,
+   "content": "Board meeting is held on the first Monday of every month at 09:00."
+  },
+  {
+   "id": "b02",
+   "agent": "acme_chief",
+   "category": "daily",
+   "age_days": 3,
+   "content": "Investor update draft is due Friday; include pipeline and churn numbers."
+  },
+  {
+   "id": "b03",
+   "agent": "acme_chief",
+   "category": "daily",
+   "age_days": 20,
+   "content": "Travel booking for the Surabaya trade show was handled by the office manager."
+  },
+  {
+   "id": "c01",
+   "agent": "other_leads",
+   "category": "core",
+   "age_days": 40,
+   "content": "Never contact leads in the healthcare sector without legal review of the outreach text."
+  },
+  {
+   "id": "c02",
+   "agent": "other_leads",
+   "category": "daily",
+   "age_days": 2,
+   "content": "Call with PT Nusantara Logistik about warehouse robotics."
+  },
+  {
+   "id": "c03",
+   "agent": "other_leads",
+   "category": "daily",
+   "age_days": 5,
+   "content": "Pricing floor: Business tier is never discounted more than 30 percent."
+  }
+ ],
+ "queries": [
+  {
+   "id": "q01",
+   "kind": "exact",
+   "agent": "acme_leads",
+   "query": "discovery call meeting slots",
+   "expect": [
+    "m03"
+   ]
+  },
+  {
+   "id": "q02",
+   "kind": "exact",
+   "agent": "acme_leads",
+   "query": "Odoo opportunity before handover",
+   "expect": [
+    "m10"
+   ]
+  },
+  {
+   "id": "q03",
+   "kind": "exact",
+   "agent": "acme_leads",
+   "query": "lead scoring free email domain",
+   "expect": [
+    "m07"
+   ]
+  },
+  {
+   "id": "q04",
+   "kind": "exact",
+   "agent": "acme_leads",
+   "query": "competitor RetailFlow",
+   "expect": [
+    "m17"
+   ]
+  },
+  {
+   "id": "q05",
+   "kind": "exact",
+   "agent": "acme_leads",
+   "query": "data processing addendum",
+   "expect": [
+    "m16"
+   ]
+  },
+  {
+   "id": "q06",
+   "kind": "exact",
+   "agent": "acme_leads",
+   "query": "webinar registrants qualified",
+   "expect": [
+    "m20"
+   ]
+  },
+  {
+   "id": "q07",
+   "kind": "paraphrase",
+   "agent": "acme_leads",
+   "query": "when should we avoid emailing prospects?",
+   "expect": [
+    "m09"
+   ]
+  },
+  {
+   "id": "q08",
+   "kind": "paraphrase",
+   "agent": "acme_leads",
+   "query": "how much can we cut the price?",
+   "expect": [
+    "m04",
+    "m27"
+   ]
+  },
+  {
+   "id": "q09",
+   "kind": "paraphrase",
+   "agent": "acme_leads",
+   "query": "which industry needs lawyer sign-off before outreach?",
+   "expect": [
+    "m02"
+   ]
+  },
+  {
+   "id": "q10",
+   "kind": "paraphrase",
+   "agent": "acme_leads",
+   "query": "what makes a lead worth pursuing?",
+   "expect": [
+    "m01",
+    "m07"
+   ]
+  },
+  {
+   "id": "q11",
+   "kind": "paraphrase",
+   "agent": "acme_leads",
+   "query": "who is worried about where their data is stored?",
+   "expect": [
+    "m18"
+   ]
+  },
+  {
+   "id": "q12",
+   "kind": "paraphrase",
+   "agent": "acme_leads",
+   "query": "which customer is at risk of leaving?",
+   "expect": [
+    "m31"
+   ]
+  },
+  {
+   "id": "q13",
+   "kind": "paraphrase",
+   "agent": "acme_leads",
+   "query": "did the hotel chain sign?",
+   "expect": [
+    "m23"
+   ]
+  },
+  {
+   "id": "q14",
+   "kind": "paraphrase",
+   "agent": "acme_leads",
+   "query": "what language should proposals be in for local clients?",
+   "expect": [
+    "m05"
+   ]
+  },
+  {
+   "id": "q15",
+   "kind": "paraphrase",
+   "agent": "acme_leads",
+   "query": "how many new customers have we won against the target?",
+   "expect": [
+    "m34"
+   ]
+  },
+  {
+   "id": "q16",
+   "kind": "paraphrase",
+   "agent": "acme_leads",
+   "query": "what time do reports get sent?",
+   "expect": [
+    "m08"
+   ]
+  },
+  {
+   "id": "q17",
+   "kind": "paraphrase",
+   "agent": "acme_leads",
+   "query": "which prospect wants a self-hosted deployment?",
+   "expect": [
+    "m19"
+   ]
+  },
+  {
+   "id": "q18",
+   "kind": "indonesian",
+   "agent": "acme_leads",
+   "query": "kapan sebaiknya tidak mengirim email follow-up?",
+   "expect": [
+    "m09"
+   ]
+  },
+  {
+   "id": "q19",
+   "kind": "indonesian",
+   "agent": "acme_leads",
+   "query": "berapa batas diskon maksimal?",
+   "expect": [
+    "m04",
+    "m27"
+   ]
+  },
+  {
+   "id": "q20",
+   "kind": "indonesian",
+   "agent": "acme_leads",
+   "query": "siapa yang minta pelatihan karyawan sebelum go-live?",
+   "expect": [
+    "m30"
+   ]
+  },
+  {
+   "id": "q21",
+   "kind": "indonesian",
+   "agent": "acme_leads",
+   "query": "prospek mana yang tanya soal integrasi Odoo?",
+   "expect": [
+    "m29"
+   ]
+  },
+  {
+   "id": "q22",
+   "kind": "indonesian",
+   "agent": "acme_leads",
+   "query": "klien mana yang butuh sertifikasi keamanan?",
+   "expect": [
+    "m28"
+   ]
+  },
+  {
+   "id": "q23",
+   "kind": "indonesian",
+   "agent": "acme_leads",
+   "query": "penawaran untuk hotel dengan banyak cabang",
+   "expect": [
+    "m22"
+   ]
+  },
+  {
+   "id": "q24",
+   "kind": "indonesian",
+   "agent": "acme_leads",
+   "query": "laporan penjualan mingguan otomatis",
+   "expect": [
+    "m26"
+   ]
+  },
+  {
+   "id": "q25",
+   "kind": "indonesian",
+   "agent": "acme_leads",
+   "query": "target kuartalan logo baru",
+   "expect": [
+    "m34"
+   ]
+  },
+  {
+   "id": "q26",
+   "kind": "old",
+   "agent": "acme_leads",
+   "query": "Surabaya trade show leads",
+   "expect": [
+    "m25"
+   ]
+  },
+  {
+   "id": "q27",
+   "kind": "old",
+   "agent": "acme_leads",
+   "query": "Hotel Permata onboarding contact",
+   "expect": [
+    "m24"
+   ]
+  },
+  {
+   "id": "q28",
+   "kind": "old",
+   "agent": "acme_leads",
+   "query": "Hotel Permata contract signed",
+   "expect": [
+    "m23"
+   ]
+  },
+  {
+   "id": "q29",
+   "kind": "old",
+   "agent": "acme_leads",
+   "query": "Mitra Digital on-premise",
+   "expect": [
+    "m19"
+   ]
+  },
+  {
+   "id": "q30",
+   "kind": "old",
+   "agent": "acme_leads",
+   "query": "follow-up sequence touches",
+   "expect": [
+    "m21"
+   ]
+  },
+  {
+   "id": "q31",
+   "kind": "old",
+   "agent": "acme_leads",
+   "query": "Warung Digital renewal",
+   "expect": [
+    "m31"
+   ]
+  },
+  {
+   "id": "q32",
+   "kind": "multi",
+   "agent": "acme_leads",
+   "query": "Kopi Kita",
+   "expect": [
+    "m13",
+    "m14",
+    "m32"
+   ]
+  },
+  {
+   "id": "q33",
+   "kind": "multi",
+   "agent": "acme_leads",
+   "query": "Nusantara Logistik",
+   "expect": [
+    "m11",
+    "m16"
+   ]
+  },
+  {
+   "id": "q34",
+   "kind": "multi",
+   "agent": "acme_leads",
+   "query": "Hotel Permata",
+   "expect": [
+    "m22",
+    "m23",
+    "m24"
+   ]
+  },
+  {
+   "id": "q35",
+   "kind": "negative",
+   "agent": "acme_leads",
+   "query": "warehouse robotics",
+   "expect": []
+  },
+  {
+   "id": "q36",
+   "kind": "isolation",
+   "agent": "acme_leads",
+   "query": "healthcare sector legal review",
+   "expect": [
+    "m02"
+   ]
+  }
+ ]
+}
