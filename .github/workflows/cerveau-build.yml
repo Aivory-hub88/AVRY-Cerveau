@@ -76,6 +76,8 @@ jobs:
       - name: Postgres memory embedding + hybrid recall tests
         run: |
           cargo test --locked -p zeroclaw-memory --features memory-postgres --test pg_embedding_recall
+          # ADR-016 P0: recall-quality baseline (fails if hit@5 regresses past the recorded tolerance)
+          cargo test --locked -p zeroclaw-memory --features memory-postgres --test pg_recall_bench
       - name: Capability graph (Postgres) tests
         env:
           RUST_BACKTRACE: full
