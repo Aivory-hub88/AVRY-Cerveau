@@ -43,6 +43,12 @@ impl Tool for MemoryStoreTool {
                 "category": {
                     "type": "string",
                     "description": "Memory category: 'core' (permanent), 'daily' (session), 'conversation' (chat), or a custom category name. Defaults to 'core'."
+                },
+                "importance": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                    "description": "Optional 0-1 weight for how much this should be preferred when memory is recalled or trimmed. Use ~0.9 for standing rules and hard constraints, ~0.5 for ordinary facts, ~0.2 for passing notes. Omit to let the system score it."
                 }
             },
             "required": ["key", "content"]
@@ -93,7 +99,24 @@ impl Tool for MemoryStoreTool {
             });
         }
 
-        match self.memory.store(key, content, category, None).await {
+        // Out-of-range or non-numeric values are ignored rather than rejected: a bad hint
+        // must not cost the agent the memory itself.
+        let importance = args
+            .get("importance")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 1.0));
+
+        let stored = match importance {
+            Some(imp) => {
+                self.memory
+                    .store_with_metadata(key, content, category, None, None, Some(imp))
+                    .await
+            }
+            None => self.memory.store(key, content, category, None).await,
+        };
+
+        match stored {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!("Stored memory: {key}").into(),
@@ -150,6 +173,34 @@ mod tests {
         let entry = mem.get("lang").await.unwrap();
         assert!(entry.is_some());
         assert_eq!(entry.unwrap().content, "Prefers Rust");
+    }
+
+    #[tokio::test]
+    async fn importance_is_stored_clamped_and_optional() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+
+        for (key, arg, expect) in [
+            ("rule", json!(0.9), Some(0.9)),
+            ("over", json!(7.5), Some(1.0)),
+            ("neg", json!(-2.0), Some(0.0)),
+        ] {
+            let r = tool
+                .execute(json!({"key": key, "content": "x", "importance": arg}))
+                .await
+                .unwrap();
+            assert!(r.success, "{key}: {:?}", r.error);
+            let got = mem.get(key).await.unwrap().unwrap().importance;
+            assert_eq!(got.map(|v| (v * 100.0).round() / 100.0), expect, "{key}");
+        }
+
+        // A non-numeric hint is ignored, and the memory is still stored.
+        let r = tool
+            .execute(json!({"key": "junk", "content": "x", "importance": "high"}))
+            .await
+            .unwrap();
+        assert!(r.success);
+        assert!(mem.get("junk").await.unwrap().is_some());
     }
 
     #[tokio::test]

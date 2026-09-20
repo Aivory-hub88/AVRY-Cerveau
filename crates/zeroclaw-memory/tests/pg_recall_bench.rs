@@ -36,7 +36,6 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use zeroclaw_memory::decay::{DEFAULT_HALF_LIFE_DAYS, apply_time_decay};
 use zeroclaw_memory::embeddings::EmbeddingProvider;
-use zeroclaw_memory::importance::compute_importance;
 use zeroclaw_memory::postgres::PostgresMemory;
 use zeroclaw_memory::rerank::{self, RerankConfig, RerankStrategy};
 use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
@@ -207,7 +206,8 @@ struct Variant {
     decay: bool,
     /// The rerank stage (`memory.rerank_enabled = true`): blend, then floor. It replaces the decay.
     rerank: bool,
-    /// Fill `importance` with the heuristic scorer, as ADR-016 P1 would on store.
+    /// Use the importance the backend now stores (ADR-016 P1). When false the value is cleared,
+    /// which reproduces the pre-P1 backend where it was always NULL.
     importance: bool,
     floor: f64,
 }
@@ -304,9 +304,10 @@ const POOL: usize = TOP_K * 4;
 fn apply(v: &Variant, pool: &[MemoryEntry]) -> Vec<MemoryEntry> {
     let mut entries = pool.to_vec();
     if v.rerank {
-        if v.importance {
+        if !v.importance {
+            // Simulate the backend before ADR-016 P1, which never stored importance.
             for e in &mut entries {
-                e.importance = Some(compute_importance(&e.content, &e.category));
+                e.importance = None;
             }
         }
         let cfg = RerankConfig {

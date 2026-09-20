@@ -78,6 +78,8 @@ jobs:
           cargo test --locked -p zeroclaw-memory --features memory-postgres --test pg_embedding_recall
           # ADR-016 P0: recall-quality baseline (fails if hit@5 regresses past the recorded tolerance)
           cargo test --locked -p zeroclaw-memory --features memory-postgres --test pg_recall_bench
+          # ADR-016 P1: importance stored/read, supersede, budget order, access counts, in-place upgrade
+          cargo test --locked -p zeroclaw-memory --features memory-postgres --test pg_memory_p1
       - name: Capability graph (Postgres) tests
         env:
           RUST_BACKTRACE: full
