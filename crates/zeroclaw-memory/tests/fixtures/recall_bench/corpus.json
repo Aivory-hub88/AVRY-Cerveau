@@ -616,6 +616,34 @@
    "expect": [
     "m02"
    ]
+  },
+  {
+   "id": "q37",
+   "kind": "negative",
+   "agent": "acme_chief",
+   "query": "Kopi Kita",
+   "expect": []
+  },
+  {
+   "id": "q38",
+   "kind": "negative",
+   "agent": "acme_chief",
+   "query": "Hotel Permata",
+   "expect": []
+  },
+  {
+   "id": "q39",
+   "kind": "negative",
+   "agent": "acme_chief",
+   "query": "lead scoring free email domain",
+   "expect": []
+  },
+  {
+   "id": "q40",
+   "kind": "negative",
+   "agent": "acme_chief",
+   "query": "discovery call meeting slots",
+   "expect": []
   }
  ]
 }

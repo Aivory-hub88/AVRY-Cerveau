@@ -36,13 +36,13 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use zeroclaw_memory::decay::{DEFAULT_HALF_LIFE_DAYS, apply_time_decay};
 use zeroclaw_memory::embeddings::EmbeddingProvider;
+use zeroclaw_memory::importance::compute_importance;
 use zeroclaw_memory::postgres::PostgresMemory;
-use zeroclaw_memory::{Memory, MemoryCategory};
+use zeroclaw_memory::rerank::{self, RerankConfig, RerankStrategy};
+use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
 
 const SCHEMA: &str = "cerveau_recall_bench";
 const TOP_K: usize = 5;
-/// Live `memory.min_relevance_score` (config.toml, 2026-09-20).
-const MIN_RELEVANCE: f64 = 0.4;
 /// Live `memory.vector_weight` / `keyword_weight`.
 const VECTOR_WEIGHT: f32 = 0.7;
 const KEYWORD_WEIGHT: f32 = 0.3;
@@ -112,6 +112,10 @@ struct Score {
     n: usize,
     hit: f64,
     mrr: f64,
+    /// Mean number of entries returned per query. For `negative` queries (nothing relevant
+    /// exists) the ideal is 0, and `hit` is the share of them that returned nothing.
+    #[serde(default)]
+    returned: f64,
 }
 
 /// mode -> pipeline -> kind ("all" included) -> score
@@ -148,33 +152,37 @@ fn category(name: &str) -> MemoryCategory {
 }
 
 fn score(rankings: &[(Vec<String>, &Query)]) -> BTreeMap<String, Score> {
-    let mut acc: BTreeMap<String, (usize, f64, f64)> = BTreeMap::new();
+    // kind -> (n, hits, reciprocal ranks, entries returned)
+    let mut acc: BTreeMap<String, (usize, f64, f64, f64)> = BTreeMap::new();
     for (ranked, q) in rankings {
-        // Queries with no expected answer (negative) are checked for leaks elsewhere and
-        // would only dilute hit@5 here.
-        if q.expect.is_empty() {
-            continue;
-        }
-        let rank = ranked.iter().take(TOP_K).position(|k| q.expect.contains(k));
-        let (hit, rr) = match rank {
-            Some(p) => (1.0, 1.0 / (p as f64 + 1.0)),
-            None => (0.0, 0.0),
+        let (hit, rr, groups): (f64, f64, &[&str]) = if q.expect.is_empty() {
+            // Nothing relevant exists: the right answer is to return nothing. Kept out of
+            // "all" so it does not dilute hit@5.
+            (f64::from(ranked.is_empty()), 0.0, &["negative"])
+        } else {
+            match ranked.iter().take(TOP_K).position(|k| q.expect.contains(k)) {
+                Some(p) => (1.0, 1.0 / (p as f64 + 1.0), &[q.kind.as_str(), "all"][..]),
+                None => (0.0, 0.0, &[q.kind.as_str(), "all"][..]),
+            }
         };
-        for key in [q.kind.as_str(), "all"] {
-            let e = acc.entry(key.to_string()).or_default();
+        for key in groups {
+            let e = acc.entry((*key).to_string()).or_default();
             e.0 += 1;
             e.1 += hit;
             e.2 += rr;
+            e.3 += ranked.len() as f64;
         }
     }
     acc.into_iter()
-        .map(|(k, (n, h, r))| {
+        .map(|(k, (n, h, r, ret))| {
+            let n_f = n as f64;
             (
                 k,
                 Score {
                     n,
-                    hit: h / n as f64,
-                    mrr: r / n as f64,
+                    hit: h / n_f,
+                    mrr: r / n_f,
+                    returned: ret / n_f,
                 },
             )
         })
@@ -185,10 +193,141 @@ fn print_table(mode: &str, pipeline: &str, scores: &BTreeMap<String, Score>) {
     eprintln!("[{mode}/{pipeline}]");
     for (kind, s) in scores {
         eprintln!(
-            "  {kind:<11} n={:<3} hit@{TOP_K}={:.3} mrr={:.3}",
-            s.n, s.hit, s.mrr
+            "  {kind:<11} n={:<3} hit@{TOP_K}={:.3} mrr={:.3} returned={:.1}",
+            s.n, s.hit, s.mrr, s.returned
         );
     }
+}
+
+/// One way of turning the backend's candidate pool into the memories an agent is shown.
+/// `injected` is production today (live config 2026-09-20); the others are candidate changes.
+struct Variant {
+    name: &'static str,
+    /// Flat 7-day time decay (the non-rerank arm of `memory_inject.rs`).
+    decay: bool,
+    /// The rerank stage (`memory.rerank_enabled = true`): blend, then floor. It replaces the decay.
+    rerank: bool,
+    /// Fill `importance` with the heuristic scorer, as ADR-016 P1 would on store.
+    importance: bool,
+    floor: f64,
+}
+
+const VARIANTS: &[Variant] = &[
+    Variant {
+        name: "rerank_f0.2",
+        decay: false,
+        rerank: true,
+        importance: false,
+        floor: 0.2,
+    },
+    Variant {
+        name: "injected",
+        decay: true,
+        rerank: false,
+        importance: false,
+        floor: 0.4,
+    },
+    Variant {
+        name: "floor_only",
+        decay: false,
+        rerank: false,
+        importance: false,
+        floor: 0.4,
+    },
+    Variant {
+        name: "decay_f0.3",
+        decay: true,
+        rerank: false,
+        importance: false,
+        floor: 0.3,
+    },
+    Variant {
+        name: "decay_f0.2",
+        decay: true,
+        rerank: false,
+        importance: false,
+        floor: 0.2,
+    },
+    Variant {
+        name: "nodecay_f0.3",
+        decay: false,
+        rerank: false,
+        importance: false,
+        floor: 0.3,
+    },
+    Variant {
+        name: "nodecay_f0.2",
+        decay: false,
+        rerank: false,
+        importance: false,
+        floor: 0.2,
+    },
+    Variant {
+        name: "rerank_f0.4",
+        decay: false,
+        rerank: true,
+        importance: false,
+        floor: 0.4,
+    },
+    Variant {
+        name: "rerank_f0.3",
+        decay: false,
+        rerank: true,
+        importance: false,
+        floor: 0.3,
+    },
+    Variant {
+        name: "rerank_imp_f0.4",
+        decay: false,
+        rerank: true,
+        importance: true,
+        floor: 0.4,
+    },
+    Variant {
+        name: "rerank_imp_f0.3",
+        decay: false,
+        rerank: true,
+        importance: true,
+        floor: 0.3,
+    },
+];
+
+/// Pipelines whose hit@5 is enforced against the baseline. The other variants are
+/// informational: they are candidates, not behaviour we ship.
+const ENFORCED: &[&str] = &["raw", "injected"];
+
+/// Candidate pool size: `limit * candidate_multiplier` (default 4), as production over-fetches
+/// only when rerank is on. Non-rerank variants use the first `TOP_K` of it, which is exactly
+/// what a `TOP_K` recall returns because the backend orders by score.
+const POOL: usize = TOP_K * 4;
+
+fn apply(v: &Variant, pool: &[MemoryEntry]) -> Vec<MemoryEntry> {
+    let mut entries = pool.to_vec();
+    if v.rerank {
+        if v.importance {
+            for e in &mut entries {
+                e.importance = Some(compute_importance(&e.content, &e.category));
+            }
+        }
+        let cfg = RerankConfig {
+            strategy: RerankStrategy::None,
+            threshold: 5,
+            importance_weight: 0.2,
+            recency_weight: 0.1,
+            min_relevance_score: v.floor,
+            final_limit: TOP_K,
+            candidate_pool_cap: POOL,
+        };
+        return rerank::run(entries, &cfg, |e| {
+            !matches!(e.category, MemoryCategory::Conversation)
+        });
+    }
+    entries.truncate(TOP_K);
+    if v.decay {
+        apply_time_decay(&mut entries, DEFAULT_HALF_LIFE_DAYS);
+    }
+    entries.retain(|e| e.score.is_none_or(|s| s >= v.floor));
+    entries
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -291,8 +430,8 @@ async fn recall_quality_baseline() {
     }
 
     let mut raw: Vec<(Vec<String>, &Query)> = Vec::new();
-    let mut injected: Vec<(Vec<String>, &Query)> = Vec::new();
-    let mut floor_only: Vec<(Vec<String>, &Query)> = Vec::new();
+    let mut variant_out: Vec<Vec<(Vec<String>, &Query)>> =
+        VARIANTS.iter().map(|_| Vec::new()).collect();
     // (age of the expected memory, its raw score) for every query whose answer was retrieved.
     let mut expected_scores: Vec<(i64, f64)> = Vec::new();
     let age_of: HashMap<&str, i64> = corpus
@@ -304,39 +443,26 @@ async fn recall_quality_baseline() {
 
     for q in &corpus.queries {
         let uuid = &uuid_of[&q.agent];
-        let results = mem
-            .recall_for_agents(&[uuid], &q.query, TOP_K, None, None, None)
+        let pool = mem
+            .recall_for_agents(&[uuid], &q.query, POOL, None, None, None)
             .await
             .expect("recall");
+        let top: Vec<MemoryEntry> = pool.iter().take(TOP_K).cloned().collect();
 
-        for r in &results {
+        for r in &pool {
             if agent_of_key.get(r.key.as_str()) != Some(&q.agent.as_str()) {
                 leaks.push(format!("{} returned {} for {}", q.id, r.key, q.agent));
             }
         }
-        raw.push((results.iter().map(|r| r.key.clone()).collect(), q));
-        floor_only.push((
-            results
-                .iter()
-                .filter(|e| e.score.is_none_or(|s| s >= MIN_RELEVANCE))
-                .map(|e| e.key.clone())
-                .collect(),
-            q,
-        ));
-        if let Some(top) = results.iter().find(|r| q.expect.contains(&r.key)) {
-            expected_scores.push((age_of[top.key.as_str()], top.score.unwrap_or(0.0)));
+        raw.push((top.iter().map(|r| r.key.clone()).collect(), q));
+        if let Some(hit) = top.iter().find(|r| q.expect.contains(&r.key)) {
+            expected_scores.push((age_of[hit.key.as_str()], hit.score.unwrap_or(0.0)));
         }
-
-        let mut entries = results;
-        apply_time_decay(&mut entries, DEFAULT_HALF_LIFE_DAYS);
-        injected.push((
-            entries
-                .iter()
-                .filter(|e| e.score.is_none_or(|s| s >= MIN_RELEVANCE))
-                .map(|e| e.key.clone())
-                .collect(),
-            q,
-        ));
+        if mode == "hybrid" {
+            for (out, v) in variant_out.iter_mut().zip(VARIANTS) {
+                out.push((apply(v, &pool).iter().map(|e| e.key.clone()).collect(), q));
+            }
+        }
     }
 
     assert!(leaks.is_empty(), "cross-agent leak: {leaks:?}");
@@ -347,12 +473,13 @@ async fn recall_quality_baseline() {
     print_table(mode, "raw", &raw_scores);
     entry.insert("raw".into(), raw_scores);
     if mode == "hybrid" {
-        let inj = score(&injected);
-        print_table(mode, "injected", &inj);
-        entry.insert("injected".into(), inj);
-        let floor = score(&floor_only);
-        print_table(mode, "floor_only", &floor);
-        entry.insert("floor_only".into(), floor);
+        for (out, v) in variant_out.iter().zip(VARIANTS) {
+            let sc = score(out);
+            if v.name == "injected" {
+                print_table(mode, v.name, &sc);
+            }
+            entry.insert(v.name.to_string(), sc);
+        }
         for (label, lo, hi) in [("<=7d", 0, 7), ("8-30d", 8, 30), (">30d", 31, i64::MAX)] {
             let v: Vec<f64> = expected_scores
                 .iter()
@@ -367,6 +494,26 @@ async fn recall_quality_baseline() {
                     v.iter().cloned().fold(0.0, f64::max)
                 );
             }
+        }
+        eprintln!(
+            "\nVariant comparison (hit@{TOP_K}; `neg` = share of no-answer queries that correctly return nothing; `ret` = mean entries shown):"
+        );
+        eprintln!(
+            "  {:<16} {:>5} {:>10} {:>10} {:>5} {:>5} {:>5}",
+            "variant", "all", "paraphrase", "indonesian", "old", "neg", "ret"
+        );
+        for name in std::iter::once("raw").chain(VARIANTS.iter().map(|v| v.name)) {
+            let k = &entry[name];
+            let g = |kind: &str| k.get(kind).map_or(f64::NAN, |s| s.hit);
+            eprintln!(
+                "  {name:<16} {:>5.3} {:>10.3} {:>10.3} {:>5.3} {:>5.2} {:>5.1}",
+                g("all"),
+                g("paraphrase"),
+                g("indonesian"),
+                g("old"),
+                g("negative"),
+                k["all"].returned
+            );
         }
     }
 
@@ -392,7 +539,10 @@ async fn recall_quality_baseline() {
         return;
     };
     let mut regressions = Vec::new();
-    for (pipeline, kinds) in &current[mode] {
+    for (pipeline, kinds) in current[mode]
+        .iter()
+        .filter(|(p, _)| ENFORCED.contains(&p.as_str()))
+    {
         for (kind, now) in kinds {
             if let Some(was) = base.get(pipeline).and_then(|k| k.get(kind))
                 && now.hit + TOLERANCE < was.hit
