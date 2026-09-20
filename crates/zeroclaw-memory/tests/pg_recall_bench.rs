@@ -10,6 +10,8 @@
 //! * `injected`: the same results after the production auto-injection filter, i.e. the flat
 //!   7-day time decay and then the `min_relevance_score = 0.4` floor (`memory_inject.rs`, live
 //!   config 2026-09-20). This is what an agent sees without asking.
+//! * `floor_only`: `raw` with the 0.4 floor but no decay, to separate the two causes when
+//!   `injected` is low.
 //!
 //! Two modes, chosen by whether `fixtures/recall_bench/embeddings.json` exists:
 //!
@@ -290,6 +292,14 @@ async fn recall_quality_baseline() {
 
     let mut raw: Vec<(Vec<String>, &Query)> = Vec::new();
     let mut injected: Vec<(Vec<String>, &Query)> = Vec::new();
+    let mut floor_only: Vec<(Vec<String>, &Query)> = Vec::new();
+    // (age of the expected memory, its raw score) for every query whose answer was retrieved.
+    let mut expected_scores: Vec<(i64, f64)> = Vec::new();
+    let age_of: HashMap<&str, i64> = corpus
+        .memories
+        .iter()
+        .map(|m| (m.id.as_str(), m.age_days))
+        .collect();
     let mut leaks: Vec<String> = Vec::new();
 
     for q in &corpus.queries {
@@ -305,6 +315,17 @@ async fn recall_quality_baseline() {
             }
         }
         raw.push((results.iter().map(|r| r.key.clone()).collect(), q));
+        floor_only.push((
+            results
+                .iter()
+                .filter(|e| e.score.is_none_or(|s| s >= MIN_RELEVANCE))
+                .map(|e| e.key.clone())
+                .collect(),
+            q,
+        ));
+        if let Some(top) = results.iter().find(|r| q.expect.contains(&r.key)) {
+            expected_scores.push((age_of[top.key.as_str()], top.score.unwrap_or(0.0)));
+        }
 
         let mut entries = results;
         apply_time_decay(&mut entries, DEFAULT_HALF_LIFE_DAYS);
@@ -329,6 +350,24 @@ async fn recall_quality_baseline() {
         let inj = score(&injected);
         print_table(mode, "injected", &inj);
         entry.insert("injected".into(), inj);
+        let floor = score(&floor_only);
+        print_table(mode, "floor_only", &floor);
+        entry.insert("floor_only".into(), floor);
+        for (label, lo, hi) in [("<=7d", 0, 7), ("8-30d", 8, 30), (">30d", 31, i64::MAX)] {
+            let v: Vec<f64> = expected_scores
+                .iter()
+                .filter(|(a, _)| (lo..=hi).contains(a))
+                .map(|(_, sc)| *sc)
+                .collect();
+            if !v.is_empty() {
+                eprintln!(
+                    "  raw score of the expected hit, age {label:<6} n={:<2} mean={:.3} max={:.3}",
+                    v.len(),
+                    v.iter().sum::<f64>() / v.len() as f64,
+                    v.iter().cloned().fold(0.0, f64::max)
+                );
+            }
+        }
     }
 
     let baseline_path = dir.join("baseline.json");
