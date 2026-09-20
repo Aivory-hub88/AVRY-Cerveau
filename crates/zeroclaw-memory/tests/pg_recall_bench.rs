@@ -6,17 +6,17 @@
 //!
 //! Two pipelines are measured, because they answer different questions:
 //!
-//! * `raw`      what the backend returns (what the `memory_recall` tool sees);
-//! * `injected` the same results after the production auto-injection filter: the flat 7-day
-//!              time decay, then the `min_relevance_score = 0.4` floor (`memory_inject.rs`,
-//!              live config 2026-09-20). This is what an agent sees without asking.
+//! * `raw`: what the backend returns (what the `memory_recall` tool sees).
+//! * `injected`: the same results after the production auto-injection filter, i.e. the flat
+//!   7-day time decay and then the `min_relevance_score = 0.4` floor (`memory_inject.rs`, live
+//!   config 2026-09-20). This is what an agent sees without asking.
 //!
 //! Two modes, chosen by whether `fixtures/recall_bench/embeddings.json` exists:
 //!
-//! * `hybrid`  vectors are precomputed (same model and dimensions as production), so the run is
-//!             deterministic, free and needs no network. Needs the pgvector extension.
-//! * `keyword` no embeddings; keyword-only recall. The `injected` pipeline is not reported
-//!             because keyword scores are not on the hybrid scale the 0.4 floor was set for.
+//! * `hybrid`: vectors are precomputed (same model and dimensions as production), so the run is
+//!   deterministic, free and needs no network. Needs the pgvector extension.
+//! * `keyword`: no embeddings, keyword-only recall. The `injected` pipeline is not reported
+//!   because keyword scores are not on the hybrid scale the 0.4 floor was set for.
 //!
 //! Runs only when `CERVEAU_TEST_PG_URL` is set. `RECALL_BENCH_WRITE_BASELINE=1` records the
 //! current numbers as the baseline; otherwise the run fails if hit@5 falls more than the
