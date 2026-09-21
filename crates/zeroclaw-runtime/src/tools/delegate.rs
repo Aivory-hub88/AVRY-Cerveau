@@ -1489,15 +1489,17 @@ impl DelegateTool {
         execution: DelegateExecution,
     ) -> anyhow::Result<ToolResult> {
         let started_at = chrono::Utc::now().to_rfc3339();
-        let (result, facts) = envelope::capture(async {
+        // `capture` holds the future twice (argument + the scoped copy), so hand it
+        // a boxed one: a by-value ~50 KB future became ~100 KB per capture level.
+        let run = Box::pin(async {
             match execution {
                 DelegateExecution::Background => {
                     self.execute_background(agent_name, prompt, args).await
                 }
                 _ => self.execute_sync(agent_name, prompt, args).await,
             }
-        })
-        .await;
+        });
+        let (result, facts) = envelope::capture(run).await;
         let (tool_result, envelope) =
             self.envelope_result(result?, facts, agent_name, execution, &started_at);
         if execution == DelegateExecution::Sync {
@@ -1684,20 +1686,18 @@ impl DelegateTool {
         args: &serde_json::Value,
         admission: DelegateAdmission,
     ) -> anyhow::Result<ToolResult> {
+        // Boxed once, before the scope wraps it: the inner future is large, and a
+        // debug build copies a by-value future through every wrapper layer.
+        let inner =
+            Box::pin(self.execute_sync_with_admission_inner(agent_name, prompt, args, admission));
         match crate::agent::tenant::current_tenant() {
             Some(parent) => {
                 let overlay = delegate_tenant_overlay(parent, agent_name.trim());
                 crate::agent::tenant::TENANT_CONTEXT
-                    .scope(
-                        Some(overlay),
-                        self.execute_sync_with_admission_inner(agent_name, prompt, args, admission),
-                    )
+                    .scope(Some(overlay), inner)
                     .await
             }
-            None => {
-                self.execute_sync_with_admission_inner(agent_name, prompt, args, admission)
-                    .await
-            }
+            None => inner.await,
         }
     }
 

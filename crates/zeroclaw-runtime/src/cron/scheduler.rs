@@ -930,32 +930,37 @@ async fn run_agent_job(
 
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            Box::pin(
-                crate::agent::tenant::TENANT_CONTEXT.scope(
+            // Box the (~100 KB) agent-run future *before* the task-local scopes
+            // wrap it. Built in one expression, each scope layer moves its own
+            // copy of that future through this frame, and in a debug build the
+            // copies stack up (~450 KB extra on the cron path, enough to
+            // overflow a 2 MB thread stack). Boxed first, the layers hold a
+            // pointer.
+            let agent_run = Box::pin(
+                crate::agent::run(
+                    cron_config,
+                    agent_alias,
+                    Some(prefixed_prompt),
+                    None,
+                    model_override,
+                    config
+                        .model_provider_for_agent(agent_alias)
+                        .and_then(|e| e.temperature),
+                    vec![],
+                    false,
+                    Some(session_path.clone()),
+                    job.allowed_tools.clone(),
+                    zeroclaw_api::ingress::TurnOrigin::Cron,
+                    run_overrides,
+                )
+                .instrument(subagent_span),
+            );
+            crate::agent::tenant::TENANT_CONTEXT
+                .scope(
                     tenant_ctx,
-                    crate::agent::tenant::TURN_ORIGIN_CONTEXT.scope(
-                        turn_origin,
-                        crate::agent::run(
-                            cron_config,
-                            agent_alias,
-                            Some(prefixed_prompt),
-                            None,
-                            model_override,
-                            config
-                                .model_provider_for_agent(agent_alias)
-                                .and_then(|e| e.temperature),
-                            vec![],
-                            false,
-                            Some(session_path.clone()),
-                            job.allowed_tools.clone(),
-                            zeroclaw_api::ingress::TurnOrigin::Cron,
-                            run_overrides,
-                        )
-                        .instrument(subagent_span),
-                    ),
-                ),
-            )
-            .await
+                    crate::agent::tenant::TURN_ORIGIN_CONTEXT.scope(turn_origin, agent_run),
+                )
+                .await
         }
     };
 

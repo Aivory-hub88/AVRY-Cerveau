@@ -507,6 +507,52 @@ fn spawn_tenant_schedule_sync(config: Config, cancel: tokio_util::sync::Cancella
     });
 }
 
+/// Spawn the F-1 (ADR-003) boot-time goal auto-resume drive.
+///
+/// Extracted like `spawn_tenant_schedule_sync`, and the drive future (~100 KB)
+/// is boxed inside the task. A debug build materialises a future by value on
+/// the stack, and `spawn!` moves it through several wrappers; unboxed, those
+/// copies stacked past a 2 MB test thread. Boxed, the task's own state is a
+/// pointer.
+#[inline(never)]
+fn spawn_resume_drive(config: Config) {
+    zeroclaw_spawn::spawn!(async move {
+        let outcome = Box::pin(crate::control_plane::drive_resumable_goals(
+            crate::control_plane::control_plane().expect("just installed above"),
+            &config,
+        ))
+        .await;
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "resumed": outcome.resumed,
+                    "re_paused": outcome.re_paused,
+                    "interrupted": outcome.interrupted,
+                    "already_done": outcome.already_done,
+                })
+            ),
+            "F-1: boot-time goal auto-resume drive finished"
+        );
+    });
+}
+
+/// Spawn the ADR-008 verifier sweep. Extracted and boxed like
+/// `spawn_resume_drive`; its future (~140 KB) is the largest in the daemon.
+#[inline(never)]
+fn spawn_verifier_sweep(
+    store: std::sync::Arc<crate::control_plane::pending_approvals::PendingApprovalsStore>,
+    config: Config,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    zeroclaw_spawn::spawn!(async move {
+        Box::pin(crate::control_plane::verifier_sweep::sweep_loop(
+            store, config, cancel,
+        ))
+        .await;
+    });
+}
+
 pub async fn run(
     mut config: Config,
     host: String,
@@ -662,25 +708,7 @@ pub async fn run(
         // daemon" discipline as the reaper. Config is cloned once per
         // candidate-bearing boot, not per reload.
         if freshly_started && !handle.resumable_goals.is_empty() {
-            let drive_config = config.clone();
-            zeroclaw_spawn::spawn!(async move {
-                let outcome = crate::control_plane::drive_resumable_goals(
-                    crate::control_plane::control_plane().expect("just installed above"),
-                    &drive_config,
-                )
-                .await;
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({
-                            "resumed": outcome.resumed,
-                            "re_paused": outcome.re_paused,
-                            "interrupted": outcome.interrupted,
-                            "already_done": outcome.already_done,
-                        })),
-                    "F-1: boot-time goal auto-resume drive finished"
-                );
-            });
+            spawn_resume_drive(config.clone());
         }
     }
 
@@ -698,12 +726,7 @@ pub async fn run(
             // handle either way, but taking it here makes that obvious.
             spawn_approval_expiry(std::sync::Arc::clone(&store), channels_cancel.clone());
 
-            let sweep_config = config.clone();
-            let sweep_cancel = channels_cancel.clone();
-            zeroclaw_spawn::spawn!(async move {
-                crate::control_plane::verifier_sweep::sweep_loop(store, sweep_config, sweep_cancel)
-                    .await;
-            });
+            spawn_verifier_sweep(store, config.clone(), channels_cancel.clone());
         }
         Err(e) => {
             ::zeroclaw_log::record!(
