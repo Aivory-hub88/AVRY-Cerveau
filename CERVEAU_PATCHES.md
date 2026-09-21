@@ -62,3 +62,30 @@ git fetch upstream --tags
    localized — if a patch conflicts hard, check whether upstream implemented the same idea and drop ours)
 3. Update this file's table if any patch was dropped/renumbered
 4. Push; CI must produce a working artifact before the binary is deployed
+
+## Upgrade notes
+
+### v0.8.5: the webhook secret moved to `[gateway] webhook_secret` (config change REQUIRED)
+
+Up to v0.8.4 the gateway took its `/webhook` secret from
+`[channels.webhook.<alias>] secret`. From v0.8.5 that section "never
+participates in authorization for the gateway's `/webhook` routes"; the only
+source is `[gateway] webhook_secret`. A v0.8.5 binary run against an unmigrated
+config therefore sees *no secret configured*, which is worse than it sounds:
+
+- tenant-scoped requests are rejected `401` (our tenant gate fails closed), and
+- requests with no secret at all are **accepted** on the host agent.
+
+Migrate before starting the new binary by copying the same value the caller
+already sends (`CERVEAU_WEBHOOK_SECRET`) into `[gateway]`. A v0.8.4 binary
+ignores the extra key, so this is safe to do first and keeps rollback trivial.
+Deploy check (all four must hold): no secret -> 401, wrong secret -> 401,
+secret + malformed `X-Tenant-Id` -> 400, secret + host agent -> 200. `/health`
+alone does not catch this. `[node_transport]` is retired in v0.8.5 (ignored with
+a warning); delete it when convenient.
+
+### Building from a non-`cerveau-main` branch
+
+`cerveau-build.yml` publishes to `cerveau-cd` only for `cerveau-main`. Other
+branches publish to `cerveau-cd-<suffix>` (e.g. `cerveau-cd-v0.8.5`) and never
+take the "Latest" badge, so the rollback artifact is not overwritten.
