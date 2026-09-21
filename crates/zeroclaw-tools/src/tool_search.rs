@@ -1086,9 +1086,10 @@ mod tests {
             // Pre-activate a tool so `recent` is non-empty and the rerank
             // path actually engages.
             let seed_tool: Arc<dyn Tool> = Arc::new(
-                make_stub("srv__seed", "seed tool").activate(Arc::new(
-                    McpRegistry::connect_all(&[]).await.unwrap(),
-                )),
+                make_stub("srv__seed", "seed tool").activate(
+                    Arc::new(McpRegistry::connect_all(&[]).await.unwrap()),
+                    Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+                ),
             );
             activated
                 .lock()

@@ -123,7 +123,7 @@ impl PostgresMemory {
             pgvector,
         )?;
 
-        if !pgvector_ok {
+        if pgvector.is_some() && !pgvector_ok {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -252,7 +252,11 @@ impl PostgresMemory {
                             dimensions,
                         )
                         .is_ok(),
-                        None => true,
+                        // Not requested => no `embedding` column. `pgvector_ready` means
+                        // the column exists (store/recall pick their SQL from it), so this
+                        // must be false; upstream's `true` broke every store on a
+                        // deployment that never enabled pgvector.
+                        None => false,
                     };
 
                     // Return the connection to the pool instead of holding
