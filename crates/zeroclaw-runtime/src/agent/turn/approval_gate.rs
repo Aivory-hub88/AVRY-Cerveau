@@ -487,6 +487,7 @@ mod tests {
             pacing: &pacing,
             strict_tool_parsing: false,
             channel: None,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,

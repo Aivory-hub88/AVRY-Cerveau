@@ -6547,7 +6547,8 @@ mod tests {
             };
             let model_provider = ScriptedModelProvider::from_text_responses(vec!["done"]);
             let mut history = vec![ChatMessage::user("what about Toko Melati?".to_string())];
-            let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+            let tools_registry =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
             let observer = RecallCountingObserver::default();
             let turn_id = uuid::Uuid::new_v4().to_string();
             let mem = StaticRecallMemory;
@@ -8293,7 +8294,17 @@ mod tests {
         // C1: shell never executes on a headless path — the model sees the
         // denial, not command output.
         assert!(!tool_results.content.contains("hello"));
-        assert!(tool_results.content.contains("Denied by user."));
+        // The runtime denied it on its own authority (nobody was there to
+        // answer), so the message must not claim a user did.
+        assert!(!tool_results.content.contains("Denied by user."));
+        assert!(
+            tool_results.content.contains("requires approval")
+                || tool_results
+                    .content
+                    .contains("no operator decision was available"),
+            "denial must say why, got: {}",
+            tool_results.content
+        );
     }
 
     /// An auto-denial in a non-interactive run must not claim a user denied it.

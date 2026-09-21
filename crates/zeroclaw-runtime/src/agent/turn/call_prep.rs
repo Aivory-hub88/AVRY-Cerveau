@@ -828,6 +828,35 @@ mod tests {
         }
     }
 
+    /// A `TurnCtx` for the breaker tests: no observer output, no streaming.
+    fn breaker_ctx<'a>(
+        turn_id: &'a str,
+        dedup_exempt_tools: &'a [String],
+        pacing: &'a PacingConfig,
+    ) -> TurnCtx<'a> {
+        TurnCtx {
+            observer: &NoopObserver,
+            provider_name: "test",
+            model: "test-model",
+            temperature: None,
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools,
+            pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id,
+            agent_alias: None,
+            parent_agent_alias: None,
+        }
+    }
+
     /// Feed `n` executed outcomes for `tool` through the real post-execution path.
     async fn feed_outcomes(
         ctx: &TurnCtx<'_>,
@@ -843,6 +872,7 @@ mod tests {
                 ctx,
                 &[0],
                 &calls,
+                &[None],
                 vec![outcome(success, text)],
                 &[None],
                 &mut ordered,
@@ -856,6 +886,8 @@ mod tests {
         let calls = vec![breaker_call(tool)];
         prepare_tool_calls(
             ctx,
+            &[],
+            None,
             &calls,
             &mut HashSet::new(),
             &mut HashSet::new(),
@@ -870,7 +902,7 @@ mod tests {
     async fn a_dead_mcp_server_is_short_circuited_after_five_server_failures() {
         let dedup_exempt_tools: Vec<String> = Vec::new();
         let pacing = zeroclaw_config::schema::PacingConfig::default();
-        let ctx = test_ctx("turn-breaker-open", &dedup_exempt_tools, &pacing);
+        let ctx = breaker_ctx("turn-breaker-open", &dedup_exempt_tools, &pacing);
         let tool = "brk_dead__get_thread_memory";
 
         feed_outcomes(
@@ -900,7 +932,7 @@ mod tests {
     async fn answers_with_errors_or_successes_never_open_the_breaker() {
         let dedup_exempt_tools: Vec<String> = Vec::new();
         let pacing = zeroclaw_config::schema::PacingConfig::default();
-        let ctx = test_ctx("turn-breaker-closed", &dedup_exempt_tools, &pacing);
+        let ctx = breaker_ctx("turn-breaker-closed", &dedup_exempt_tools, &pacing);
 
         // The server ANSWERS with an error every time ("not found"): it is alive.
         let answering = "brk_alive__get_thread";
@@ -928,14 +960,14 @@ mod tests {
         let dedup_exempt_tools: Vec<String> = Vec::new();
         let mut pacing = zeroclaw_config::schema::PacingConfig::default();
         pacing.tool_breaker_threshold = 0;
-        let ctx = test_ctx("turn-breaker-off", &dedup_exempt_tools, &pacing);
+        let ctx = breaker_ctx("turn-breaker-off", &dedup_exempt_tools, &pacing);
         let down = "MCP server `brk_off` error during tool call `t`";
         feed_outcomes(&ctx, "brk_off__t", 10, false, down).await;
         assert_eq!(prepared_for(&ctx, "brk_off__t").await.executable_indices, vec![0]);
 
         // Built-ins (no `server__tool` shape) have no remote server to be down.
         let pacing_on = zeroclaw_config::schema::PacingConfig::default();
-        let ctx_on = test_ctx("turn-breaker-builtin", &dedup_exempt_tools, &pacing_on);
+        let ctx_on = breaker_ctx("turn-breaker-builtin", &dedup_exempt_tools, &pacing_on);
         feed_outcomes(&ctx_on, "brk_builtin", 10, false, down).await;
         assert_eq!(prepared_for(&ctx_on, "brk_builtin").await.executable_indices, vec![0]);
     }

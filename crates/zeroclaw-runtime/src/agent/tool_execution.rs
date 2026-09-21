@@ -2756,6 +2756,7 @@ mod tests {
             "test-model",
             0,
             "turn-test",
+            None,
         )
         .expect("collect_tool_results must succeed");
 
