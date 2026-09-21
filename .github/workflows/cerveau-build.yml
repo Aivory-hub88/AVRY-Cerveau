@@ -195,11 +195,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="cerveau-cd"
+          # `cerveau-cd` is the deploy artifact for cerveau-main and doubles as the
+          # rollback binary for whatever is live. A build from any other branch
+          # (e.g. cerveau-main-v0.8.5, dispatched by hand) gets its own tag and
+          # never takes the "Latest" badge, so it cannot overwrite it.
+          REF="${{ github.ref_name }}"
+          if [ "$REF" = "cerveau-main" ]; then
+            TAG="cerveau-cd"; LATEST="--latest"
+          else
+            TAG="cerveau-cd-${REF#cerveau-main-}"; LATEST="--latest=false"
+          fi
           gh release delete "$TAG" --yes --cleanup-tag --repo "${{ github.repository }}" || true
-          gh release create "$TAG" \
+          gh release create "$TAG" $LATEST \
             --repo "${{ github.repository }}" \
-            --title "Cerveau CD artifact ($(git rev-parse --short HEAD))" \
-            --notes "Rolling deploy artifact, auto-published from commit ${{ github.sha }}. Not a versioned release — always points at the latest cerveau-main build." \
+            --title "Cerveau CD artifact $REF ($(git rev-parse --short HEAD))" \
+            --notes "Deploy artifact built from ${REF} at commit ${{ github.sha }}. The cerveau-cd tag always points at the latest cerveau-main build; other branches publish to cerveau-cd-<suffix>." \
             zeroclaw-x86_64-unknown-linux-gnu.tar.gz \
             zeroclaw-x86_64-unknown-linux-gnu.tar.gz.sha256
