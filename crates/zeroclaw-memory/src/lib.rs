@@ -143,12 +143,12 @@ where
 /// — there is no separate `[storage.postgres.<alias>]` copy of these, since
 /// they're a recall-blending policy, not a storage-connection detail.
 #[cfg(feature = "memory-postgres")]
-fn build_postgres_memory(
+fn build_postgres_memory_concrete(
     storage: &PostgresStorageConfig,
     resolved_embedding: &ResolvedEmbeddingConfig,
     vector_weight: f32,
     keyword_weight: f32,
-) -> anyhow::Result<Box<dyn Memory>> {
+) -> anyhow::Result<postgres::PostgresMemory> {
     use postgres::PostgresMemory;
     let db_url = storage
         .db_url
@@ -179,7 +179,24 @@ fn build_postgres_memory(
         vector_weight,
         keyword_weight,
     )?;
-    Ok(Box::new(memory))
+    Ok(memory)
+}
+
+/// Boxed form of [`build_postgres_memory_concrete`] for callers that do not
+/// need the concrete type (the decorators in `wrap_scanned_and_audit` do).
+#[cfg(feature = "memory-postgres")]
+fn build_postgres_memory(
+    storage: &PostgresStorageConfig,
+    resolved_embedding: &ResolvedEmbeddingConfig,
+    vector_weight: f32,
+    keyword_weight: f32,
+) -> anyhow::Result<Box<dyn Memory>> {
+    Ok(Box::new(build_postgres_memory_concrete(
+        storage,
+        resolved_embedding,
+        vector_weight,
+        keyword_weight,
+    )?))
 }
 
 #[cfg(not(feature = "memory-postgres"))]
@@ -809,11 +826,43 @@ pub fn create_memory_with_storage_and_routes(
                  referenced by `memory.backend = \"postgres.<alias>\"`"
             ),
         };
-        return build_postgres_memory(
-            pg_cfg,
+        #[cfg(feature = "memory-postgres")]
+        {
+            return wrap_scanned_and_audit(
+                build_postgres_memory_concrete(
+                    pg_cfg,
+                    &resolved_embedding,
+                    config.vector_weight as f32,
+                    config.keyword_weight as f32,
+                )?,
+                &config.policy,
+                workspace_dir,
+                config.audit_enabled,
+            );
+        }
+        #[cfg(not(feature = "memory-postgres"))]
+        {
+            return build_postgres_memory(
+                pg_cfg,
+                &resolved_embedding,
+                config.vector_weight as f32,
+                config.keyword_weight as f32,
+            );
+        }
+    }
+
+    if matches!(backend_kind, MemoryBackendKind::Lucid) {
+        let local = build_sqlite_memory(
+            config,
+            sqlite_open_timeout_secs,
+            workspace_dir,
             &resolved_embedding,
-            config.vector_weight as f32,
-            config.keyword_weight as f32,
+        )?;
+        return wrap_scanned_and_audit(
+            build_lucid_memory(workspace_dir, local, active_storage),
+            &config.policy,
+            workspace_dir,
+            config.audit_enabled,
         );
     }
 
