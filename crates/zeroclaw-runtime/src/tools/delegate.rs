@@ -1664,7 +1664,12 @@ impl DelegateTool {
                 .output
                 .split_once('\n')
                 .map_or(result.output.as_str(), |(_, rendered)| rendered);
-            result.output = format!("{header}\n{rendered}\n\n{warning}").into();
+            let body = format!("{rendered}\n\n{warning}");
+            result.output = format!("{header}\n{body}").into();
+            // The envelope boundary rebuilds a success from the facts the engine
+            // recorded, not from this text; without re-recording them it would
+            // show the pre-fallback header and drop the provenance warning.
+            envelope::note_completed(header, body);
         }
         Ok(result)
     }
@@ -10876,11 +10881,16 @@ command = "rm independent-delegate-marker"
             }),
             "nested tool result must report runtime fail-closed denial: {tool_messages:?}"
         );
+        // Shell is fail-closed either by the approval layer (Cerveau's shell
+        // default-deny) or, if it got that far, by its own command policy with
+        // approved=false. It must never execute (asserted via the marker above).
         assert!(
             tool_messages.iter().any(|message| {
                 message.contains("Command requires explicit approval (approved=true)")
+                    || (message.contains("'shell' requires approval")
+                        && message.contains("no operator decision was available"))
             }),
-            "built-in shell must still receive approved=false and enforce command policy: {tool_messages:?}"
+            "built-in shell must be denied, by approval or by command policy: {tool_messages:?}"
         );
     }
 
@@ -11664,7 +11674,15 @@ command = "rm independent-delegate-marker"
             "timeout must not carry output: {result:?}"
         );
         let error = result.error.expect("timeout error");
-        assert_eq!(error, "Agent 'target' timed out after 1s");
+        // The engine's text leads; the ADR-014 envelope appends state/reason.
+        assert!(
+            error.starts_with("Agent 'target' timed out after 1s"),
+            "timeout text must lead the error: {error}"
+        );
+        assert!(
+            error.contains("reason=timed_out"),
+            "timeout must stay classified as timed_out, not provider exhaustion: {error}"
+        );
         assert_eq!(
             backup_requests.load(std::sync::atomic::Ordering::SeqCst),
             0,
