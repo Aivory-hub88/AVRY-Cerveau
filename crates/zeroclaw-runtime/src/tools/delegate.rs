@@ -12,7 +12,7 @@ use crate::tools::delegate_envelope::{
     self as envelope, DEFAULT_MAX_SUMMARY_BYTES, DelegateEnvelope, DelegateExecution,
     DelegateReason, DelegateState, RunFacts,
 };
-use crate::tools::delegate_ledger::{LedgerLink, LedgerStart};
+use crate::tools::delegate_ledger::{ContextGate, LedgerLink, LedgerStart};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::json;
@@ -316,6 +316,46 @@ fn expected_output_arg(args: &serde_json::Value) -> &str {
         .and_then(|v| v.as_str())
         .map(str::trim)
         .unwrap_or("")
+}
+
+/// ADR-014 P1: how often a running background delegation stamps its registry
+/// heartbeat. The reaper times out same-boot records whose beat is older
+/// than its grace, so a delegation that dies without settling stops looking
+/// alive on its own. Before this, delegates registered `heartbeat_at: None`
+/// and were exempt from stall detection entirely.
+const DELEGATE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Stamp `heartbeat_at` until the record leaves `Running` (settled, lost, or
+/// gone), then stop — so a panicked task cannot beat forever. Best-effort: a
+/// missed beat only delays stall detection, never fails the delegation.
+async fn heartbeat_while_running(
+    store: Arc<dyn crate::control_plane::TaskRegistry>,
+    task_id: String,
+    owner_boot_id: String,
+    interval: Duration,
+) {
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        let running = store.get(&task_id).await.ok().flatten().is_some_and(|rec| {
+            rec.owner_boot_id == owner_boot_id
+                && rec.status == crate::control_plane::TaskStatus::Running
+        });
+        if !running {
+            break;
+        }
+        let _ = store.heartbeat(&task_id, &owner_boot_id).await;
+    }
+}
+
+/// ADR-014 P1: effective per-context delegation cap (schema default 5),
+/// clamped 1..=20 so a misconfigured zero cannot deadlock follow-ups and a
+/// huge value cannot build an unbounded chain.
+fn effective_context_turn_cap(config: &DelegateToolConfig) -> u32 {
+    config
+        .context_turn_cap
+        .clamp(1, zeroclaw_config::schema::MAX_DELEGATE_CONTEXT_TURN_CAP)
 }
 
 pub struct DelegateTool {
@@ -1476,6 +1516,34 @@ impl Tool for DelegateTool {
         } else {
             DelegateExecution::Sync
         };
+        // ADR-014 P1: the context gate runs before anything is spawned and
+        // creates no row; prior findings prepend to the prompt the sub-agent
+        // sees. No ledger link (host turns) skips both, fail-open.
+        let prompt_owned;
+        let prompt = match LedgerLink::capture(agent_name) {
+            Some(link) => {
+                let cap = effective_context_turn_cap(&self.delegate_config);
+                match link.prepare_context(&call_context, cap).await {
+                    ContextGate::PassThrough => prompt,
+                    ContextGate::CarryForward { prompt_prefix } => {
+                        prompt_owned = format!("{prompt_prefix}\n{prompt}");
+                        &prompt_owned
+                    }
+                    ContextGate::Refused { count, cap } => {
+                        return Ok(Self::refusal(
+                            agent_name,
+                            execution,
+                            DelegateReason::ContextTurnCap,
+                            &format!(
+                                "Context '{call_context}' already holds {count} delegations (cap {cap})."
+                            ),
+                            Some(&call_context),
+                        ));
+                    }
+                }
+            }
+            None => prompt,
+        };
         self.run_enveloped(agent_name, prompt, &args, execution, &call_context)
             .await
     }
@@ -2200,6 +2268,11 @@ impl DelegateTool {
         let watch_link = closure_link.clone();
         // Owned: the spawned task cannot see the caller's noted context.
         let context_owned = context_id.to_string();
+        // The registry record exists from here on; beat until it leaves
+        // `Running` so a silent death is eventually declared stalled. Absent
+        // outside a booted daemon (tests, dry runs): then nothing beats.
+        let hb_plane = crate::control_plane::control_plane()
+            .map(|cp| (Arc::clone(&cp.store), cp.boot_id.clone()));
 
         zeroclaw_spawn::spawn!(
             scope_delegate_session_key(parent_session_key, async move {
@@ -2234,6 +2307,19 @@ impl DelegateTool {
                     // same context from its args instead of inheriting it.
                     "context_id": context_owned,
                 });
+
+                if let Some((hb_store, hb_boot)) = hb_plane {
+                    let hb_id = task_id_clone.clone();
+                    zeroclaw_spawn::spawn!(async move {
+                        heartbeat_while_running(
+                            hb_store,
+                            hb_id,
+                            hb_boot,
+                            DELEGATE_HEARTBEAT_INTERVAL,
+                        )
+                        .await;
+                    });
+                }
 
                 // ADR-008 Phase 3b: give this turn somewhere to record a
                 // parked approval. `approval_gate` calls
@@ -2528,6 +2614,34 @@ impl DelegateTool {
             }
         }
 
+        // ADR-014 P1: one gate for the whole fan-out (per tenant+context, not
+        // per leg). Priors prepend to the shared prompt every leg receives.
+        let prompt_owned;
+        let prompt = match LedgerLink::capture(&agent_names[0]) {
+            Some(link) => {
+                let cap = effective_context_turn_cap(&self.delegate_config);
+                match link.prepare_context(context_id, cap).await {
+                    ContextGate::PassThrough => prompt,
+                    ContextGate::CarryForward { prompt_prefix } => {
+                        prompt_owned = format!("{prompt_prefix}\n{prompt}");
+                        &prompt_owned
+                    }
+                    ContextGate::Refused { count, cap } => {
+                        return Ok(Self::refusal(
+                            "(parallel)",
+                            DelegateExecution::Parallel,
+                            DelegateReason::ContextTurnCap,
+                            &format!(
+                                "Context '{context_id}' already holds {count} delegations (cap {cap})."
+                            ),
+                            Some(context_id),
+                        ));
+                    }
+                }
+            }
+            None => prompt,
+        };
+
         let parent_receipt_scope = crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
             .try_with(Clone::clone)
             .ok()
@@ -2788,11 +2902,7 @@ impl DelegateTool {
             .with_timing(Some(&result.started_at), result.finished_at.as_deref());
             // ADR-014 P1: the file carries the context in `meta` (written at
             // accept/settle), so `check_result` renders the same envelope.
-            if let Some(context_id) = result
-                .meta
-                .as_ref()
-                .and_then(|m| m.context_id.as_deref())
-            {
+            if let Some(context_id) = result.meta.as_ref().and_then(|m| m.context_id.as_deref()) {
                 env = env.with_context_id(context_id);
             }
             env
@@ -5387,6 +5497,122 @@ mod tests {
         assert_eq!(data["context_id"], "ctx_keep");
     }
 
+    #[test]
+    fn context_turn_cap_clamps_to_1_through_20() {
+        let capped = |raw: u32| {
+            effective_context_turn_cap(&DelegateToolConfig {
+                context_turn_cap: raw,
+                ..DelegateToolConfig::default()
+            })
+        };
+        assert_eq!(capped(0), 1);
+        assert_eq!(capped(1), 1);
+        assert_eq!(capped(5), 5);
+        assert_eq!(capped(20), 20);
+        assert_eq!(capped(99), 20);
+        assert_eq!(
+            capped(DelegateToolConfig::default().context_turn_cap),
+            5,
+            "schema default is Hermes' number"
+        );
+    }
+
+    #[test]
+    fn context_cap_refusal_is_rejected_never_retryable_with_a_stop_hint() {
+        let result = DelegateTool::refusal(
+            "lex",
+            DelegateExecution::Sync,
+            DelegateReason::ContextTurnCap,
+            "Context 'ctx_x' already holds 5 delegations (cap 5).",
+            Some("ctx_x"),
+        );
+        assert_failure_envelope(
+            &result,
+            "already holds 5 delegations",
+            "rejected",
+            "context_turn_cap",
+            false,
+        );
+        let data = result.output.data().expect("structured envelope");
+        assert_eq!(data["context_id"], "ctx_x");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("stop and answer the user with what you have"),
+            "stop hint missing: {:?}",
+            result.error
+        );
+    }
+
+    /// ADR-014 P1: the heartbeat loop stamps a running delegate and stops
+    /// once the record leaves `Running` — so the reaper's stall timeout can
+    /// fire, and a dead task cannot beat forever.
+    #[tokio::test]
+    async fn delegate_heartbeat_beats_while_running_then_stops() {
+        use crate::control_plane::{
+            SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
+        };
+
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        store
+            .create(TaskRecord {
+                id: "hb-1".into(),
+                kind: TaskKind::Delegate,
+                agent: "lex".into(),
+                status: TaskStatus::Running,
+                owner_pid: std::process::id(),
+                owner_boot_id: "boot-test".into(),
+                heartbeat_at: None,
+                depth: 0,
+                parent_id: None,
+                originator_route: None,
+                delivered: false,
+                idem_key: None,
+                principal_id: None,
+                started_at: chrono::Utc::now().to_rfc3339(),
+                finished_at: None,
+            })
+            .await
+            .unwrap();
+
+        let beat = heartbeat_while_running(
+            Arc::clone(&store),
+            "hb-1".into(),
+            "boot-test".into(),
+            Duration::from_millis(10),
+        );
+        let settled = store.clone();
+        let driver = async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let rec = settled.get("hb-1").await.unwrap().expect("record");
+            assert!(
+                rec.heartbeat_at.is_some(),
+                "a running delegate must be heartbeating"
+            );
+            settled
+                .update_status("hb-1", TaskStatus::Completed, None, None)
+                .await
+                .unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(beat, driver);
+        })
+        .await
+        .expect("heartbeat loop must exit once the record settles");
+        // A foreign boot's record is never ours to beat.
+        heartbeat_while_running(
+            Arc::clone(&store),
+            "hb-1".into(),
+            "other-boot".into(),
+            Duration::from_millis(10),
+        )
+        .await;
+        let rec = store.get("hb-1").await.unwrap().expect("record");
+        assert_eq!(rec.status, TaskStatus::Completed);
+    }
+
     #[tokio::test]
     async fn background_start_failure_is_rejected_with_a_reason() {
         let tool = DelegateTool::new(sample_agents(), None, test_security());
@@ -5525,8 +5751,8 @@ mod tests {
         });
         let env = file_envelope(&stored);
         assert_eq!(env["context_id"], "ctx_file");
-        let text = DelegateTool::envelope_from_file(&stored, None)
-            .render_text("[Agent 'lex' (p/m)]");
+        let text =
+            DelegateTool::envelope_from_file(&stored, None).render_text("[Agent 'lex' (p/m)]");
         assert!(
             text.contains("context=ctx_file"),
             "background text carries the context: {text}"
@@ -13049,6 +13275,158 @@ command = "rm independent-delegate-marker"
                     })
                     .expect("the reconciler announced the lost delegation");
                 assert_eq!(lost["payload"]["status"], "blocked");
+            }
+
+            // ── H. ADR-014 P1: the context gate refuses at the cap and carries
+            //       prior findings forward ──
+            {
+                use zeroclaw_memory::task_ledger::NewDelegatedTask;
+
+                let ctx = "ctx_gate_e2e";
+                // Below the cap a fresh context passes through untouched.
+                let link = LedgerLink::for_test(
+                    Arc::clone(&ledger),
+                    &user,
+                    "researcher",
+                    "chief_of_staff",
+                    Some("room-ctx"),
+                    None,
+                );
+                assert!(matches!(
+                    link.prepare_context("ctx_fresh_e2e", 5).await,
+                    ContextGate::PassThrough
+                ));
+
+                // Two finished delegations with summaries, one still running.
+                for (i, summary) in ["first findings", "second findings"].iter().enumerate() {
+                    let id = format!("gate-done-{i}");
+                    ledger
+                        .create_delegated_task(NewDelegatedTask {
+                            tenant_id: &user,
+                            agent_type: "researcher",
+                            session_id: Some("room-ctx"),
+                            title: "Delegated to researcher: x",
+                            delegated_by: "chief_of_staff",
+                            delegation_id: &id,
+                            context_id: Some(ctx),
+                            status: LedgerStatus::InProgress,
+                            outcome: None,
+                            blocked_reason: None,
+                            result_summary: None,
+                        })
+                        .await
+                        .unwrap();
+                    ledger
+                        .finish_delegation_returning(
+                            &id,
+                            DelegationEnd::Completed {
+                                summary: Some(summary.to_string()),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+                ledger
+                    .create_delegated_task(NewDelegatedTask {
+                        tenant_id: &user,
+                        agent_type: "researcher",
+                        session_id: Some("room-ctx"),
+                        title: "Delegated to researcher: running",
+                        delegated_by: "chief_of_staff",
+                        delegation_id: "gate-running",
+                        context_id: Some(ctx),
+                        status: LedgerStatus::InProgress,
+                        outcome: None,
+                        blocked_reason: None,
+                        result_summary: None,
+                    })
+                    .await
+                    .unwrap();
+
+                match link.prepare_context(ctx, 5).await {
+                    ContextGate::CarryForward { prompt_prefix } => {
+                        assert!(
+                            prompt_prefix.contains("[Prior findings in context ctx_gate_e2e]"),
+                            "{prompt_prefix}"
+                        );
+                        let first = prompt_prefix.find("second findings").unwrap();
+                        let second = prompt_prefix.find("first findings").unwrap();
+                        assert!(first < second, "newest first: {prompt_prefix}");
+                    }
+                    other => panic!("expected carry-forward, got {other:?}"),
+                }
+
+                // Fill to the cap: the next delegation is refused up front —
+                // no row, no result file, no model_provider call.
+                for i in 0..2 {
+                    ledger
+                        .create_delegated_task(NewDelegatedTask {
+                            tenant_id: &user,
+                            agent_type: "researcher",
+                            session_id: Some("room-ctx"),
+                            title: "Delegated to researcher: filler",
+                            delegated_by: "chief_of_staff",
+                            delegation_id: &format!("gate-fill-{i}"),
+                            context_id: Some(ctx),
+                            status: LedgerStatus::InProgress,
+                            outcome: None,
+                            blocked_reason: None,
+                            result_summary: None,
+                        })
+                        .await
+                        .unwrap();
+                }
+                let files_before = result_files(&workspace);
+                let refused = in_tenant(
+                    &user,
+                    tool.execute(json!({
+                        "agent": "researcher", "prompt": "one too many",
+                        "context_id": ctx,
+                    })),
+                )
+                .await
+                .unwrap();
+                assert!(!refused.success);
+                let refused_error = refused.error.unwrap();
+                assert!(
+                    refused_error.contains("already holds 5 delegations"),
+                    "{refused_error}"
+                );
+                assert!(
+                    refused_error.contains("[delegate state=rejected reason=context_turn_cap"),
+                    "{refused_error}"
+                );
+                assert_eq!(
+                    result_files(&workspace),
+                    files_before,
+                    "a refused delegation spawns nothing"
+                );
+
+                // Below the cap the same call would proceed: a fresh context
+                // is accepted and its board row carries the context id.
+                let accepted = in_tenant(
+                    &user,
+                    tool.execute(json!({
+                        "agent": "researcher", "prompt": "follow-up",
+                        "background": true, "context_id": "ctx_fresh_e2e",
+                    })),
+                )
+                .await
+                .unwrap();
+                assert!(accepted.success, "{accepted:?}");
+                let accepted_data = accepted.output.data().unwrap();
+                assert_eq!(accepted_data["context_id"], "ctx_fresh_e2e");
+                let accepted_row = accepted_data["ledger_task_id"].as_str().unwrap();
+                let row = row_eventually(&ledger, &user, accepted_row, |r| {
+                    r.status != LedgerStatus::InProgress || r.context_id.is_some()
+                })
+                .await;
+                assert_eq!(row.context_id.as_deref(), Some("ctx_fresh_e2e"));
+                let _ = wait_for_terminal_background_result(
+                    &workspace,
+                    accepted_data["task_id"].as_str().unwrap(),
+                )
+                .await;
             }
 
             let _ = std::fs::remove_dir_all(workspace);

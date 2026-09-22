@@ -3580,6 +3580,12 @@ pub struct DelegateToolConfig {
     /// Default: 300 seconds.
     #[serde(default = "default_delegate_agentic_timeout_secs")]
     pub agentic_timeout_secs: u64,
+    /// ADR-014 P1: max delegations per follow-up context before the engine
+    /// refuses with `context_turn_cap`. Read through
+    /// `effective_context_turn_cap`, which clamps to 1..=20.
+    /// Default: 5.
+    #[serde(default = "default_delegate_context_turn_cap")]
+    pub context_turn_cap: u32,
 }
 
 impl Default for DelegateToolConfig {
@@ -3587,6 +3593,7 @@ impl Default for DelegateToolConfig {
         Self {
             timeout_secs: DEFAULT_DELEGATE_TIMEOUT_SECS,
             agentic_timeout_secs: DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
+            context_turn_cap: DEFAULT_DELEGATE_CONTEXT_TURN_CAP,
         }
     }
 }
@@ -4987,6 +4994,17 @@ pub const DEFAULT_DELEGATE_TIMEOUT_SECS: u64 = 120;
 
 /// Default delegate tool timeout for agentic runs: 300 seconds.
 pub const DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS: u64 = 300;
+
+/// ADR-014 P1: default max delegations per follow-up context (Hermes' number).
+pub const DEFAULT_DELEGATE_CONTEXT_TURN_CAP: u32 = 5;
+
+/// Hard ceiling for the context turn cap: a miscounted context must fail
+/// closed on noise, not on an unbounded delegation chain.
+pub const MAX_DELEGATE_CONTEXT_TURN_CAP: u32 = 20;
+
+fn default_delegate_context_turn_cap() -> u32 {
+    DEFAULT_DELEGATE_CONTEXT_TURN_CAP
+}
 
 /// Per-channel reply-pacing accessor. Implemented by every `*Config`
 /// struct that participates in outbound pacing so validation and

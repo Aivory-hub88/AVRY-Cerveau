@@ -1266,3 +1266,88 @@ async fn finishing_a_delegation_returns_the_row_as_it_now_stands() {
 
     exec(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE;")).await;
 }
+
+/// ADR-014 P1: the context turn cap counts live + archive rows per
+/// (tenant, context), and carry-forward reads the newest summaries.
+#[tokio::test(flavor = "multi_thread")]
+async fn delegation_context_count_and_priors() {
+    let Some(url) = pg_url() else {
+        eprintln!("CERVEAU_TEST_PG_URL unset — skipping context test");
+        return;
+    };
+    const SCHEMA: &str = "cerveau_task_ledger_context_test";
+    exec(&format!(
+        "DROP SCHEMA IF EXISTS {SCHEMA} CASCADE; CREATE SCHEMA {SCHEMA};"
+    ))
+    .await;
+    let l = AgentTaskLedger::connect(&url, SCHEMA)
+        .await
+        .expect("connect");
+    let mk = |id: &'static str, ctx: Option<&'static str>| NewDelegatedTask {
+        tenant_id: "t1",
+        agent_type: "leads_qualifier",
+        session_id: Some("s"),
+        title: "Delegated to leads_qualifier: x",
+        delegated_by: "chief_of_staff",
+        delegation_id: id,
+        context_id: ctx,
+        status: TaskStatus::InProgress,
+        outcome: None,
+        blocked_reason: None,
+        result_summary: None,
+    };
+
+    l.create_delegated_task(mk("d1", Some("ctx_a")))
+        .await
+        .unwrap();
+    l.create_delegated_task(mk("d2", Some("ctx_a")))
+        .await
+        .unwrap();
+    l.create_delegated_task(mk("d3", Some("ctx_a")))
+        .await
+        .unwrap();
+    l.create_delegated_task(mk("d9", Some("ctx_b")))
+        .await
+        .unwrap();
+
+    assert_eq!(l.count_by_context("t1", "ctx_a").await.unwrap(), 3);
+    assert_eq!(l.count_by_context("t1", "ctx_b").await.unwrap(), 1);
+    assert_eq!(l.count_by_context("t1", "ctx_nope").await.unwrap(), 0);
+    assert_eq!(l.count_by_context("t2", "ctx_a").await.unwrap(), 0);
+
+    // In-progress rows carry no findings yet.
+    assert!(l.context_priors("t1", "ctx_a", 2).await.unwrap().is_empty());
+
+    l.finish_delegation_returning(
+        "d1",
+        DelegationEnd::Completed {
+            summary: Some("first findings".into()),
+        },
+    )
+    .await
+    .unwrap();
+    l.finish_delegation_returning(
+        "d2",
+        DelegationEnd::Completed {
+            summary: Some("second findings".into()),
+        },
+    )
+    .await
+    .unwrap();
+
+    // Archive counts too: 1 live + 2 finished.
+    assert_eq!(l.count_by_context("t1", "ctx_a").await.unwrap(), 3);
+
+    let priors = l.context_priors("t1", "ctx_a", 2).await.unwrap();
+    assert_eq!(priors.len(), 2);
+    assert_eq!(priors[0].summary, "second findings", "newest first");
+    assert_eq!(priors[1].summary, "first findings");
+    assert_eq!(priors[0].status, "done");
+
+    let one = l.context_priors("t1", "ctx_a", 1).await.unwrap();
+    assert_eq!(one.len(), 1);
+
+    assert!(l.context_priors("t2", "ctx_a", 2).await.unwrap().is_empty());
+
+    exec(&format!("DROP SCHEMA IF EXISTS {SCHEMA} CASCADE;")).await;
+}

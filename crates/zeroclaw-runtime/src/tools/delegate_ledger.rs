@@ -39,9 +39,23 @@ pub(crate) enum LedgerStart {
     Refused(String),
 }
 
+/// ADR-014 P1: the context gate outcome — refuse, pass through, or carry
+/// prior findings forward. Computed in `LedgerLink::prepare_context` so both
+/// feature builds share the call sites in `delegate.rs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(feature = "memory-postgres"), allow(dead_code))]
+pub(crate) enum ContextGate {
+    /// No priors (or no ledger): run with the prompt as-is.
+    PassThrough,
+    /// The context already holds `count` delegations: refuse, create nothing.
+    Refused { count: u64, cap: u32 },
+    /// Run with `prompt_prefix` prepended to the sub-agent prompt.
+    CarryForward { prompt_prefix: String },
+}
+
 #[cfg(feature = "memory-postgres")]
 mod real {
-    use super::LedgerStart;
+    use super::{ContextGate, LedgerStart};
     use crate::agent::tenant::{current_tenant, current_turn_origin};
     use crate::control_plane::{TaskRegistry, TaskStatus};
     use crate::tools::delegate::BackgroundDelegateResult;
@@ -59,6 +73,23 @@ mod real {
     const CANCEL_POLL: Duration = Duration::from_secs(5);
     const TITLE_PROMPT_CHARS: usize = 80;
     const REASON_CHARS: usize = 300;
+
+    /// ADR-014 P1 carry-forward: the context's recent findings, framed as
+    /// engine knowledge prepended before everything the caller wrote (at most
+    /// 2, newest first — the query already orders and caps).
+    fn frame_context_priors(
+        context_id: &str,
+        priors: &[zeroclaw_memory::task_ledger::ContextPrior],
+    ) -> String {
+        let mut out = format!("[Prior findings in context {context_id}]\n");
+        for prior in priors {
+            out.push_str(&format!(
+                "- {} [{}]: {}\n",
+                prior.title, prior.status, prior.summary
+            ));
+        }
+        out
+    }
 
     /// The tenant, session and ledger a delegation is recorded under, captured
     /// on the caller's task before anything is spawned (a spawned task does not
@@ -240,6 +271,59 @@ mod real {
                     warn("record_failed_hop", &e);
                     None
                 }
+            }
+        }
+
+        /// ADR-014 P1: how many delegations a follow-up context already
+        /// holds (live + archive). Best-effort like every other ledger read:
+        /// an outage yields zero, which fails the cap open (the delegation
+        /// still runs; the per-turn iteration cap bounds a single turn).
+        pub(crate) async fn context_count(&self, context_id: &str) -> u64 {
+            self.ledger
+                .count_by_context(&self.tenant_id, context_id)
+                .await
+                .unwrap_or(0)
+        }
+
+        /// ADR-014 P1: the context's most recent findings for carry-forward.
+        /// Best-effort: an outage yields none, and the delegation runs with
+        /// only its own prompt.
+        pub(crate) async fn context_priors(
+            &self,
+            context_id: &str,
+            limit: usize,
+        ) -> Vec<zeroclaw_memory::task_ledger::ContextPrior> {
+            self.ledger
+                .context_priors(&self.tenant_id, context_id, limit)
+                .await
+                .unwrap_or_default()
+        }
+
+        /// ADR-014 P1: the context gate — refuse when the context already
+        /// holds `cap` delegations, else fetch its recent findings for
+        /// carry-forward. `Err(count)` is the refusal; best-effort reads mean
+        /// an outage fails open (the per-turn iteration cap still bounds).
+        pub(crate) async fn context_gate(
+            &self,
+            context_id: &str,
+            cap: u32,
+        ) -> Result<Vec<zeroclaw_memory::task_ledger::ContextPrior>, u64> {
+            let count = self.context_count(context_id).await;
+            if count >= cap.max(1) as u64 {
+                return Err(count);
+            }
+            Ok(self.context_priors(context_id, 2).await)
+        }
+
+        /// ADR-014 P1: the context gate outcome. Computed here so both
+        /// feature builds share the call sites in `delegate.rs`.
+        pub(crate) async fn prepare_context(&self, context_id: &str, cap: u32) -> ContextGate {
+            match self.context_gate(context_id, cap).await {
+                Err(count) => ContextGate::Refused { count, cap },
+                Ok(priors) if priors.is_empty() => ContextGate::PassThrough,
+                Ok(priors) => ContextGate::CarryForward {
+                    prompt_prefix: frame_context_priors(context_id, &priors),
+                },
             }
         }
 
@@ -487,6 +571,35 @@ mod real {
         }
 
         #[test]
+        fn carry_forward_frames_newest_first_as_engine_knowledge() {
+            use zeroclaw_memory::task_ledger::ContextPrior;
+            let priors = vec![
+                ContextPrior {
+                    title: "Qualify Acme".into(),
+                    status: "done".into(),
+                    summary: "3 leads, 1 hot".into(),
+                    at: chrono::DateTime::parse_from_rfc3339("2026-09-22T10:00:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                },
+                ContextPrior {
+                    title: "Draft outreach".into(),
+                    status: "blocked".into(),
+                    summary: "waiting on approval".into(),
+                    at: chrono::DateTime::parse_from_rfc3339("2026-09-22T09:00:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                },
+            ];
+            let framed = frame_context_priors("ctx_x", &priors);
+            assert!(framed.starts_with("[Prior findings in context ctx_x]\n"));
+            let first = framed.find("Qualify Acme").unwrap();
+            let second = framed.find("Draft outreach").unwrap();
+            assert!(first < second, "newest first: {framed}");
+            assert!(framed.contains("[done]") && framed.contains("[blocked]"));
+        }
+
+        #[test]
         fn a_running_task_has_no_end() {
             assert!(
                 end_for_result(&result(BackgroundTaskStatus::Running, None, None, None)).is_none()
@@ -691,6 +804,14 @@ mod stub {
         }
         pub(crate) async fn watch_cancel(self, _delegation_id: String) {
             std::future::pending::<()>().await
+        }
+
+        pub(crate) async fn prepare_context(
+            &self,
+            _context_id: &str,
+            _cap: u32,
+        ) -> super::ContextGate {
+            super::ContextGate::PassThrough
         }
     }
 

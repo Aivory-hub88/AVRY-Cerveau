@@ -244,6 +244,16 @@ pub struct AgentTask {
     pub result_summary: Option<String>,
 }
 
+/// ADR-014 P1: one prior finding in a follow-up context, for carry-forward.
+/// Sourced live or from an archived payload; both carry the same fields.
+#[derive(Debug, Clone)]
+pub struct ContextPrior {
+    pub title: String,
+    pub status: String,
+    pub summary: String,
+    pub at: DateTime<Utc>,
+}
+
 /// Terminal failure cause of a delegated row (ADR-014 §5.2). Deliberately not a
 /// [`TaskStatus`]: the dashboard maps an unknown status to its `todo` column, so
 /// a failed delegation is expressed as `blocked` plus one of these.
@@ -535,6 +545,15 @@ impl AgentTaskLedger {
                     WHERE delegation_id IS NOT NULL;
                 ALTER TABLE "{schema_owned}".agent_tasks_archive
                     ADD COLUMN IF NOT EXISTS context_id TEXT;
+                -- ADR-014 P1: the anti ping-pong turn cap counts rows per
+                -- context (live + archive) on every delegation, and
+                -- carry-forward reads the context's recent summaries. Both
+                -- queries are tenant-scoped; these indexes serve exactly them.
+                CREATE INDEX IF NOT EXISTS idx_agent_tasks_context
+                    ON "{schema_owned}".agent_tasks(tenant_id, context_id)
+                    WHERE context_id IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_agent_tasks_archive_context
+                    ON "{schema_owned}".agent_tasks_archive(tenant_id, context_id);
                 "#
             ))?;
             Ok(client)
@@ -1238,6 +1257,117 @@ impl AgentTaskLedger {
                 &[],
             )?;
             Ok(rows.iter().map(|row| row.get(0)).collect())
+        })
+        .await
+    }
+
+    /// ADR-014 P1: how many delegations a follow-up context already holds,
+    /// live rows plus archive, for the anti ping-pong turn cap. Tenant-scoped;
+    /// a context the tenant never used counts zero.
+    pub async fn count_by_context(&self, tenant_id: &str, context_id: &str) -> Result<u64> {
+        let client = Arc::clone(self.client.get());
+        let schema = self.schema.clone();
+        let tenant_id = tenant_id.to_string();
+        let context_id = context_id.to_string();
+        run_on_os_thread(move || -> Result<u64> {
+            let mut live = client.lock();
+            let client = live.ready()?;
+            let open: i64 = client
+                .query_one(
+                    &format!(
+                        r#"SELECT COUNT(*) FROM "{schema}".agent_tasks
+                       WHERE tenant_id = $1 AND context_id = $2"#
+                    ),
+                    &[&tenant_id, &context_id],
+                )?
+                .get(0);
+            let archived: i64 = client
+                .query_one(
+                    &format!(
+                        r#"SELECT COUNT(*) FROM "{schema}".agent_tasks_archive
+                       WHERE tenant_id = $1 AND context_id = $2"#
+                    ),
+                    &[&tenant_id, &context_id],
+                )?
+                .get(0);
+            Ok((open.max(0) as u64).saturating_add(archived.max(0) as u64))
+        })
+        .await
+    }
+
+    /// ADR-014 P1: the context's most recent findings for carry-forward:
+    /// rows with a recorded `result_summary`, newest first, live plus
+    /// archive, capped at `limit`. Tenant-scoped. Rows still `in_progress`
+    /// have no findings yet and are skipped.
+    pub async fn context_priors(
+        &self,
+        tenant_id: &str,
+        context_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ContextPrior>> {
+        let client = Arc::clone(self.client.get());
+        let schema = self.schema.clone();
+        let tenant_id = tenant_id.to_string();
+        let context_id = context_id.to_string();
+        let limit = limit.min(8) as i64;
+        run_on_os_thread(move || -> Result<Vec<ContextPrior>> {
+            let mut live = client.lock();
+            let client = live.ready()?;
+            let mut out: Vec<ContextPrior> = Vec::new();
+            let rows = client.query(
+                &format!(
+                    r#"SELECT title, status, result_summary, updated_at
+                       FROM "{schema}".agent_tasks
+                       WHERE tenant_id = $1 AND context_id = $2
+                         AND result_summary IS NOT NULL AND result_summary <> ''
+                       ORDER BY updated_at DESC
+                       LIMIT $3"#
+                ),
+                &[&tenant_id, &context_id, &limit],
+            )?;
+            for row in &rows {
+                let summary: Option<String> = row.get(2);
+                if let Some(summary) = summary.filter(|s| !s.trim().is_empty()) {
+                    let at: DateTime<Utc> = row.get(3);
+                    out.push(ContextPrior {
+                        title: row.get(0),
+                        status: row.get(1),
+                        summary,
+                        at,
+                    });
+                }
+            }
+            if (out.len() as i64) < limit {
+                let rows = client.query(
+                    &format!(
+                        r#"SELECT payload FROM "{schema}".agent_tasks_archive
+                           WHERE tenant_id = $1 AND context_id = $2
+                           ORDER BY archived_at DESC
+                           LIMIT 20"#
+                    ),
+                    &[&tenant_id, &context_id],
+                )?;
+                for row in &rows {
+                    if (out.len() as i64) >= limit {
+                        break;
+                    }
+                    let payload: Vec<u8> = row.get(0);
+                    if let Some(task) = decode_archived(&payload)
+                        && let Some(summary) = task.result_summary.filter(|s| !s.trim().is_empty())
+                        && task.tenant_id == tenant_id
+                    {
+                        out.push(ContextPrior {
+                            title: task.title,
+                            status: task.status.as_str().to_string(),
+                            summary,
+                            at: task.updated_at,
+                        });
+                    }
+                }
+            }
+            out.sort_by_key(|p| std::cmp::Reverse(p.at));
+            out.truncate(limit as usize);
+            Ok(out)
         })
         .await
     }

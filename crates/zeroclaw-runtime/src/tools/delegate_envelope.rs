@@ -158,9 +158,7 @@ impl DelegateReason {
             Self::Lost => Some("may have partially run; reads are safe to retry"),
             Self::DepthExceeded => Some("answer with what you have; do not delegate further"),
             Self::UnknownAgent => Some("use an agent from the Available list"),
-            Self::ContextTurnCap => {
-                Some("stop and answer the user with what you have")
-            }
+            Self::ContextTurnCap => Some("stop and answer the user with what you have"),
             Self::CapacityExceeded => {
                 Some("wait for running background tasks (check_result) or cancel one")
             }
