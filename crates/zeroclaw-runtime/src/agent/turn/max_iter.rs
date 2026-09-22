@@ -245,6 +245,11 @@ pub(crate) async fn finish_after_max_iterations(
 /// of the iteration cap — and unlike the cap path, this NEVER fails the
 /// turn: if the summary call itself fails, the caller still gets the
 /// partial work plus an honest note instead of a 500.
+///
+/// Display-hygiene parity with the max-iteration exit is load-bearing here:
+/// the summary is user-facing, so hidden think content and trailing terminal
+/// markers are stripped and an internal tool-protocol envelope is suppressed
+/// rather than rendered (upstream #10026 applied this to the cap path only).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finish_after_loop_break(
     model_provider: &dyn ModelProvider,
@@ -410,11 +415,40 @@ pub(crate) async fn finish_after_loop_break(
         SummaryCall::Done(Ok(resp)) => resp,
     };
 
-    let text = resp.text.unwrap_or_default();
-    if text.is_empty() {
+    let raw_text = resp.text.unwrap_or_default();
+    if raw_text.is_empty() {
         return canned_fallback();
     }
-    let summary_msg = ChatMessage::assistant(text.clone());
+    // Same display-safe contract as the max-iteration exit: strip hidden
+    // think content and trailing terminal markers, then withhold text that
+    // looks like an internal tool-protocol envelope. History keeps the raw
+    // provider text; only the display path is normalized.
+    let display_text = strip_trailing_terminal_markers(&strip_think_tags(&raw_text));
+    let protocol_suppressed =
+        super::protocol_detect::detect_internal_protocol_without_tools(&display_text).is_some();
+    if protocol_suppressed {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "model": model,
+                    "trace_id": turn_id,
+                    "error": "malformed internal tool protocol omitted from loop-break summary",
+                })),
+            "loop_break_summary_protocol_suppressed"
+        );
+    }
+    let display_text = if protocol_suppressed {
+        crate::i18n::get_required_cli_string("channel-runtime-malformed-tool-output").to_string()
+    } else {
+        display_text
+    };
+    if display_text.trim().is_empty() {
+        return canned_fallback();
+    }
+    let summary_msg = ChatMessage::assistant(raw_text.clone());
     if let Some(out) = new_messages_out {
         out.push(summary_prompt_mirror);
         out.push(summary_msg.clone());
@@ -423,7 +457,7 @@ pub(crate) async fn finish_after_loop_break(
     if !accumulated_display_text.is_empty() {
         accumulated_display_text.push_str("\n\n");
     }
-    accumulated_display_text.push_str(&text);
+    accumulated_display_text.push_str(&display_text);
     accumulated_display_text.push_str("\n\n");
     accumulated_display_text.push_str(&stop_note);
     Ok(accumulated_display_text)
@@ -1152,6 +1186,123 @@ mod loop_break_wrap_up_tests {
         assert!(
             out.contains("Stopped early by the loop guard"),
             "stop note missing: {out}"
+        );
+    }
+
+    /// Provider stub returning caller-supplied raw summary text, so a test
+    /// can drive the display-hygiene path (think content, protocol
+    /// envelopes, blank text) on the loop-break exit.
+    struct RawTextBreakProvider {
+        text: String,
+    }
+
+    #[async_trait]
+    impl ModelProvider for RawTextBreakProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(self.text.clone())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some(self.text.clone()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl Attributable for RawTextBreakProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "raw-text-break-provider"
+        }
+    }
+
+    async fn run_break_with_text(raw: &str, accumulated: &str) -> anyhow::Result<String> {
+        let provider = RawTextBreakProvider {
+            text: raw.to_string(),
+        };
+        let mut history = vec![ChatMessage::user("log the lead")];
+        run_break(&provider, &mut history, accumulated.to_string()).await
+    }
+
+    // Parity with the max-iteration exit (upstream #10026): hidden think
+    // content in the wrap-up summary must not reach the user.
+    #[tokio::test]
+    async fn break_summary_strips_hidden_think_content() {
+        let out = run_break_with_text(
+            "<think>secret chain of thought</think>here is what got done",
+            "partial work",
+        )
+        .await
+        .expect("loop break must never fail the turn");
+        assert!(
+            !out.contains("secret chain of thought"),
+            "hidden think content must not reach the user: {out}"
+        );
+        assert!(
+            out.contains("here is what got done"),
+            "visible summary text must survive: {out}"
+        );
+        assert!(
+            out.contains("Stopped early by the loop guard"),
+            "stop note missing: {out}"
+        );
+    }
+
+    // Parity with the max-iteration exit: an internal tool-protocol envelope
+    // is suppressed rather than rendered, with the safe notice instead.
+    #[tokio::test]
+    async fn break_summary_suppresses_internal_tool_protocol_envelope() {
+        let out = run_break_with_text(
+            "<tool_call>{\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}</tool_call>",
+            "partial work",
+        )
+        .await
+        .expect("loop break must never fail the turn");
+        assert!(
+            !out.contains("tool_call"),
+            "internal tool-protocol envelope must not be rendered: {out}"
+        );
+        assert!(
+            !out.contains("shell"),
+            "internal tool-protocol payload must not be rendered: {out}"
+        );
+        assert!(
+            out.contains("internal tool-call format error"),
+            "suppressed protocol output must fall back to the safe notice: {out}"
+        );
+        assert!(
+            out.contains("Stopped early by the loop guard"),
+            "stop note missing: {out}"
+        );
+    }
+
+    // A whitespace-only summary carries nothing for the user: fall back to
+    // the canned partial answer instead of appending blank text.
+    #[tokio::test]
+    async fn break_whitespace_only_summary_falls_back_to_canned_partial() {
+        let out = run_break_with_text("   \n  ", "partial work")
+            .await
+            .expect("loop break must never fail the turn");
+        assert!(out.contains("partial work"), "partial work lost: {out}");
+        assert!(
+            out.contains("could not be generated"),
+            "honest fallback note missing: {out}"
         );
     }
 
