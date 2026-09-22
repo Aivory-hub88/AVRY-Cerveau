@@ -1460,6 +1460,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         &message,
                         accumulated_display_text,
                         turn_id,
+                        iteration,
                         knobs,
                         turn_state.canonical.as_deref_mut(),
                     )
@@ -1494,6 +1495,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         &message,
                         accumulated_display_text,
                         turn_id,
+                        iteration,
                         knobs,
                         turn_state.canonical.as_deref_mut(),
                     )

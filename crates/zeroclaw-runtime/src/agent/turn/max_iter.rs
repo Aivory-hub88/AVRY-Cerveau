@@ -4,8 +4,9 @@
 
 use super::knobs::{LoopKnobs, MaxIterationBehavior};
 use super::outcome::ToolLoopCancelled;
+use super::redact::scrub_credentials;
 use anyhow::{Context, Result};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
@@ -250,6 +251,13 @@ pub(crate) async fn finish_after_max_iterations(
 /// the summary is user-facing, so hidden think content and trailing terminal
 /// markers are stripped and an internal tool-protocol envelope is suppressed
 /// rather than rendered (upstream #10026 applied this to the cap path only).
+///
+/// Trace parity matters as much: the wrap-up summary call runs through the
+/// metered provider seam, bypassing the turn loop's `llm_request`/
+/// `llm_response` events, and this exit returns the turn's final text without
+/// a `turn_final_response` event — without both, traces go dark exactly when
+/// the detector fires. All three are emitted here, tagged `"wrap_up":
+/// "loop_break"` so they never masquerade as an ordinary iteration.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finish_after_loop_break(
     model_provider: &dyn ModelProvider,
@@ -262,6 +270,7 @@ pub(crate) async fn finish_after_loop_break(
     break_message: &str,
     mut accumulated_display_text: String,
     turn_id: &str,
+    iteration: usize,
     knobs: &LoopKnobs,
     new_messages_out: Option<&mut Vec<ChatMessage>>,
 ) -> Result<String> {
@@ -312,6 +321,26 @@ pub(crate) async fn finish_after_loop_break(
     history.push(summary_prompt);
 
     let stop_note = format!("Stopped early by the loop guard: {break_message}.");
+
+    // The wrap-up call bypasses the turn loop's provider-call path, so its
+    // `llm_request` would never be recorded. Emit it here in the same shape
+    // (tagged as wrap-up, attributed to the breaking iteration).
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+            .with_category(::zeroclaw_log::EventCategory::Provider)
+            .with_attrs(::serde_json::json!({
+                "model": model,
+                "iteration": iteration,
+                "messages_count": history.len(),
+                "wrap_up": "loop_break",
+                "trace_id": turn_id,
+            })),
+        "llm_request"
+    );
+    let wrap_up_started_at = Instant::now();
+    let wrap_up_elapsed_ms =
+        || u64::try_from(wrap_up_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     enum SummaryCall {
         Cancelled,
@@ -367,7 +396,7 @@ pub(crate) async fn finish_after_loop_break(
 
     // Unlike the cap path, a failed wrap-up must not fail the turn: the
     // user keeps the partial work plus the stop reason.
-    let mut canned_fallback = || {
+    let mut canned_fallback = || -> anyhow::Result<String> {
         history.pop();
         if !accumulated_display_text.is_empty() {
             accumulated_display_text.push_str("\n\n");
@@ -377,6 +406,24 @@ pub(crate) async fn finish_after_loop_break(
             " The closing summary could not be generated, but the work above stands.",
         );
         Ok(accumulated_display_text.clone())
+    };
+    // This exit returns the turn's final text, so it owns the
+    // `turn_final_response` event the normal path emits in the loop.
+    let emit_final = |text: &str| {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "model": model,
+                    "iteration": iteration,
+                    "wrap_up": "loop_break",
+                    "text": scrub_credentials(text),
+                    "trace_id": turn_id,
+                })),
+            "turn_final_response"
+        );
     };
     let resp = match summary_call {
         SummaryCall::Cancelled => return Err(ToolLoopCancelled.into()),
@@ -394,7 +441,24 @@ pub(crate) async fn finish_after_loop_break(
                     })),
                 "loop-break wrap-up timed out; returning partial work"
             );
-            return canned_fallback();
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Provider)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_duration(wrap_up_elapsed_ms())
+                    .with_attrs(::serde_json::json!({
+                        "model": model,
+                        "iteration": iteration,
+                        "wrap_up": "loop_break",
+                        "error": format!("wrap-up timed out after {step_secs}s"),
+                        "trace_id": turn_id,
+                    })),
+                "llm_response"
+            );
+            let out = canned_fallback()?;
+            emit_final(&out);
+            return Ok(out);
         }
         SummaryCall::Done(Err(e)) => {
             ::zeroclaw_log::record!(
@@ -410,14 +474,55 @@ pub(crate) async fn finish_after_loop_break(
                     })),
                 "loop-break wrap-up call failed; returning partial work"
             );
-            return canned_fallback();
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Provider)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_duration(wrap_up_elapsed_ms())
+                    .with_attrs(::serde_json::json!({
+                        "model": model,
+                        "iteration": iteration,
+                        "wrap_up": "loop_break",
+                        "error": scrub_credentials(&e.to_string()),
+                        "trace_id": turn_id,
+                    })),
+                "llm_response"
+            );
+            let out = canned_fallback()?;
+            emit_final(&out);
+            return Ok(out);
         }
         SummaryCall::Done(Ok(resp)) => resp,
     };
 
+    let input_tokens = resp.usage.as_ref().and_then(|usage| usage.input_tokens);
+    let output_tokens = resp.usage.as_ref().and_then(|usage| usage.output_tokens);
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Receive)
+            .with_category(::zeroclaw_log::EventCategory::Provider)
+            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+            .with_duration(wrap_up_elapsed_ms())
+            .with_attrs(::serde_json::json!({
+                "model": model,
+                "iteration": iteration,
+                "wrap_up": "loop_break",
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "raw_response": scrub_credentials(resp.text.as_deref().unwrap_or_default()),
+                "native_tool_calls": resp.tool_calls.len(),
+                "parsed_tool_calls": 0,
+                "trace_id": turn_id,
+            })),
+        "llm_response"
+    );
+
     let raw_text = resp.text.unwrap_or_default();
     if raw_text.is_empty() {
-        return canned_fallback();
+        let out = canned_fallback()?;
+        emit_final(&out);
+        return Ok(out);
     }
     // Same display-safe contract as the max-iteration exit: strip hidden
     // think content and trailing terminal markers, then withhold text that
@@ -446,7 +551,9 @@ pub(crate) async fn finish_after_loop_break(
         display_text
     };
     if display_text.trim().is_empty() {
-        return canned_fallback();
+        let out = canned_fallback()?;
+        emit_final(&out);
+        return Ok(out);
     }
     let summary_msg = ChatMessage::assistant(raw_text.clone());
     if let Some(out) = new_messages_out {
@@ -460,6 +567,7 @@ pub(crate) async fn finish_after_loop_break(
     accumulated_display_text.push_str(&display_text);
     accumulated_display_text.push_str("\n\n");
     accumulated_display_text.push_str(&stop_note);
+    emit_final(&accumulated_display_text);
     Ok(accumulated_display_text)
 }
 
@@ -1111,6 +1219,7 @@ mod loop_break_wrap_up_tests {
             "tool 'create_lead' has succeeded 9 times this turn",
             accumulated,
             "trace-break-test",
+            10,
             &LoopKnobs::default(),
             None,
         )
@@ -1177,6 +1286,7 @@ mod loop_break_wrap_up_tests {
             "tool 'x' broke the loop",
             "partial work".to_string(),
             "trace-break-timeout",
+            10,
             &LoopKnobs::default(),
             None,
         )
@@ -1303,6 +1413,102 @@ mod loop_break_wrap_up_tests {
         assert!(
             out.contains("could not be generated"),
             "honest fallback note missing: {out}"
+        );
+    }
+
+    // The wrap-up must leave the same trace footprint as an ordinary
+    // iteration: llm_request + llm_response for the summary call and a
+    // turn_final_response for the turn's final text — tagged as wrap-up so
+    // they never masquerade as a loop iteration. (Without these, traces go
+    // dark exactly when the detector fires.)
+    #[tokio::test]
+    async fn break_wrap_up_leaves_request_response_final_trace() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut log_rx = zeroclaw_log::subscribe_or_install();
+        while log_rx.try_recv().is_ok() {}
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = HappyProvider {
+            calls: Arc::clone(&calls),
+        };
+        let mut history = vec![ChatMessage::user("log the lead")];
+        finish_after_loop_break(
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            None,
+            &PacingConfig::default(),
+            None,
+            "tool 'x' broke the loop",
+            "partial work".to_string(),
+            "trace-break-wrap-up-events",
+            10,
+            &LoopKnobs::default(),
+            None,
+        )
+        .await
+        .expect("loop break must never fail the turn");
+
+        let mut seen = std::collections::HashSet::new();
+        let mut final_text = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while seen.len() < 3 && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, log_rx.recv()).await {
+                Ok(Ok(value)) => {
+                    let is_ours = value.get("trace_id").and_then(|v| v.as_str())
+                        == Some("trace-break-wrap-up-events");
+                    let msg = value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    // Only the three wrap-up footprint events carry the tag;
+                    // older records on the same trace (e.g. the breaker note)
+                    // predate it and are ignored here.
+                    if !is_ours
+                        || !matches!(msg, "llm_request" | "llm_response" | "turn_final_response")
+                    {
+                        continue;
+                    }
+                    let is_wrap_up = value
+                        .get("attributes")
+                        .and_then(|a| a.get("wrap_up"))
+                        .and_then(|v| v.as_str())
+                        == Some("loop_break");
+                    assert!(
+                        is_wrap_up,
+                        "wrap-up trace record must carry wrap_up=loop_break: {value}"
+                    );
+                    if msg == "turn_final_response" {
+                        final_text = value
+                            .get("attributes")
+                            .and_then(|a| a.get("text"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                    }
+                    seen.insert(msg.to_string());
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        zeroclaw_log::clear_broadcast_hook();
+
+        for expected in ["llm_request", "llm_response", "turn_final_response"] {
+            assert!(
+                seen.contains(expected),
+                "wrap-up must emit {expected}; saw: {seen:?}"
+            );
+        }
+        assert!(
+            final_text.contains("Stopped early by the loop guard"),
+            "turn_final_response must carry the stop note: {final_text}"
         );
     }
 
