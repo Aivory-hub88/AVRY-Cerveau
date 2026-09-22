@@ -126,6 +126,7 @@ mod real {
             agent: &str,
             prompt: &str,
             adopt: Option<&str>,
+            context_id: Option<&str>,
         ) -> LedgerStart {
             if let Some(task_id) = adopt {
                 return match self
@@ -135,7 +136,7 @@ mod real {
                         task_id,
                         delegation_id,
                         &self.delegated_by,
-                        None,
+                        context_id,
                     )
                     .await
                 {
@@ -159,7 +160,7 @@ mod real {
                     title: &title,
                     delegated_by: &self.delegated_by,
                     delegation_id,
-                    context_id: None,
+                    context_id,
                     status: LedgerStatus::InProgress,
                     outcome: None,
                     blocked_reason: None,
@@ -201,6 +202,7 @@ mod real {
             prompt: &str,
             reason: DelegateReason,
             error: &str,
+            context_id: Option<&str>,
         ) -> Option<String> {
             let outcome = match reason {
                 DelegateReason::TimedOut => TaskOutcome::TimedOut,
@@ -218,7 +220,7 @@ mod real {
                     title: &title,
                     delegated_by: &self.delegated_by,
                     delegation_id,
-                    context_id: None,
+                    context_id,
                     status: LedgerStatus::Blocked,
                     outcome: Some(outcome),
                     blocked_reason: Some(&blocked),
@@ -547,6 +549,7 @@ mod real {
                 Some("Waiting on approval pa_9 for tool send_email"),
                 Some(BackgroundResultMeta {
                     reason: Some("approval_pending".into()),
+                    context_id: None,
                     approval_id: Some("pa_9".into()),
                     approval_tool: Some("send_email".into()),
                 }),
@@ -670,6 +673,7 @@ mod stub {
             _agent: &str,
             _prompt: &str,
             _adopt: Option<&str>,
+            _context_id: Option<&str>,
         ) -> LedgerStart {
             LedgerStart::Unlinked
         }
@@ -681,6 +685,7 @@ mod stub {
             _prompt: &str,
             _reason: DelegateReason,
             _error: &str,
+            _context_id: Option<&str>,
         ) -> Option<String> {
             None
         }

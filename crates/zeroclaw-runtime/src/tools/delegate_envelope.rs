@@ -78,6 +78,9 @@ pub(crate) enum DelegateReason {
     NotReachable,
     CapacityExceeded,
     InvalidRequest,
+    /// ADR-014 P1: the context already holds `cap` delegations. Refused
+    /// before any work starts, so no ledger row is created for it.
+    ContextTurnCap,
     Cancelled,
 }
 
@@ -95,6 +98,7 @@ impl DelegateReason {
             Self::NotReachable => "not_reachable",
             Self::CapacityExceeded => "capacity_exceeded",
             Self::InvalidRequest => "invalid_request",
+            Self::ContextTurnCap => "context_turn_cap",
             Self::Cancelled => "cancelled",
         }
     }
@@ -112,6 +116,7 @@ impl DelegateReason {
             "not_reachable" => Self::NotReachable,
             "capacity_exceeded" => Self::CapacityExceeded,
             "invalid_request" => Self::InvalidRequest,
+            "context_turn_cap" => Self::ContextTurnCap,
             "cancelled" => Self::Cancelled,
             _ => return None,
         })
@@ -128,6 +133,7 @@ impl DelegateReason {
             | Self::UnknownAgent
             | Self::NotReachable
             | Self::CapacityExceeded
+            | Self::ContextTurnCap
             | Self::InvalidRequest => DelegateState::Rejected,
             Self::Cancelled => DelegateState::Canceled,
         }
@@ -152,6 +158,9 @@ impl DelegateReason {
             Self::Lost => Some("may have partially run; reads are safe to retry"),
             Self::DepthExceeded => Some("answer with what you have; do not delegate further"),
             Self::UnknownAgent => Some("use an agent from the Available list"),
+            Self::ContextTurnCap => {
+                Some("stop and answer the user with what you have")
+            }
             Self::CapacityExceeded => {
                 Some("wait for running background tasks (check_result) or cancel one")
             }
@@ -198,6 +207,11 @@ pub(crate) struct EnvelopeTiming {
 pub(crate) struct DelegateEnvelope {
     pub v: u32,
     pub task_id: String,
+    /// ADR-014 P1: the follow-up context this delegation belongs to. Minted
+    /// per call when the caller passes none; a follow-up passes it back to
+    /// continue the context (carry-forward + turn cap).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_id: Option<String>,
     pub agent: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
@@ -236,6 +250,7 @@ impl DelegateEnvelope {
         Self {
             v: ENVELOPE_VERSION,
             task_id: task_id.into(),
+            context_id: None,
             agent: agent.into(),
             mode: None,
             execution,
@@ -271,6 +286,11 @@ impl DelegateEnvelope {
 
     pub(crate) fn with_ledger_task(mut self, ledger_task_id: &str) -> Self {
         self.ledger_task_id = Some(ledger_task_id.to_string());
+        self
+    }
+
+    pub(crate) fn with_context_id(mut self, context_id: &str) -> Self {
+        self.context_id = Some(context_id.to_string());
         self
     }
 
@@ -330,7 +350,7 @@ impl DelegateEnvelope {
         self
     }
 
-    /// `state=… [task=…] [reason=…] [approval=… tool=…]`.
+    /// `state=… [task=…] [context=…] [reason=…] [approval=… tool=…]`.
     ///
     /// `task=` appears only for background delegations, where the id is
     /// something the caller can act on (`check_result`, `cancel_task`). For a
@@ -338,10 +358,18 @@ impl DelegateEnvelope {
     /// which changes the text's hash each time and blinds the tool-loop
     /// detector's exact-repeat / no-progress checks. The id stays in the
     /// structured data either way.
+    ///
+    /// `context=` follows the same rule for the same reason: an
+    /// engine-minted id is fresh per call, so it renders only for background
+    /// delegations. A caller-supplied id is stable across retries, but the
+    /// text shape stays uniform so the detector contract has one rule.
     pub(crate) fn status_line(&self) -> String {
         let mut line = format!("state={}", self.state.as_str());
         if self.execution == DelegateExecution::Background {
             line.push_str(&format!(" task={}", self.task_id));
+            if let Some(context_id) = &self.context_id {
+                line.push_str(&format!(" context={context_id}"));
+            }
         }
         if let Some(reason) = self.reason {
             line.push_str(&format!(" reason={}", reason.as_str()));
@@ -564,6 +592,46 @@ pub(crate) fn note_started(task_id: &str) {
     let _ = RUN_FACTS.try_with(|cell| cell.lock().task_id = Some(task_id.to_string()));
 }
 
+/// ADR-014 P1 context identity: `ctx_` + 12 hex chars. Minted per delegate
+/// call when the caller passes none; a follow-up passes the id back.
+pub(crate) fn mint_context_id() -> String {
+    let hex: String = uuid::Uuid::new_v4().simple().to_string();
+    format!("ctx_{}", &hex[..12])
+}
+
+/// Caller-supplied ids must be short, inert text: letters, digits, `_`, `-`
+/// (the shape we mint). Anything else is a programming error by the model
+/// and refuses up front rather than keying ledger rows off it.
+pub(crate) fn validate_context_id(raw: &str) -> Option<String> {
+    let id = raw.trim();
+    if id.is_empty() || id.len() > 64 {
+        return None;
+    }
+    if id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        Some(id.to_string())
+    } else {
+        None
+    }
+}
+
+/// Resolve the call's context from the tool args: validate a supplied id,
+/// mint when absent or blank. `Err` is model-facing (InvalidRequest refusal).
+/// Resolving is deterministic per args: parallel legs and the background
+/// sub-turn carry the id in their args (spawn drops task-locals) and every
+/// hop resolves the same value without coordination.
+pub(crate) fn resolve_context_id(args: &serde_json::Value) -> Result<String, String> {
+    match args.get("context_id").and_then(|v| v.as_str()) {
+        None => Ok(mint_context_id()),
+        Some(raw) if raw.trim().is_empty() => Ok(mint_context_id()),
+        Some(raw) => validate_context_id(raw).ok_or_else(|| {
+            "context_id must be 1-64 chars of letters, digits, '_' or '-'. Omit it and the engine mints one.".to_string()
+        }),
+    }
+}
+
 /// Run `fut` with a fresh facts cell and return its output together with what
 /// was recorded. Cells are per-call, so a sub-agent that itself delegates
 /// cannot leak facts into its caller.
@@ -609,7 +677,7 @@ pub(crate) fn reason_of(error: &anyhow::Error) -> DelegateReason {
 mod tests {
     use super::*;
 
-    const ALL: [DelegateReason; 12] = [
+    const ALL: [DelegateReason; 13] = [
         DelegateReason::ApprovalPending,
         DelegateReason::TimedOut,
         DelegateReason::ProviderError,
@@ -621,6 +689,7 @@ mod tests {
         DelegateReason::NotReachable,
         DelegateReason::CapacityExceeded,
         DelegateReason::InvalidRequest,
+        DelegateReason::ContextTurnCap,
         DelegateReason::Cancelled,
     ];
 
@@ -675,8 +744,78 @@ mod tests {
         assert!(!DelegateReason::ToolError.retryable());
         assert!(!DelegateReason::TimedOut.retryable());
         assert!(!DelegateReason::PolicyForbidden.retryable());
+        assert!(!DelegateReason::ContextTurnCap.retryable());
         assert!(DelegateReason::ProviderError.retryable());
         assert!(DelegateReason::Lost.retryable());
+    }
+
+    #[test]
+    fn context_turn_cap_is_a_rejected_stop_with_a_stop_hint() {
+        let reason = DelegateReason::ContextTurnCap;
+        assert_eq!(reason.state(), DelegateState::Rejected);
+        assert!(!reason.retryable());
+        assert_eq!(
+            reason.hint(),
+            Some("stop and answer the user with what you have")
+        );
+    }
+
+    #[test]
+    fn context_ids_validate_mint_and_resolve_deterministically() {
+        assert_eq!(validate_context_id("ctx_abc123"), Some("ctx_abc123".into()));
+        assert_eq!(validate_context_id("  ctx-x_9  "), Some("ctx-x_9".into()));
+        assert_eq!(validate_context_id(""), None);
+        assert_eq!(validate_context_id("   "), None);
+        assert_eq!(validate_context_id("ctx with spaces"), None);
+        assert_eq!(validate_context_id("ctx;drop"), None);
+        assert_eq!(validate_context_id(&"x".repeat(65)), None);
+        assert_eq!(validate_context_id(&"x".repeat(64)).unwrap().len(), 64);
+
+        let minted = mint_context_id();
+        assert!(minted.starts_with("ctx_"));
+        assert_eq!(validate_context_id(&minted), Some(minted.clone()));
+        assert_ne!(mint_context_id(), minted, "mints must be unique");
+
+        let args = serde_json::json!({"context_id": "ctx_keep"});
+        assert_eq!(
+            resolve_context_id(&args).unwrap(),
+            "ctx_keep",
+            "same args resolve the same id on every hop"
+        );
+        assert_eq!(
+            resolve_context_id(&args).unwrap(),
+            resolve_context_id(&args).unwrap()
+        );
+        assert!(resolve_context_id(&serde_json::json!({})).is_ok());
+        assert!(resolve_context_id(&serde_json::json!({"context_id": "  "})).is_ok());
+        assert!(resolve_context_id(&serde_json::json!({"context_id": "no spaces"})).is_err());
+    }
+
+    #[test]
+    fn context_renders_for_background_only_so_sync_text_stays_stable() {
+        let bg = DelegateEnvelope::new(
+            "t-1",
+            "lex",
+            DelegateExecution::Background,
+            DelegateState::Working,
+        )
+        .with_context_id("ctx_abc");
+        assert!(bg.status_line().contains("context=ctx_abc"));
+        assert!(bg.data()["context_id"] == "ctx_abc");
+
+        let sync = DelegateEnvelope::new(
+            "t-2",
+            "lex",
+            DelegateExecution::Sync,
+            DelegateState::Completed,
+        )
+        .with_context_id("ctx_abc");
+        assert!(
+            !sync.status_line().contains("ctx_abc"),
+            "sync text must not carry a per-call id: {}",
+            sync.status_line()
+        );
+        assert!(sync.data()["context_id"] == "ctx_abc");
     }
 
     #[test]

@@ -89,6 +89,10 @@ pub struct BackgroundResultMeta {
     /// `snake_case` [`DelegateReason`], when the cause is known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// ADR-014 P1: the follow-up context, so `check_result` renders the same
+    /// envelope (including `context=`) the accept path returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1315,6 +1319,14 @@ impl Tool for DelegateTool {
                                     already created with task_create: it then tracks this \
                                     delegation instead of a second row being added."
                 },
+                "context_id": {
+                    "type": "string",
+                    "description": "Optional follow-up context id (`ctx_…`, 1-64 chars of \
+                                    letters, digits, '_' or '-'). Pass back the id from a \
+                                    prior envelope to continue that context: the sub-agent \
+                                    sees the previous findings and the context counts \
+                                    towards its turn cap. Omitted or blank mints a fresh one."
+                },
                 "background": {
                     "type": "boolean",
                     "description": "When true, the sub-agent runs in a background tokio task and \
@@ -1376,9 +1388,29 @@ impl Tool for DelegateTool {
             DelegateAction::Delegate => {}
         }
 
+        // ADR-014 P1: one context per delegate call. Resolved once here
+        // and threaded explicitly (never ambient): task-locals do not cross
+        // the background/parallel spawn boundary, and a nested sync
+        // delegation would otherwise overwrite its caller's noted id.
+        // Absent or blank mints a fresh id; a malformed id refuses up front.
+        let call_context = match envelope::resolve_context_id(&args) {
+            Ok(id) => id,
+            Err(message) => {
+                return Ok(Self::refusal(
+                    "(none)",
+                    DelegateExecution::Sync,
+                    DelegateReason::InvalidRequest,
+                    &message,
+                    None,
+                ));
+            }
+        };
+
         // --- Parallel mode ---
         if let Some(parallel_agents) = args.get("parallel").and_then(|v| v.as_array()) {
-            return self.execute_parallel(parallel_agents, &args).await;
+            return self
+                .execute_parallel(parallel_agents, &args, &call_context)
+                .await;
         }
 
         // --- Single-agent delegation (synchronous or background) ---
@@ -1404,6 +1436,7 @@ impl Tool for DelegateTool {
                 DelegateExecution::Sync,
                 DelegateReason::InvalidRequest,
                 "'agent' parameter must not be empty",
+                Some(&call_context),
             ));
         }
 
@@ -1429,6 +1462,7 @@ impl Tool for DelegateTool {
                 DelegateExecution::Sync,
                 DelegateReason::InvalidRequest,
                 "'prompt' parameter must not be empty",
+                Some(&call_context),
             ));
         }
 
@@ -1442,29 +1476,34 @@ impl Tool for DelegateTool {
         } else {
             DelegateExecution::Sync
         };
-        self.run_enveloped(agent_name, prompt, &args, execution)
+        self.run_enveloped(agent_name, prompt, &args, execution, &call_context)
             .await
     }
 }
 
 impl DelegateTool {
     /// A refusal that never reached the delegation engine (bad arguments),
-    /// already shaped as an envelope.
+    /// already shaped as an envelope. `context` is the call's resolved id
+    /// (None only when the id itself was what failed validation).
     fn refusal(
         agent: &str,
         execution: DelegateExecution,
         reason: DelegateReason,
         message: &str,
+        context: Option<&str>,
     ) -> ToolResult {
-        DelegateEnvelope::new(
+        let mut envelope = DelegateEnvelope::new(
             uuid::Uuid::new_v4().to_string(),
             agent,
             execution,
             reason.state(),
         )
         .with_reason(reason)
-        .with_error(message)
-        .into_tool_result(&format!("[Agent '{agent}']"), Some(message))
+        .with_error(message);
+        if let Some(context_id) = context {
+            envelope = envelope.with_context_id(context_id);
+        }
+        envelope.into_tool_result(&format!("[Agent '{agent}']"), Some(message))
     }
 
     fn mode_label(&self, target: &str) -> Option<&'static str> {
@@ -1487,6 +1526,7 @@ impl DelegateTool {
         prompt: &str,
         args: &serde_json::Value,
         execution: DelegateExecution,
+        context_id: &str,
     ) -> anyhow::Result<ToolResult> {
         let started_at = chrono::Utc::now().to_rfc3339();
         // `capture` holds the future twice (argument + the scoped copy), so hand it
@@ -1494,14 +1534,21 @@ impl DelegateTool {
         let run = Box::pin(async {
             match execution {
                 DelegateExecution::Background => {
-                    self.execute_background(agent_name, prompt, args).await
+                    self.execute_background(agent_name, prompt, args, context_id)
+                        .await
                 }
                 _ => self.execute_sync(agent_name, prompt, args).await,
             }
         });
         let (result, facts) = envelope::capture(run).await;
-        let (tool_result, envelope) =
-            self.envelope_result(result?, facts, agent_name, execution, &started_at);
+        let (tool_result, envelope) = self.envelope_result(
+            result?,
+            facts,
+            agent_name,
+            execution,
+            &started_at,
+            context_id,
+        );
         if execution == DelegateExecution::Sync {
             Self::record_failed_hop(&envelope, prompt).await;
         }
@@ -1518,6 +1565,7 @@ impl DelegateTool {
         agent: &str,
         execution: DelegateExecution,
         started_at: &str,
+        context_id: &str,
     ) -> (ToolResult, DelegateEnvelope) {
         let finished_at = chrono::Utc::now().to_rfc3339();
         let task_id = facts
@@ -1536,6 +1584,7 @@ impl DelegateTool {
             let envelope = DelegateEnvelope::new(task_id, agent, execution, reason.state())
                 .with_reason(reason)
                 .with_mode(mode)
+                .with_context_id(context_id)
                 .with_error(&original)
                 .with_timing(Some(started_at), Some(&finished_at));
             let tool_result = envelope.clone().into_tool_result(&header, Some(&original));
@@ -1549,6 +1598,7 @@ impl DelegateTool {
             let mut envelope =
                 DelegateEnvelope::new(task_id, agent, execution, DelegateState::Working)
                     .with_mode(mode)
+                    .with_context_id(context_id)
                     .with_timing(Some(started_at), None);
             if let Some(ledger_task_id) = facts.ledger_task_id.as_deref() {
                 envelope = envelope.with_ledger_task(ledger_task_id);
@@ -1567,6 +1617,7 @@ impl DelegateTool {
             .unwrap_or_else(|| result.output.to_string());
         let envelope = DelegateEnvelope::new(task_id, agent, execution, DelegateState::Completed)
             .with_mode(mode)
+            .with_context_id(context_id)
             .with_summary(&raw, DEFAULT_MAX_SUMMARY_BYTES)
             .with_timing(Some(started_at), Some(&finished_at));
         let tool_result = envelope.clone().into_tool_result(&header, None);
@@ -1590,6 +1641,7 @@ impl DelegateTool {
             prompt,
             envelope.reason.unwrap_or(DelegateReason::ToolError),
             envelope.error.as_deref().unwrap_or(""),
+            envelope.context_id.as_deref(),
         )
         .await;
     }
@@ -1928,6 +1980,7 @@ impl DelegateTool {
         agent_name: &str,
         prompt: &str,
         args: &serde_json::Value,
+        context_id: &str,
     ) -> anyhow::Result<ToolResult> {
         // Validate agent exists and check depth/security before spawning
         let agent_config = match self.agents.get(agent_name) {
@@ -2012,7 +2065,7 @@ impl DelegateTool {
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
             match link
-                .start_background(&task_id, agent_name, prompt, adopt)
+                .start_background(&task_id, agent_name, prompt, adopt, Some(context_id))
                 .await
             {
                 LedgerStart::Linked { ledger_task_id } => {
@@ -2046,7 +2099,10 @@ impl DelegateTool {
             error: None,
             started_at: started_at.clone(),
             finished_at: None,
-            meta: None,
+            meta: Some(BackgroundResultMeta {
+                context_id: Some(context_id.to_string()),
+                ..BackgroundResultMeta::default()
+            }),
         };
         let result_path = results_dir.join(format!("{task_id}.json"));
         if let Err(e) = Self::write_result_atomic(&result_path, &initial_result).await {
@@ -2142,6 +2198,8 @@ impl DelegateTool {
         // Host-brain targets keep the parent overlay unchanged.
         let ambient = DelegateAmbient::capture(&agent_name_owned);
         let watch_link = closure_link.clone();
+        // Owned: the spawned task cannot see the caller's noted context.
+        let context_owned = context_id.to_string();
 
         zeroclaw_spawn::spawn!(
             scope_delegate_session_key(parent_session_key, async move {
@@ -2172,6 +2230,9 @@ impl DelegateTool {
                 let args_inner = json!({
                     "agent": agent_name_owned,
                     "prompt": full_prompt,
+                    // The spawn drops task-locals: the sub-turn resolves the
+                    // same context from its args instead of inheriting it.
+                    "context_id": context_owned,
                 });
 
                 // ADR-008 Phase 3b: give this turn somewhere to record a
@@ -2259,11 +2320,19 @@ impl DelegateTool {
                                 )),
                                 Some(BackgroundResultMeta {
                                     reason: Some(DelegateReason::ApprovalPending.as_str().into()),
+                                    context_id: Some(context_owned.clone()),
                                     approval_id: Some(summary.id.clone()),
                                     approval_tool: Some(summary.tool_name.clone()),
                                 }),
                             ),
-                            None => (BackgroundTaskStatus::Completed, None, None),
+                            None => (
+                                BackgroundTaskStatus::Completed,
+                                None,
+                                Some(BackgroundResultMeta {
+                                    context_id: Some(context_owned.clone()),
+                                    ..BackgroundResultMeta::default()
+                                }),
+                            ),
                         };
                         BackgroundDelegateResult {
                             task_id: task_id_clone.clone(),
@@ -2290,8 +2359,12 @@ impl DelegateTool {
                             error: Some(err),
                             started_at,
                             finished_at: Some(finished_at),
-                            meta: failure_reason.map(|reason| BackgroundResultMeta {
-                                reason: Some(reason.as_str().into()),
+                            // Always present on failure: the context must
+                            // survive even when no failure cause was recorded.
+                            meta: Some(BackgroundResultMeta {
+                                reason: failure_reason
+                                    .map(|reason| reason.as_str().into()),
+                                context_id: Some(context_owned.clone()),
                                 ..BackgroundResultMeta::default()
                             }),
                         }
@@ -2370,6 +2443,7 @@ impl DelegateTool {
         &self,
         parallel_agents: &[serde_json::Value],
         args: &serde_json::Value,
+        context_id: &str,
     ) -> anyhow::Result<ToolResult> {
         let prompt = args
             .get("prompt")
@@ -2393,6 +2467,7 @@ impl DelegateTool {
                 DelegateExecution::Parallel,
                 DelegateReason::InvalidRequest,
                 "'prompt' parameter must not be empty",
+                Some(context_id),
             ));
         }
 
@@ -2408,6 +2483,7 @@ impl DelegateTool {
                 DelegateExecution::Parallel,
                 DelegateReason::InvalidRequest,
                 "'parallel' array must contain at least one agent name",
+                Some(context_id),
             ));
         }
 
@@ -2428,6 +2504,7 @@ impl DelegateTool {
                             available.join(", ")
                         }
                     ),
+                    Some(context_id),
                 ));
             }
         }
@@ -2443,6 +2520,7 @@ impl DelegateTool {
                     DelegateExecution::Parallel,
                     envelope::reason_of(&e),
                     &format!("{e:#}"),
+                    Some(context_id),
                 ));
             }
             if let Some(refusal) = self.independent_always_ask_refusal(name) {
@@ -2557,12 +2635,16 @@ impl DelegateTool {
                         output: ToolOutput::default(),
                         error: Some(e.to_string()),
                     });
+                    // The fan-out shares the call's resolved context: legs
+                    // cannot inherit it (spawn drops task-locals), so the
+                    // join loop attaches it explicitly to every leg envelope.
                     let (tool_result, leg) = self.envelope_result(
                         tool_result,
                         facts,
                         &agent_name,
                         DelegateExecution::Parallel,
                         &parallel_started_at,
+                        context_id,
                     );
                     Self::record_failed_hop(&leg, prompt).await;
                     if !tool_result.success {
@@ -2697,13 +2779,23 @@ impl DelegateTool {
         reconciled: Option<DelegateReason>,
     ) -> DelegateEnvelope {
         let base = |state| {
-            DelegateEnvelope::new(
+            let mut env = DelegateEnvelope::new(
                 result.task_id.clone(),
                 result.agent.clone(),
                 DelegateExecution::Background,
                 state,
             )
-            .with_timing(Some(&result.started_at), result.finished_at.as_deref())
+            .with_timing(Some(&result.started_at), result.finished_at.as_deref());
+            // ADR-014 P1: the file carries the context in `meta` (written at
+            // accept/settle), so `check_result` renders the same envelope.
+            if let Some(context_id) = result
+                .meta
+                .as_ref()
+                .and_then(|m| m.context_id.as_deref())
+            {
+                env = env.with_context_id(context_id);
+            }
+            env
         };
         let stored_reason = result
             .meta
@@ -5267,6 +5359,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_context_id_refuses_before_any_work() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let result = tool
+            .execute(json!({"agent": "researcher", "prompt": "x", "context_id": "no spaces"}))
+            .await
+            .unwrap();
+        assert_failure_envelope(
+            &result,
+            "context_id must be 1-64 chars",
+            "rejected",
+            "invalid_request",
+            false,
+        );
+    }
+
+    #[tokio::test]
+    async fn refusal_carries_the_call_context() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let result = tool
+            .execute(json!({"agent": "researcher", "prompt": "   ", "context_id": "ctx_keep"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let data = result.output.data().expect("structured envelope");
+        assert_eq!(data["reason"], "invalid_request");
+        assert_eq!(data["context_id"], "ctx_keep");
+    }
+
+    #[tokio::test]
     async fn background_start_failure_is_rejected_with_a_reason() {
         let tool = DelegateTool::new(sample_agents(), None, test_security());
         let result = tool
@@ -5328,6 +5449,7 @@ mod tests {
     fn schema_advertises_expected_output_and_stays_closed() {
         let schema = DelegateTool::new(sample_agents(), None, test_security()).parameters_schema();
         assert_eq!(schema["properties"]["expected_output"]["type"], "string");
+        assert_eq!(schema["properties"]["context_id"]["type"], "string");
         assert_eq!(schema["additionalProperties"], false);
     }
 
@@ -5395,6 +5517,23 @@ mod tests {
     }
 
     #[test]
+    fn stored_file_context_reaches_the_envelope_and_background_text() {
+        let mut stored = background_result("t", BackgroundTaskStatus::Running, None, None);
+        stored.meta = Some(BackgroundResultMeta {
+            context_id: Some("ctx_file".into()),
+            ..BackgroundResultMeta::default()
+        });
+        let env = file_envelope(&stored);
+        assert_eq!(env["context_id"], "ctx_file");
+        let text = DelegateTool::envelope_from_file(&stored, None)
+            .render_text("[Agent 'lex' (p/m)]");
+        assert!(
+            text.contains("context=ctx_file"),
+            "background text carries the context: {text}"
+        );
+    }
+
+    #[test]
     fn stored_completed_task_strips_the_label_and_redacts_credentials() {
         let output = "[Agent 'researcher' (p/m)]\nlead 3f2a9c1e-8b7d-4e0a-9c11-5d6f7a8b9c0d ok; key sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH";
         let env = file_envelope(&background_result(
@@ -5453,6 +5592,7 @@ mod tests {
         );
         parked.meta = Some(BackgroundResultMeta {
             reason: Some("approval_pending".into()),
+            context_id: None,
             approval_id: Some("pa_9".into()),
             approval_tool: Some("send_email".into()),
         });
@@ -12709,8 +12849,14 @@ command = "rm independent-delegate-marker"
                     &format!("g-stop-{run}"),
                 ] {
                     assert!(matches!(
-                        link.start_background(id, "leads_qualifier", "qualify the leads", None)
-                            .await,
+                        link.start_background(
+                            id,
+                            "leads_qualifier",
+                            "qualify the leads",
+                            None,
+                            Some("ctx_p1test")
+                        )
+                        .await,
                         LedgerStart::Linked { .. }
                     ));
                 }
@@ -12767,6 +12913,7 @@ command = "rm independent-delegate-marker"
                     "qualify the leads",
                     DelegateReason::TimedOut,
                     "Agent 'leads_qualifier' timed out after 300s",
+                    Some("ctx_p1test"),
                 )
                 .await
                 .expect("failed hop recorded");
