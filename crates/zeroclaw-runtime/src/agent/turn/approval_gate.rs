@@ -18,7 +18,82 @@ pub(crate) enum ApprovalGateOutcome {
 /// section): resolve the tool's approval requirement, prompt interactively on
 /// CLI or via the channel's inline approval on non-interactive channels
 /// (falling back to auto-deny), and record the decision.
+///
+/// Shadow wrapper (ADR-017, P2 exit gate): after the real decision is made,
+/// a `judge_shadow` trace event is emitted for non-`Safe` tools carrying the
+/// full judge request plus the gate's actual decision. Log-only — the outcome
+/// returned here is exactly the inner one, so shadow can never change a turn.
 pub(crate) async fn gate_tool_approval(
+    ctx: &TurnCtx<'_>,
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+    iteration: usize,
+) -> ApprovalGateOutcome {
+    let outcome = gate_tool_approval_inner(ctx, tool_name, tool_args, iteration).await;
+    observe_gate(ctx, tool_name, tool_args, &outcome);
+    outcome
+}
+
+fn observe_gate(
+    ctx: &TurnCtx<'_>,
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+    outcome: &ApprovalGateOutcome,
+) {
+    let Some(mgr) = ctx.approval else { return };
+    let tier = mgr.risk_tier(tool_name);
+    if !super::judge_shadow::should_shadow(&tier) {
+        return;
+    }
+    let tier_label = match tier {
+        zeroclaw_config::schema::ToolRiskTier::Safe => "safe",
+        zeroclaw_config::schema::ToolRiskTier::Reversible => "reversible",
+        zeroclaw_config::schema::ToolRiskTier::Irreversible => "irreversible",
+    };
+    let requirement = mgr.approval_requirement(tool_name);
+    let requirement_label = match requirement {
+        ApprovalRequirement::Prompt => "Prompt",
+        ApprovalRequirement::Approved => "Approved",
+        ApprovalRequirement::NotRequired => "NotRequired",
+        ApprovalRequirement::Pending => "Pending",
+    };
+    let (gate_action, pending_id) = match outcome {
+        ApprovalGateOutcome::Proceed { approved } => (
+            if *approved { "proceed (approved)" } else { "proceed (unapproved)" },
+            None,
+        ),
+        ApprovalGateOutcome::Deny(o) => (
+            if pending_id_of(o).is_some() { "deny (pending)" } else { "deny" },
+            pending_id_of(o),
+        ),
+        ApprovalGateOutcome::Replace(_) => ("replace", None),
+    };
+    let origin_message = crate::agent::tenant::current_turn_origin()
+        .as_ref()
+        .map(|o| o.origin_message.clone());
+    super::judge_shadow::emit(&super::judge_shadow::ShadowObservation {
+        trace_id: ctx.turn_id,
+        tool: tool_name,
+        tier: tier_label,
+        requirement: requirement_label,
+        gate_action,
+        pending_id,
+        args_scrubbed: super::judge_shadow::scrub_args_summary(tool_args),
+        origin_message,
+    });
+}
+
+/// Pending rows join the resolve path on this id — carry it on the shadow
+/// event so replay can correlate judge decisions with human resolutions.
+fn pending_id_of(outcome: &ToolExecutionOutcome) -> Option<&str> {
+    outcome
+        .output_data
+        .as_ref()
+        .and_then(|v| v.get("pending_id"))
+        .and_then(|v| v.as_str())
+}
+
+async fn gate_tool_approval_inner(
     ctx: &TurnCtx<'_>,
     tool_name: &str,
     tool_args: &serde_json::Value,
