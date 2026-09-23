@@ -86,8 +86,12 @@ pub(crate) fn build_event(obs: &ShadowObservation) -> serde_json::Value {
                 "args_summary": args,
                 "origin_message": origin,
             },
+            // Policy hints are advisory only: replay owns the real policy
+            // (`evals/typesafe-jev/replay.py`). Note `escalate_on` is empty
+            // on purpose — high `explicit_instruction` means the user DID
+            // authorize the call, so escalating on it would be backwards.
             "questions": shadow_questions(),
-            "escalate_on": ["explicit_instruction"],
+            "escalate_on": [],
             "escalate_score_at": 3,
             "confirm_score_at": 2,
             "observe_only": [],
