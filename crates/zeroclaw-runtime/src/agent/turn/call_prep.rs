@@ -304,20 +304,45 @@ pub(crate) async fn prepare_tool_calls(
         // once-per-turn "successful" loop the in-turn detector can never
         // see. Runs before the approval gate; denied/prompted/pending
         // calls are untouched and unconsumed.
-        if let Some(parked) = super::velocity_gate::check_velocity_park(
-            ctx,
-            &tool_name,
-            &tool_args,
-            iteration,
-        ) {
-            if let super::approval_gate::ApprovalGateOutcome::Deny(outcome) = parked {
+        if let Some(super::approval_gate::ApprovalGateOutcome::Deny(outcome)) =
+            super::velocity_gate::check_velocity_park(ctx, &tool_name, &tool_args, iteration)
+        {
+                // Same shadow contract as the approval gate (ADR-017): log
+                // the parked decision with its judge request; never alters it.
+                // Borrow-only: `outcome` still moves into ordered_results below.
+                if let Some(mgr) = ctx.approval {
+                    let tier = mgr.risk_tier(&tool_name);
+                    if super::judge_shadow::should_shadow(&tier) {
+                        let tier_label = match tier {
+                            zeroclaw_config::schema::ToolRiskTier::Safe => "safe",
+                            zeroclaw_config::schema::ToolRiskTier::Reversible => "reversible",
+                            zeroclaw_config::schema::ToolRiskTier::Irreversible => "irreversible",
+                        };
+                        let origin_message = crate::agent::tenant::current_turn_origin()
+                            .as_ref()
+                            .map(|o| o.origin_message.clone());
+                        super::judge_shadow::emit(&super::judge_shadow::ShadowObservation {
+                            trace_id: ctx.turn_id,
+                            tool: &tool_name,
+                            tier: tier_label,
+                            requirement: "velocity_park",
+                            gate_action: "deny (parked)",
+                            pending_id: outcome
+                                .output_data
+                                .as_ref()
+                                .and_then(|v| v.get("pending_id"))
+                                .and_then(|v| v.as_str()),
+                            args_scrubbed: super::judge_shadow::scrub_args_summary(&tool_args),
+                            origin_message,
+                        });
+                    }
+                }
                 if let Some(tx) = ctx.event_tx {
                     emit_tool_call_pair(tx, call, &outcome).await;
                 }
                 ordered_results[idx] =
                     Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
                 continue;
-            }
         }
 
         // ── Approval hook ────────────────────────────────

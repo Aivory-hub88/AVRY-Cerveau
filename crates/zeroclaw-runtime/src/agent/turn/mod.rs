@@ -9,6 +9,7 @@ pub(crate) mod events;
 pub(crate) mod execution;
 pub(crate) mod history_append;
 pub(crate) mod history_window;
+pub(crate) mod judge_shadow;
 pub(crate) mod knobs;
 pub(crate) mod max_iter;
 pub(crate) mod outcome;
