@@ -48,6 +48,7 @@ pub mod http_request;
 pub mod image_gen;
 pub mod image_info;
 pub mod jira_tool;
+pub mod judge;
 pub mod knowledge_tool;
 pub mod linkedin;
 pub mod linkedin_client;
