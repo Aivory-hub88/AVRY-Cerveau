@@ -79,6 +79,7 @@ pub use zeroclaw_tools::http_request::HttpRequestTool;
 pub use zeroclaw_tools::image_gen::ImageGenTool;
 pub use zeroclaw_tools::image_info::ImageInfoTool;
 pub use zeroclaw_tools::jira_tool::JiraTool;
+pub use zeroclaw_tools::judge::JudgeTool;
 pub use zeroclaw_tools::knowledge_tool::KnowledgeTool;
 pub use zeroclaw_tools::linkedin::LinkedInTool;
 pub use zeroclaw_tools::llm_task::LlmTaskTool;
@@ -1109,6 +1110,20 @@ pub fn all_tools_with_runtime(
             entry.temperature,
             entry.api_key.clone(),
             llm_task_runtime_options,
+        )));
+        // Typed-judgment routing (ADR-017, P2): same provider/model wiring as
+        // llm_task, one bounded call, policy in code. Shadow-mode first —
+        // decisions are logged by the caller; behaviour is unchanged until
+        // the shadow numbers match P1 on real traffic.
+        tool_arcs.push(Arc::new(JudgeTool::new(
+            security.clone(),
+            family.to_string(),
+            entry
+                .model
+                .clone()
+                .unwrap_or_else(|| "openai/gpt-4o-mini".to_string()),
+            entry.api_key.clone(),
+            zeroclaw_providers::provider_runtime_options_for_alias(root_config, family, alias),
         )));
     }
 
