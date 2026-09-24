@@ -249,8 +249,10 @@ impl Tool for ToolSearchTool {
                     let candidates: Vec<String> =
                         results.iter().map(|s| s.prefixed_name.clone()).collect();
                     let ranked_names = ranker.rerank(tenant_id, &candidates, &recent).await;
-                    let by_name: std::collections::HashMap<&str, _> =
-                        results.iter().map(|s| (s.prefixed_name.as_str(), *s)).collect();
+                    let by_name: std::collections::HashMap<&str, _> = results
+                        .iter()
+                        .map(|s| (s.prefixed_name.as_str(), *s))
+                        .collect();
                     ranked_names
                         .iter()
                         .filter_map(|n| by_name.get(n.as_str()).copied())
@@ -343,7 +345,9 @@ impl Tool for ToolSearchTool {
         // `record_co_activation` itself, never propagated to this call.
         #[cfg(feature = "memory-postgres")]
         if let Some((tenant_id, ranker)) = &self.capability_graph {
-            ranker.record_co_activation(tenant_id, &surfaced_names).await;
+            ranker
+                .record_co_activation(tenant_id, &surfaced_names)
+                .await;
         }
 
         ::zeroclaw_log::record!(
@@ -1085,12 +1089,10 @@ mod tests {
             let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
             // Pre-activate a tool so `recent` is non-empty and the rerank
             // path actually engages.
-            let seed_tool: Arc<dyn Tool> = Arc::new(
-                make_stub("srv__seed", "seed tool").activate(
-                    Arc::new(McpRegistry::connect_all(&[]).await.unwrap()),
-                    Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
-                ),
-            );
+            let seed_tool: Arc<dyn Tool> = Arc::new(make_stub("srv__seed", "seed tool").activate(
+                Arc::new(McpRegistry::connect_all(&[]).await.unwrap()),
+                Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            ));
             activated
                 .lock()
                 .unwrap()

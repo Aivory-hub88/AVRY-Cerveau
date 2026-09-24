@@ -955,14 +955,21 @@ mod tests {
             ("rogue-row", rogue_uuid),
         ] {
             inner
-                .store_with_agent(key, "v", MemoryCategory::Core, None, None, None, Some(owner))
+                .store_with_agent(
+                    key,
+                    "v",
+                    MemoryCategory::Core,
+                    None,
+                    None,
+                    None,
+                    Some(owner),
+                )
                 .await
                 .unwrap();
         }
 
         let shared = as_dyn(inner);
-        let wrapper =
-            AgentScopedMemory::new(shared.clone(), alpha_uuid, vec![beta_uuid.clone()]);
+        let wrapper = AgentScopedMemory::new(shared.clone(), alpha_uuid, vec![beta_uuid.clone()]);
 
         let mut via_wrapper: Vec<String> = wrapper
             .list(None, None)
@@ -982,7 +989,10 @@ mod tests {
         direct.sort();
 
         assert_eq!(via_wrapper, direct);
-        assert_eq!(via_wrapper, vec!["alpha-row".to_string(), "beta-row".to_string()]);
+        assert_eq!(
+            via_wrapper,
+            vec!["alpha-row".to_string(), "beta-row".to_string()]
+        );
         assert!(!via_wrapper.iter().any(|k| k == "rogue-row"));
     }
 
@@ -1006,7 +1016,10 @@ mod tests {
             .await
             .unwrap();
 
-        let entries = as_dyn(inner).list_for_agents(&[], None, None).await.unwrap();
+        let entries = as_dyn(inner)
+            .list_for_agents(&[], None, None)
+            .await
+            .unwrap();
         assert!(entries.is_empty(), "empty allowlist must match nothing");
     }
 

@@ -179,9 +179,9 @@ pub const TENANT_CUSTOM_MCP_NAME_PREFIX: &str = "tenant_";
 /// name `"aivory-mail"` still gets the full hard floor because its url
 /// won't match here.
 fn is_aivory_mail_url(url: &str) -> bool {
-    reqwest::Url::parse(url)
-        .ok()
-        .is_some_and(|parsed| parsed.scheme() == "https" && parsed.host_str() == Some("mail.aivory.uk"))
+    reqwest::Url::parse(url).ok().is_some_and(|parsed| {
+        parsed.scheme() == "https" && parsed.host_str() == Some("mail.aivory.uk")
+    })
 }
 
 /// Synthesizes a real `McpServerConfig` per registered server, always with

@@ -463,7 +463,9 @@ impl Tool for PythonExecuteTool {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some("python_execute is disabled (python_execute.enabled = false)".to_string()),
+                error: Some(
+                    "python_execute is disabled (python_execute.enabled = false)".to_string(),
+                ),
             });
         }
 
@@ -615,89 +617,86 @@ impl Tool for PythonExecuteTool {
         let stdout_drain = spawn_drain(stdout_handle, max_output_bytes);
         let stderr_drain = spawn_drain(stderr_handle, max_output_bytes);
 
-        let mut result =
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
-                Ok(Ok(status)) => {
-                    #[cfg(unix)]
-                    group_guard.disarm();
-                    container_guard.disarm();
-                    let (stdout_capture, stderr_capture) =
-                        tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
+        let mut result = match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait())
+            .await
+        {
+            Ok(Ok(status)) => {
+                #[cfg(unix)]
+                group_guard.disarm();
+                container_guard.disarm();
+                let (stdout_capture, stderr_capture) =
+                    tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
 
-                    let mut stdout = decode_container_output(&stdout_capture.bytes);
-                    let mut stderr = decode_container_output(&stderr_capture.bytes);
+                let mut stdout = decode_container_output(&stdout_capture.bytes);
+                let mut stderr = decode_container_output(&stderr_capture.bytes);
 
-                    if stdout_capture.truncated || stdout.len() > max_output_bytes {
-                        truncate_with_marker(
-                            &mut stdout,
-                            max_output_bytes,
-                            "\n... [output truncated]",
-                        );
-                    }
-                    if stderr_capture.truncated || stderr.len() > max_output_bytes {
-                        truncate_with_marker(
-                            &mut stderr,
-                            max_output_bytes,
-                            "\n... [stderr truncated]",
-                        );
-                    }
+                if stdout_capture.truncated || stdout.len() > max_output_bytes {
+                    truncate_with_marker(&mut stdout, max_output_bytes, "\n... [output truncated]");
+                }
+                if stderr_capture.truncated || stderr.len() > max_output_bytes {
+                    truncate_with_marker(&mut stderr, max_output_bytes, "\n... [stderr truncated]");
+                }
 
-                    ToolResult {
-                        success: status.success(),
-                        output: stdout.into(),
-                        error: if stderr.is_empty() { None } else { Some(stderr) },
-                    }
+                ToolResult {
+                    success: status.success(),
+                    output: stdout.into(),
+                    error: if stderr.is_empty() {
+                        None
+                    } else {
+                        Some(stderr)
+                    },
                 }
-                Ok(Err(e)) => {
-                    container_guard.disarm();
-                    // The local `docker run` CLI process itself failed
-                    // (e.g. it was reaped unexpectedly); the container it
-                    // launched may or may not still be running. Best-effort
-                    // clean it up, but don't claim success either way.
-                    let kill_status = tokio::process::Command::new("docker")
-                        .arg("kill")
-                        .arg(&container_name)
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .await;
-                    tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
-                    let kill_note = describe_kill_result(kill_status);
-                    ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(format!(
-                            "Failed to execute python_execute container: {e} ({kill_note})"
-                        )),
-                    }
+            }
+            Ok(Err(e)) => {
+                container_guard.disarm();
+                // The local `docker run` CLI process itself failed
+                // (e.g. it was reaped unexpectedly); the container it
+                // launched may or may not still be running. Best-effort
+                // clean it up, but don't claim success either way.
+                let kill_status = tokio::process::Command::new("docker")
+                    .arg("kill")
+                    .arg(&container_name)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await;
+                tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
+                let kill_note = describe_kill_result(kill_status);
+                ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!(
+                        "Failed to execute python_execute container: {e} ({kill_note})"
+                    )),
                 }
-                Err(_) => {
-                    // Kill the container in the Docker daemon FIRST (the
-                    // thing that's actually still running and consuming
-                    // resources), then reap the local `docker run` CLI
-                    // process. `--rm` means a successful `docker kill` also
-                    // removes the container, so there is nothing further to
-                    // clean up on that side.
-                    let kill_status = tokio::process::Command::new("docker")
-                        .arg("kill")
-                        .arg(&container_name)
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .await;
-                    container_guard.disarm();
-                    let _ = child.start_kill();
-                    tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
-                    let kill_note = describe_kill_result(kill_status);
-                    ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(format!(
-                            "python_execute timed out after {timeout_secs}s ({kill_note})"
-                        )),
-                    }
+            }
+            Err(_) => {
+                // Kill the container in the Docker daemon FIRST (the
+                // thing that's actually still running and consuming
+                // resources), then reap the local `docker run` CLI
+                // process. `--rm` means a successful `docker kill` also
+                // removes the container, so there is nothing further to
+                // clean up on that side.
+                let kill_status = tokio::process::Command::new("docker")
+                    .arg("kill")
+                    .arg(&container_name)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await;
+                container_guard.disarm();
+                let _ = child.start_kill();
+                tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
+                let kill_note = describe_kill_result(kill_status);
+                ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!(
+                        "python_execute timed out after {timeout_secs}s ({kill_note})"
+                    )),
                 }
-            };
+            }
+        };
 
         // Deletes the tempfile (NamedTempFile's Drop removes the underlying
         // file) before the "after" snapshot, so the script itself is never
@@ -837,12 +836,7 @@ mod tests {
             .await
             .expect("should return a result, not an error");
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .unwrap_or_default()
-                .contains("disabled")
-        );
+        assert!(result.error.unwrap_or_default().contains("disabled"));
     }
 
     #[tokio::test]
@@ -903,10 +897,7 @@ mod tests {
             .expect("should return a result, not an error");
         assert!(!result.success);
         let err = result.error.unwrap_or_default();
-        assert!(
-            err.contains("allowed_workspace_roots"),
-            "got: {err}"
-        );
+        assert!(err.contains("allowed_workspace_roots"), "got: {err}");
     }
 
     #[test]

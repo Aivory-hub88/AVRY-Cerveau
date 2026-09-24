@@ -119,10 +119,7 @@ pub(crate) async fn prepare_tool_calls(
         // failure back to the model instead, without ever entering the
         // hook/approval/execution pipeline for this call.
         if let Some(parse_error) = &call.arguments_parse_error {
-            let message = format!(
-                "Tool call '{}' was not executed: {parse_error}",
-                call.name
-            );
+            let message = format!("Tool call '{}' was not executed: {parse_error}", call.name);
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -307,42 +304,41 @@ pub(crate) async fn prepare_tool_calls(
         if let Some(super::approval_gate::ApprovalGateOutcome::Deny(outcome)) =
             super::velocity_gate::check_velocity_park(ctx, &tool_name, &tool_args, iteration)
         {
-                // Same shadow contract as the approval gate (ADR-017): log
-                // the parked decision with its judge request; never alters it.
-                // Borrow-only: `outcome` still moves into ordered_results below.
-                if let Some(mgr) = ctx.approval {
-                    let tier = mgr.risk_tier(&tool_name);
-                    if super::judge_shadow::should_shadow(&tier) {
-                        let tier_label = match tier {
-                            zeroclaw_config::schema::ToolRiskTier::Safe => "safe",
-                            zeroclaw_config::schema::ToolRiskTier::Reversible => "reversible",
-                            zeroclaw_config::schema::ToolRiskTier::Irreversible => "irreversible",
-                        };
-                        let origin_message = crate::agent::tenant::current_turn_origin()
+            // Same shadow contract as the approval gate (ADR-017): log
+            // the parked decision with its judge request; never alters it.
+            // Borrow-only: `outcome` still moves into ordered_results below.
+            if let Some(mgr) = ctx.approval {
+                let tier = mgr.risk_tier(&tool_name);
+                if super::judge_shadow::should_shadow(&tier) {
+                    let tier_label = match tier {
+                        zeroclaw_config::schema::ToolRiskTier::Safe => "safe",
+                        zeroclaw_config::schema::ToolRiskTier::Reversible => "reversible",
+                        zeroclaw_config::schema::ToolRiskTier::Irreversible => "irreversible",
+                    };
+                    let origin_message = crate::agent::tenant::current_turn_origin()
+                        .as_ref()
+                        .map(|o| o.origin_message.clone());
+                    super::judge_shadow::emit(&super::judge_shadow::ShadowObservation {
+                        trace_id: ctx.turn_id,
+                        tool: &tool_name,
+                        tier: tier_label,
+                        requirement: "velocity_park",
+                        gate_action: "deny (parked)",
+                        pending_id: outcome
+                            .output_data
                             .as_ref()
-                            .map(|o| o.origin_message.clone());
-                        super::judge_shadow::emit(&super::judge_shadow::ShadowObservation {
-                            trace_id: ctx.turn_id,
-                            tool: &tool_name,
-                            tier: tier_label,
-                            requirement: "velocity_park",
-                            gate_action: "deny (parked)",
-                            pending_id: outcome
-                                .output_data
-                                .as_ref()
-                                .and_then(|v| v.get("pending_id"))
-                                .and_then(|v| v.as_str()),
-                            args_scrubbed: super::judge_shadow::scrub_args_summary(&tool_args),
-                            origin_message,
-                        });
-                    }
+                            .and_then(|v| v.get("pending_id"))
+                            .and_then(|v| v.as_str()),
+                        args_scrubbed: super::judge_shadow::scrub_args_summary(&tool_args),
+                        origin_message,
+                    });
                 }
-                if let Some(tx) = ctx.event_tx {
-                    emit_tool_call_pair(tx, call, &outcome).await;
-                }
-                ordered_results[idx] =
-                    Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
-                continue;
+            }
+            if let Some(tx) = ctx.event_tx {
+                emit_tool_call_pair(tx, call, &outcome).await;
+            }
+            ordered_results[idx] = Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
+            continue;
         }
 
         // ── Approval hook ────────────────────────────────
@@ -454,7 +450,9 @@ pub(crate) async fn prepare_tool_calls(
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                             .with_category(::zeroclaw_log::EventCategory::Tool)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"tool": tool_name, "error": e.to_string()})),
+                            .with_attrs(
+                                ::serde_json::json!({"tool": tool_name, "error": e.to_string()})
+                            ),
                         "F-2 idempotency claim failed; refusing to run unprotected"
                     );
                     let msg = format!(
@@ -812,8 +810,9 @@ mod tests {
         // same tool_call_id, so a role=tool follow-up message still lines up
         // with the assistant's claimed tool call.
         let mut ordered_results = prepared.ordered_results;
-        let (name, tool_call_id, outcome) =
-            ordered_results.remove(0).expect("a result must be recorded");
+        let (name, tool_call_id, outcome) = ordered_results
+            .remove(0)
+            .expect("a result must be recorded");
         assert_eq!(name, "file_write");
         assert_eq!(tool_call_id.as_deref(), Some("call_1"));
         assert!(!outcome.success, "the outcome must be a failure");
@@ -883,13 +882,7 @@ mod tests {
     }
 
     /// Feed `n` executed outcomes for `tool` through the real post-execution path.
-    async fn feed_outcomes(
-        ctx: &TurnCtx<'_>,
-        tool: &str,
-        n: usize,
-        success: bool,
-        text: &str,
-    ) {
+    async fn feed_outcomes(ctx: &TurnCtx<'_>, tool: &str, n: usize, success: bool, text: &str) {
         for _ in 0..n {
             let calls = vec![breaker_call(tool)];
             let mut ordered = vec![None];
@@ -940,13 +933,33 @@ mod tests {
         .await;
 
         let prepared = prepared_for(&ctx, tool).await;
-        assert!(prepared.executable_indices.is_empty(), "must not reach the dead server");
-        let (_, id, blocked) = prepared.ordered_results.into_iter().next().flatten().expect("result");
+        assert!(
+            prepared.executable_indices.is_empty(),
+            "must not reach the dead server"
+        );
+        let (_, id, blocked) = prepared
+            .ordered_results
+            .into_iter()
+            .next()
+            .flatten()
+            .expect("result");
         assert_eq!(id.as_deref(), Some("call_b"));
         assert!(!blocked.success);
-        assert!(blocked.output.contains("temporarily unavailable"), "{}", blocked.output);
-        assert!(blocked.output.contains("HTTP 502"), "cause must reach the model: {}", blocked.output);
-        assert!(blocked.output.contains("Do not retry"), "{}", blocked.output);
+        assert!(
+            blocked.output.contains("temporarily unavailable"),
+            "{}",
+            blocked.output
+        );
+        assert!(
+            blocked.output.contains("HTTP 502"),
+            "cause must reach the model: {}",
+            blocked.output
+        );
+        assert!(
+            blocked.output.contains("Do not retry"),
+            "{}",
+            blocked.output
+        );
 
         // A different tool of the same server-shaped name is unaffected.
         let other = prepared_for(&ctx, "brk_dead__search_mail").await;
@@ -969,7 +982,10 @@ mod tests {
             "MCP `get_thread` (server `brk_alive`) returned isError: thread not found",
         )
         .await;
-        assert_eq!(prepared_for(&ctx, answering).await.executable_indices, vec![0]);
+        assert_eq!(
+            prepared_for(&ctx, answering).await.executable_indices,
+            vec![0]
+        );
 
         // Four server failures, one success, four more: never five in a row.
         let flaky = "brk_flaky__search";
@@ -988,13 +1004,21 @@ mod tests {
         let ctx = breaker_ctx("turn-breaker-off", &dedup_exempt_tools, &pacing);
         let down = "MCP server `brk_off` error during tool call `t`";
         feed_outcomes(&ctx, "brk_off__t", 10, false, down).await;
-        assert_eq!(prepared_for(&ctx, "brk_off__t").await.executable_indices, vec![0]);
+        assert_eq!(
+            prepared_for(&ctx, "brk_off__t").await.executable_indices,
+            vec![0]
+        );
 
         // Built-ins (no `server__tool` shape) have no remote server to be down.
         let pacing_on = zeroclaw_config::schema::PacingConfig::default();
         let ctx_on = breaker_ctx("turn-breaker-builtin", &dedup_exempt_tools, &pacing_on);
         feed_outcomes(&ctx_on, "brk_builtin", 10, false, down).await;
-        assert_eq!(prepared_for(&ctx_on, "brk_builtin").await.executable_indices, vec![0]);
+        assert_eq!(
+            prepared_for(&ctx_on, "brk_builtin")
+                .await
+                .executable_indices,
+            vec![0]
+        );
     }
 
     /// A normal, successfully-parsed call must be unaffected by the new

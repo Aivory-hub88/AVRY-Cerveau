@@ -93,9 +93,19 @@ async fn postgres_lifecycle_end_to_end() {
     ))
     .await;
 
-    let mem =
-        PostgresMemory::new("test", &url, SCHEMA, "memories", Some(5), Some(false), None, None, 0.7, 0.3)
-            .expect("connect + migrate");
+    let mem = PostgresMemory::new(
+        "test",
+        &url,
+        SCHEMA,
+        "memories",
+        Some(5),
+        Some(false),
+        None,
+        None,
+        0.7,
+        0.3,
+    )
+    .expect("connect + migrate");
     mem.init_lifecycle_schema().await.expect("init lifecycle");
 
     // ── Scenario 1: budget enforced independently per tenant ──────────
@@ -111,13 +121,19 @@ async fn postgres_lifecycle_end_to_end() {
     let report = mem.run_lifecycle(&cap5).await.expect("lifecycle 1");
     assert_eq!(report.budget_evicted, 15, "A 20->5 evicts 15; B under cap");
     assert_eq!(count_for(&mem, "tenant_a").await, 5, "A capped at 5");
-    assert_eq!(count_for(&mem, "tenant_b").await, 3, "B under cap untouched");
+    assert_eq!(
+        count_for(&mem, "tenant_b").await,
+        3,
+        "B under cap untouched"
+    );
 
     // ── Scenario 2: per-tenant quota override beats the default ───────
     truncate().await;
     seed(&mem, "vip", MemoryCategory::Core, 20, "c").await;
     let vip_id = mem.ensure_agent_uuid("vip").await.expect("uuid");
-    mem.set_tenant_quota(&vip_id, "core", 12).await.expect("quota");
+    mem.set_tenant_quota(&vip_id, "core", 12)
+        .await
+        .expect("quota");
     mem.run_lifecycle(&cap5).await.expect("lifecycle 2");
     assert_eq!(
         count_for(&mem, "vip").await,
@@ -140,9 +156,19 @@ async fn postgres_lifecycle_end_to_end() {
         daily_max_rows_per_tenant: 10_000,
         conversation_max_rows_per_tenant: 10_000,
     };
-    let report = mem.run_lifecycle(&with_retention).await.expect("lifecycle 3");
-    assert_eq!(report.retention_pruned, 3, "3 aged conversation rows pruned");
-    assert_eq!(count_for(&mem, "t").await, 3, "3 core rows survive (durable)");
+    let report = mem
+        .run_lifecycle(&with_retention)
+        .await
+        .expect("lifecycle 3");
+    assert_eq!(
+        report.retention_pruned, 3,
+        "3 aged conversation rows pruned"
+    );
+    assert_eq!(
+        count_for(&mem, "t").await,
+        3,
+        "3 core rows survive (durable)"
+    );
 
     // ── Scenario 4: recall uses OR semantics (ranked top-k), so a query
     //    with one term absent from the row still finds it ──────────────
@@ -171,7 +197,11 @@ async fn postgres_lifecycle_end_to_end() {
         )
         .await
         .expect("recall");
-    assert_eq!(hits.len(), 1, "partial-term query must still match (OR semantics)");
+    assert_eq!(
+        hits.len(),
+        1,
+        "partial-term query must still match (OR semantics)"
+    );
     // Punctuation-only query: no match, no SQL error.
     let none = mem
         .recall_for_agents(&[&uuid], "!!! ...", 10, None, None, None)

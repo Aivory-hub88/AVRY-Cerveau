@@ -177,16 +177,8 @@ fn generic_rules() -> [(&'static str, BitFlags<AccessFs>, bool); 25] {
         // for GC heap sizing, or /sys CPU cache/topology nodes). None of
         // this is tenant- or workspace-specific. Present on every real
         // Linux host capable of running Landlock (5.13+), so required.
-        (
-            "/proc",
-            AccessFs::ReadFile | AccessFs::ReadDir,
-            true,
-        ),
-        (
-            "/sys",
-            AccessFs::ReadFile | AccessFs::ReadDir,
-            true,
-        ),
+        ("/proc", AccessFs::ReadFile | AccessFs::ReadDir, true),
+        ("/sys", AccessFs::ReadFile | AccessFs::ReadDir, true),
         // /dev (superset of the old /dev/null rule): /dev/null and
         // /dev/shm (POSIX shared memory, which CoreCLR and other runtimes
         // map) are write targets, alongside read-only /dev/urandom.
@@ -326,7 +318,13 @@ impl LandlockSandbox {
 
     /// Create a Landlock sandbox with a specific workspace directory
     pub fn with_workspace(workspace_dir: Option<std::path::PathBuf>) -> std::io::Result<Self> {
-        Self::with_roots(workspace_dir, Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        Self::with_roots(
+            workspace_dir,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
     }
 
     /// Create a Landlock sandbox with a workspace directory plus the extra

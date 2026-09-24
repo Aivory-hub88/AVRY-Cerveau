@@ -23,8 +23,8 @@ pub(crate) mod results_collect;
 pub(crate) mod steering;
 pub(crate) mod stream_consume;
 pub(crate) mod stream_guard;
-pub(crate) mod tool_specs;
 pub(crate) mod tool_breaker;
+pub(crate) mod tool_specs;
 pub(crate) mod velocity_gate;
 pub(crate) mod vision_route;
 
@@ -43,8 +43,8 @@ pub use execution::{
 };
 pub(crate) use history_window::preflight_history_maintenance;
 pub use knobs::{LoopKnobs, MaxIterationBehavior};
-pub(crate) use max_iter::finish_after_max_iterations;
 pub(crate) use max_iter::finish_after_loop_break;
+pub(crate) use max_iter::finish_after_max_iterations;
 pub(crate) use outcome::StreamCancelledAfterOutput;
 pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,

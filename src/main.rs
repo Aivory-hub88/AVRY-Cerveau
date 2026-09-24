@@ -6077,7 +6077,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                             module_path!(),
                                             ::zeroclaw_log::Action::Fail
                                         )
-                                        .with_attrs(::serde_json::json!({ "error": e.to_string() })),
+                                        .with_attrs(
+                                            ::serde_json::json!({ "error": e.to_string() })
+                                        ),
                                         "capability_graph.enabled=true but connecting failed; \
                                          tool_search reranking stays off this boot"
                                     );
@@ -6087,7 +6089,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         _ => {
                             ::zeroclaw_log::record!(
                                 WARN,
-                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip),
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Skip
+                                ),
                                 "capability_graph.enabled=true but memory.backend is not a \
                                  configured Postgres storage; skipping"
                             );
@@ -6131,7 +6136,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                             module_path!(),
                                             ::zeroclaw_log::Action::Fail
                                         )
-                                        .with_attrs(::serde_json::json!({ "error": e.to_string() })),
+                                        .with_attrs(
+                                            ::serde_json::json!({ "error": e.to_string() })
+                                        ),
                                         "agent_tasks.enabled=true but connecting failed; \
                                          task_create/task_update_status/task_list stay off this boot"
                                     );
@@ -6141,7 +6148,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         _ => {
                             ::zeroclaw_log::record!(
                                 WARN,
-                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip),
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Skip
+                                ),
                                 "agent_tasks.enabled=true but memory.backend is not a \
                                  configured Postgres storage; skipping"
                             );
@@ -6193,7 +6203,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         _ => {
                             ::zeroclaw_log::record!(
                                 WARN,
-                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip),
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Skip
+                                ),
                                 "skill_insights.enabled=true but memory.backend is not a \
                                  configured Postgres storage; skipping"
                             );

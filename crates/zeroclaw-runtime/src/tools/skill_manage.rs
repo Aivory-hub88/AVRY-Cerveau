@@ -538,18 +538,20 @@ impl SkillManageTool {
                     None => {
                         ::zeroclaw_log::record!(
                             DEBUG,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                .with_attrs(::serde_json::json!({
-                                    "slug": slug,
-                                    "reason": "cognee_disabled_or_no_tenant_context",
-                                })),
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Skip
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "slug": slug,
+                                "reason": "cognee_disabled_or_no_tenant_context",
+                            })),
                             "skill improvement graph-log skipped: no cognee context"
                         );
                     }
                     Some((cognee_cfg, tenant_id, agent_type)) => {
-                        let text =
-                            format!("Skill '{slug}' was improved. Reason: {reason}");
+                        let text = format!("Skill '{slug}' was improved. Reason: {reason}");
                         match zeroclaw_tools::graph_memory::remember(
                             cognee_cfg, tenant_id, agent_type, &text,
                         )
@@ -558,25 +560,35 @@ impl SkillManageTool {
                             Ok(()) => {
                                 ::zeroclaw_log::record!(
                                     INFO,
-                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                                        .with_attrs(::serde_json::json!({
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Complete
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                                    .with_attrs(
+                                        ::serde_json::json!({
                                             "slug": slug,
                                             "agent_type": agent_type,
-                                        })),
+                                        })
+                                    ),
                                     "skill improvement graph-logged"
                                 );
                             }
                             Err(e) => {
                                 ::zeroclaw_log::record!(
                                     WARN,
-                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                        .with_attrs(::serde_json::json!({
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
                                             "slug": slug,
                                             "agent_type": agent_type,
                                             "error": e.to_string(),
-                                        })),
+                                        })
+                                    ),
                                     "skill improvement graph-log failed (non-fatal)"
                                 );
                             }

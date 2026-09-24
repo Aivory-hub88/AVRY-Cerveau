@@ -148,7 +148,10 @@ pub(crate) fn detect_internal_protocol_without_tools(response: &str) -> Option<S
 /// Shared envelope heuristic behind both [`detect_tool_call_parse_issue_for_known_tools`]
 /// (no valid call parsed at all) and [`detect_residual_tool_protocol_issue`] (some valid
 /// calls parsed, but leftover text still looks like a botched tool-call attempt).
-fn detect_protocol_envelope_issue(trimmed: &str, known_tool_names: &HashSet<String>) -> Option<String> {
+fn detect_protocol_envelope_issue(
+    trimmed: &str,
+    known_tool_names: &HashSet<String>,
+) -> Option<String> {
     if trimmed.is_empty() || looks_like_tool_protocol_example(trimmed) {
         return None;
     }
@@ -259,7 +262,11 @@ Done, let me know if you need anything else."#;
             r#"<tool_call>{"name": "shell", "arguments": {"command": "pwd"#
         );
         let (residual, calls) = parse_tool_calls(response);
-        assert_eq!(calls.len(), 1, "the well-formed first tool call must survive");
+        assert_eq!(
+            calls.len(),
+            1,
+            "the well-formed first tool call must survive"
+        );
         assert_eq!(calls[0].name, "shell");
         let issue = detect_residual_tool_protocol_issue(&residual);
         assert!(

@@ -309,14 +309,12 @@ pub(crate) async fn finish_after_loop_break(
         );
     }
 
-    let summary_prompt = ChatMessage::user(
-        format!(
-            "The automated loop guard stopped the tool loop early: {break_message}. \
+    let summary_prompt = ChatMessage::user(format!(
+        "The automated loop guard stopped the tool loop early: {break_message}. \
              No more tool calls from here. Write your final user-facing answer now: \
              what was accomplished, what is still pending, and what you need \
              to continue. Be concrete and brief."
-        ),
-    );
+    ));
     let summary_prompt_mirror = summary_prompt.clone();
     history.push(summary_prompt);
 
@@ -402,9 +400,8 @@ pub(crate) async fn finish_after_loop_break(
             accumulated_display_text.push_str("\n\n");
         }
         accumulated_display_text.push_str(&stop_note);
-        accumulated_display_text.push_str(
-            " The closing summary could not be generated, but the work above stands.",
-        );
+        accumulated_display_text
+            .push_str(" The closing summary could not be generated, but the work above stands.");
         Ok(accumulated_display_text.clone())
     };
     // This exit returns the turn's final text, so it owns the
@@ -1239,7 +1236,10 @@ mod loop_break_wrap_up_tests {
         let out = run_break(&provider, &mut history, "partial work".to_string())
             .await
             .expect("loop break must never fail the turn");
-        assert!(out.contains("here is what got done"), "summary missing: {out}");
+        assert!(
+            out.contains("here is what got done"),
+            "summary missing: {out}"
+        );
         assert!(out.contains("partial work"), "partial work lost: {out}");
         assert!(
             out.contains("Stopped early by the loop guard"),

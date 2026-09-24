@@ -310,10 +310,7 @@ mod tests {
         let mut job = minimal_job();
         job.tenant_id = Some("u1".into());
         job.tenant_agent_type = Some("customer_service".into());
-        assert_eq!(
-            job.tenant_selector(),
-            Some(("u1", "customer_service"))
-        );
+        assert_eq!(job.tenant_selector(), Some(("u1", "customer_service")));
     }
 
     #[test]

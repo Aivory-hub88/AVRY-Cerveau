@@ -300,7 +300,11 @@ async fn drive_claimed(
             )
             .await
             {
-                log_drive_note(task_id, "re_park_failed_after_turn_error", &format!("{pe:#}"));
+                log_drive_note(
+                    task_id,
+                    "re_park_failed_after_turn_error",
+                    &format!("{pe:#}"),
+                );
             }
         }
     }
@@ -311,7 +315,9 @@ fn log_drive_note(task_id: &str, kind: &str, detail: &str) {
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-            .with_attrs(::serde_json::json!({ "task_id": task_id, "kind": kind, "detail": detail })),
+            .with_attrs(
+                ::serde_json::json!({ "task_id": task_id, "kind": kind, "detail": detail })
+            ),
         "F-1 goal auto-resume: notable event during drive"
     );
 }
@@ -502,7 +508,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(final_goal.pause_reason, Some(GoalPauseReason::DaemonRestart));
+        assert_eq!(
+            final_goal.pause_reason,
+            Some(GoalPauseReason::DaemonRestart)
+        );
 
         // Second drive of the identical (task_id, crashed_boot_id) candidate,
         // simulating this same orphan surfacing again on a later boot's

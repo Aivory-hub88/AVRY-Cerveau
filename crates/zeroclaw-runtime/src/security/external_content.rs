@@ -11,7 +11,10 @@ use zeroclaw_config::schema::{McpConfig, SopConfig};
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScanOutcome {
     Safe,
-    Suspicious { patterns: Vec<String>, score: f64 },
+    Suspicious {
+        patterns: Vec<String>,
+        score: f64,
+    },
     /// Detected patterns were redacted in place (only produced under
     /// `GuardAction::Sanitize`). `content` is the redacted text — callers
     /// that want the sanitized result must use this field, not the input
@@ -21,7 +24,9 @@ pub enum ScanOutcome {
         patterns: Vec<String>,
         score: f64,
     },
-    Blocked { reason: String },
+    Blocked {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -113,7 +118,9 @@ impl ContentSafety {
 
         match scan_untrusted(&scan_text, &self.scan) {
             ScanOutcome::Blocked { reason } => ScreenVerdict::Block { reason },
-            ScanOutcome::Sanitized { patterns, score, .. } => {
+            ScanOutcome::Sanitized {
+                patterns, score, ..
+            } => {
                 // `scan_untrusted` redacted the joined topic+payload as one
                 // string; redact each field independently instead of trying
                 // to split that joined string back apart, then report the
@@ -249,11 +256,17 @@ impl McpContentSafetyRegistry {
                     action: GuardAction::from_str(action_str),
                     ..default_policy
                 };
-                Some((server.name.clone(), ContentSafety::new(framing, policy, outbound)))
+                Some((
+                    server.name.clone(),
+                    ContentSafety::new(framing, policy, outbound),
+                ))
             })
             .collect();
 
-        Self { default, per_server }
+        Self {
+            default,
+            per_server,
+        }
     }
 
     /// `tool_name` is the prefixed MCP tool name (`<server>__<tool>`,
@@ -765,7 +778,11 @@ mod tests {
         assert!(matches!(outcome, ScanOutcome::Sanitized { .. }));
         // The text returned to the caller is the REDACTED text, not just the
         // homoglyph/token-folded pass-through `Warn` would have returned.
-        assert!(!text.to_lowercase().contains("ignore all previous instructions"));
+        assert!(
+            !text
+                .to_lowercase()
+                .contains("ignore all previous instructions")
+        );
         assert!(text.contains("[REDACTED_SUSPECTED_INJECTION]"));
     }
 
@@ -856,7 +873,9 @@ mod tests {
     #[test]
     fn registry_per_server_override_only_applies_to_that_server() {
         let mut mcp_config = McpConfig::default(); // global default stays "warn"
-        mcp_config.servers.push(mcp_server("avry-mail", Some("block")));
+        mcp_config
+            .servers
+            .push(mcp_server("avry-mail", Some("block")));
         let registry = McpContentSafetyRegistry::from_mcp_config(&mcp_config);
 
         let (_, blocked_outcome) = registry
@@ -873,7 +892,9 @@ mod tests {
     #[test]
     fn registry_falls_back_to_default_for_tool_names_with_no_server_prefix() {
         let mut mcp_config = McpConfig::default();
-        mcp_config.servers.push(mcp_server("avry-mail", Some("block")));
+        mcp_config
+            .servers
+            .push(mcp_server("avry-mail", Some("block")));
         let registry = McpContentSafetyRegistry::from_mcp_config(&mcp_config);
 
         // "web_search_tool" has no "__" separator — no server to look up.

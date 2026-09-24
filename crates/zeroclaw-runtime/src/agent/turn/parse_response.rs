@@ -163,9 +163,7 @@ pub(crate) async fn interpret_chat_response(
                         Ok(value) => (value, None),
                         Err(e) => (
                             serde_json::Value::Object(serde_json::Map::new()),
-                            Some(format!(
-                                "failed to parse tool arguments as JSON: {e}"
-                            )),
+                            Some(format!("failed to parse tool arguments as JSON: {e}")),
                         ),
                     };
                 ParsedToolCall {

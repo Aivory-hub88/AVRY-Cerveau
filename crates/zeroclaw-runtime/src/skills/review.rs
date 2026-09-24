@@ -74,12 +74,22 @@ pub async fn maybe_run_skill_review(
     // a configless test, cognee disabled): graph logging is enrichment, the
     // skill patch itself works identically either way.
     let graph_logging = match full_config.filter(|c| c.cognee.enabled) {
-        Some(cfg) => crate::agent::tenant::current_tenant()
-            .map(|t| (cfg.cognee.clone(), t.platform_user_id.clone(), t.agent_type.clone())),
+        Some(cfg) => crate::agent::tenant::current_tenant().map(|t| {
+            (
+                cfg.cognee.clone(),
+                t.platform_user_id.clone(),
+                t.agent_type.clone(),
+            )
+        }),
         None => None,
     };
 
-    let review_tools = build_review_tools(workspace_dir.clone(), config.clone(), allow_scripts, graph_logging);
+    let review_tools = build_review_tools(
+        workspace_dir.clone(),
+        config.clone(),
+        allow_scripts,
+        graph_logging,
+    );
     // Seal the fixed 3-tool review harness through the one assembly seam so the
     // engine receives a `ScopedToolRegistry` like every other turn path. The
     // policy is `SecurityPolicy::default()` (no allow/deny lists), which makes

@@ -146,7 +146,12 @@ mod tests {
         assert_eq!(e["pending_id"], "ap-1");
         assert_eq!(e["gate_action"], "deny (pending)");
         let req = &e["judge_request"];
-        assert!(req["state"]["args_summary"].as_str().unwrap().contains("scrubbed"));
+        assert!(
+            req["state"]["args_summary"]
+                .as_str()
+                .unwrap()
+                .contains("scrubbed")
+        );
         assert!(req["questions"]["explicit_instruction"].is_object());
         assert!(req["questions"]["severity"].is_object());
         assert_eq!(req["escalate_score_at"], 3);
@@ -155,10 +160,26 @@ mod tests {
     #[test]
     fn long_args_and_origin_truncate() {
         let big = "x".repeat(5000);
-        let o = ShadowObservation { args_scrubbed: big.clone(), origin_message: Some(big), ..obs("reversible", "proceed") };
+        let o = ShadowObservation {
+            args_scrubbed: big.clone(),
+            origin_message: Some(big),
+            ..obs("reversible", "proceed")
+        };
         let e = build_event(&o);
-        assert!(e["judge_request"]["state"]["args_summary"].as_str().unwrap().len() <= 2005);
-        assert!(e["judge_request"]["state"]["origin_message"].as_str().unwrap().len() <= 1005);
+        assert!(
+            e["judge_request"]["state"]["args_summary"]
+                .as_str()
+                .unwrap()
+                .len()
+                <= 2005
+        );
+        assert!(
+            e["judge_request"]["state"]["origin_message"]
+                .as_str()
+                .unwrap()
+                .len()
+                <= 1005
+        );
     }
 
     #[test]
