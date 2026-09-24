@@ -184,6 +184,35 @@ fn is_aivory_mail_url(url: &str) -> bool {
     })
 }
 
+/// Aivory's shared multi-tenant Od-MCP server (ADR-012). Like
+/// [`is_aivory_mail_url`], the exemption below keys on name *and* host so a
+/// tenant can't claim it for their own server by naming it "odoo".
+fn is_shared_odoo_mcp_url(url: &str) -> bool {
+    reqwest::Url::parse(url).ok().is_some_and(|parsed| {
+        parsed.scheme() == "https" && parsed.host_str() == Some("odoo-mcp.aivory.uk")
+    })
+}
+
+/// Od-MCP tools that never change Odoo data: reads, metadata, report PDFs,
+/// and the preview/validate steps of the gated-write flow (they build an
+/// approval token and call `fields_get`, nothing else). An allowlist on
+/// purpose: any tool not named here, including ones Od-MCP adds later,
+/// keeps the server's backend-declared tier.
+const SHARED_ODOO_READ_TOOLS: &[&str] = &[
+    "odoo_read_group",
+    "odoo_generate_report",
+    "odoo_search",
+    "odoo_search_read",
+    "odoo_read",
+    "odoo_count",
+    "odoo_list_models",
+    "odoo_get_model_metadata",
+    "odoo_check_access",
+    "odoo_list_instances",
+    "odoo_preview_write",
+    "odoo_validate_write",
+];
+
 /// Synthesizes a real `McpServerConfig` per registered server, always with
 /// `guarded_transport: true` (SSRF-guarded DNS-pinned transport — see
 /// `zeroclaw_tools::guarded_resolve`'s module docs) and a name prefixed with
@@ -266,16 +295,28 @@ impl TenantContext {
     /// Matched on name *and* url host (not name alone) so a tenant can't get
     /// the same exemption for their own custom server just by naming it
     /// "aivory-mail".
+    ///
+    /// Shared Od-MCP (2026-09-24): its rows stay `irreversible` so ERP writes
+    /// park (ADR-012), but that tier used to apply to every tool on the
+    /// server, so each `search_read`/`count` a tenant asked for parked too.
+    /// Tools in [`SHARED_ODOO_READ_TOOLS`] now resolve to `"safe"`; writes
+    /// and anything unlisted keep the backend tier. Same name + host match.
     pub fn custom_mcp_server_risk_tier(&self, tool_name: &str) -> Option<&str> {
         self.tenant_custom_mcp_servers.iter().find_map(|server| {
             if server.name == "aivory-mail" && is_aivory_mail_url(&server.url) {
                 return None;
             }
-            if tool_name.starts_with(&format!("{TENANT_CUSTOM_MCP_NAME_PREFIX}{}__", server.name)) {
-                Some(server.risk_tier.as_str())
-            } else {
-                None
+            let action = tool_name
+                .strip_prefix(TENANT_CUSTOM_MCP_NAME_PREFIX)?
+                .strip_prefix(server.name.as_str())?
+                .strip_prefix("__")?;
+            if server.name == "odoo"
+                && is_shared_odoo_mcp_url(&server.url)
+                && SHARED_ODOO_READ_TOOLS.contains(&action)
+            {
+                return Some("safe");
             }
+            Some(server.risk_tier.as_str())
         })
     }
 }
@@ -711,6 +752,80 @@ mod tests {
             tenant_custom_mcp_servers: vec![lookalike],
         };
         assert!(ctx.is_tenant_custom_mcp_tool("tenant_aivory-mail__send_mail"));
+    }
+
+    #[test]
+    fn shared_odoo_reads_are_safe_writes_keep_backend_tier() {
+        let odoo = |url: &str| TenantCustomMcpServer {
+            name: "odoo".to_string(),
+            url: url.to_string(),
+            transport: "streamable-http".to_string(),
+            auth_header_name: None,
+            auth_header_value: None,
+            risk_tier: "irreversible".to_string(),
+            disabled_tools: Vec::new(),
+        };
+        let ctx_with = |server: TenantCustomMcpServer| TenantContext {
+            tenant_id: "u1.leads_qualifier".to_string(),
+            platform_user_id: "u1".to_string(),
+            agent_type: "leads_qualifier".to_string(),
+            persona: None,
+            connected_toolkits: Vec::new(),
+            disabled_toolkits: Vec::new(),
+            tenant_custom_mcp_servers: vec![server],
+        };
+
+        let ctx = ctx_with(odoo("https://odoo-mcp.aivory.uk/mcp?token=abc"));
+        for read in [
+            "odoo_search_read",
+            "odoo_count",
+            "odoo_read_group",
+            "odoo_list_models",
+            "odoo_preview_write",
+            "odoo_validate_write",
+        ] {
+            assert_eq!(
+                ctx.custom_mcp_server_risk_tier(&format!("tenant_odoo__{read}")),
+                Some("safe"),
+                "{read}"
+            );
+        }
+        for write in [
+            "odoo_create",
+            "odoo_update",
+            "odoo_delete",
+            "odoo_create_batch",
+            "odoo_execute_method",
+            "odoo_execute_approved_write",
+            "odoo_some_future_tool",
+        ] {
+            assert_eq!(
+                ctx.custom_mcp_server_risk_tier(&format!("tenant_odoo__{write}")),
+                Some("irreversible"),
+                "{write}"
+            );
+        }
+        // Still a tenant tool (hard-floor bookkeeping unchanged).
+        assert!(ctx.is_tenant_custom_mcp_tool("tenant_odoo__odoo_search_read"));
+        // Prefix boundary still enforced.
+        assert_eq!(
+            ctx.custom_mcp_server_risk_tier("tenant_odoo_evil__odoo_search_read"),
+            None
+        );
+
+        // A tenant's own server named "odoo" on another host gets no carve-out.
+        for url in [
+            "https://odoo-mcp.aivory.uk.evil.example/mcp",
+            "http://odoo-mcp.aivory.uk/mcp",
+            "https://my-odoo.example.com/mcp",
+        ] {
+            let ctx = ctx_with(odoo(url));
+            assert_eq!(
+                ctx.custom_mcp_server_risk_tier("tenant_odoo__odoo_search_read"),
+                Some("irreversible"),
+                "{url}"
+            );
+        }
     }
 
     #[tokio::test]
