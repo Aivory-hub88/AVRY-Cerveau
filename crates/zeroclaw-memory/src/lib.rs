@@ -12,8 +12,6 @@ pub mod audit;
 pub mod backend;
 pub mod budget;
 #[cfg(feature = "memory-postgres")]
-pub(crate) mod pg_live;
-#[cfg(feature = "memory-postgres")]
 pub mod capability_graph;
 pub mod chunker;
 pub mod classify;
@@ -32,6 +30,8 @@ pub mod markdown;
 pub mod merge;
 pub mod none;
 pub mod normalize;
+#[cfg(feature = "memory-postgres")]
+pub(crate) mod pg_live;
 pub mod policy;
 pub mod policy_gate;
 #[cfg(feature = "memory-postgres")]
@@ -42,9 +42,9 @@ pub mod rerank;
 pub mod response_cache;
 pub mod retrieval;
 pub mod scanned;
-pub mod snapshot;
 #[cfg(feature = "memory-postgres")]
 pub mod skill_insight_ledger;
+pub mod snapshot;
 pub mod sqlite;
 #[cfg(feature = "memory-postgres")]
 pub mod task_ledger;
@@ -112,7 +112,10 @@ static POSTGRES_MEMORY_CACHE: OnceLock<RwLock<HashMap<String, Arc<dyn Memory>>>>
 
 fn postgres_memory_cache_key(storage: &PostgresStorageConfig) -> Option<String> {
     let db_url = storage.db_url.as_deref()?;
-    Some(format!("{db_url}\u{0}{}\u{0}{}", storage.schema, storage.table))
+    Some(format!(
+        "{db_url}\u{0}{}\u{0}{}",
+        storage.schema, storage.table
+    ))
 }
 
 /// Return the cached shared backend for `key`, or build it via `build` and

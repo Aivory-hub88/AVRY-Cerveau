@@ -20,7 +20,12 @@ use zeroclaw_memory::{AgentScopedMemory, Memory, MemoryCategory, SqliteMemory};
 /// allowlist).
 async fn two_tenants(
     workspace: &TempDir,
-) -> (Arc<dyn Memory>, AgentScopedMemory, AgentScopedMemory, String) {
+) -> (
+    Arc<dyn Memory>,
+    AgentScopedMemory,
+    AgentScopedMemory,
+    String,
+) {
     let shared: Arc<dyn Memory> =
         Arc::new(SqliteMemory::new("sqlite", workspace.path()).expect("sqlite init"));
     let id_a = shared
@@ -53,7 +58,10 @@ async fn tenant_a_secret_is_invisible_to_tenant_b() {
         .unwrap();
 
     // A sees its own row.
-    let own = tenant_a.recall("SECRET-ALPHA", 10, None, None, None).await.unwrap();
+    let own = tenant_a
+        .recall("SECRET-ALPHA", 10, None, None, None)
+        .await
+        .unwrap();
     assert_eq!(own.len(), 1, "owner must recall its own memory");
 
     // B: exact keyword, wildcard, and empty (recent) queries all come back
@@ -90,7 +98,10 @@ async fn shared_session_id_does_not_bridge_tenants() {
         .recall("SECRET-BRAVO", 50, Some("session-42"), None, None)
         .await
         .unwrap();
-    assert!(leaked.is_empty(), "shared session id must not bridge tenants");
+    assert!(
+        leaked.is_empty(),
+        "shared session id must not bridge tenants"
+    );
 }
 
 #[tokio::test]
@@ -112,14 +123,7 @@ async fn caller_allowlist_cannot_widen_past_the_jail() {
         .unwrap();
 
     let leaked = tenant_b
-        .recall_for_agents(
-            &[id_a.as_str()],
-            "SECRET-CHARLIE",
-            50,
-            None,
-            None,
-            None,
-        )
+        .recall_for_agents(&[id_a.as_str()], "SECRET-CHARLIE", 50, None, None, None)
         .await
         .unwrap();
     assert!(
@@ -134,7 +138,12 @@ async fn exact_key_lookup_is_tenant_scoped() {
     let (_shared, tenant_a, tenant_b, _) = two_tenants(&ws).await;
 
     tenant_a
-        .store("kb_entry", "SECRET-DELTA pricing sheet", MemoryCategory::Core, None)
+        .store(
+            "kb_entry",
+            "SECRET-DELTA pricing sheet",
+            MemoryCategory::Core,
+            None,
+        )
         .await
         .unwrap();
 
@@ -154,13 +163,21 @@ async fn vanilla_default_agent_does_not_see_tenant_rows() {
     let (shared, tenant_a, _tenant_b, _) = two_tenants(&ws).await;
 
     tenant_a
-        .store("t_note", "SECRET-ECHO tenant-only", MemoryCategory::Core, None)
+        .store(
+            "t_note",
+            "SECRET-ECHO tenant-only",
+            MemoryCategory::Core,
+            None,
+        )
         .await
         .unwrap();
 
     let default_id = shared.ensure_agent_uuid("default").await.unwrap();
     let vanilla = AgentScopedMemory::new(shared.clone(), default_id, Vec::new());
-    let leaked = vanilla.recall("SECRET-ECHO", 50, None, None, None).await.unwrap();
+    let leaked = vanilla
+        .recall("SECRET-ECHO", 50, None, None, None)
+        .await
+        .unwrap();
     assert!(
         leaked.is_empty(),
         "install-default agent scope saw tenant rows"

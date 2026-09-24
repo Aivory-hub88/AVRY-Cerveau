@@ -89,7 +89,10 @@ pub(crate) fn check_velocity_park(
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let len = {
             let entry = registry.entry(key).or_default();
-            while entry.front().is_some_and(|t| now.duration_since(*t) > window) {
+            while entry
+                .front()
+                .is_some_and(|t| now.duration_since(*t) > window)
+            {
                 entry.pop_front();
             }
             entry.push_back(now);
@@ -100,7 +103,9 @@ pub(crate) fn check_velocity_park(
             // key. Eviction only ever resets a count (fail-open toward a few
             // more calls, never toward unlogged execution).
             registry.retain(|_, times| {
-                times.front().is_some_and(|t| now.duration_since(*t) <= window)
+                times
+                    .front()
+                    .is_some_and(|t| now.duration_since(*t) <= window)
             });
             if registry.len() > MAX_REGISTRY_KEYS
                 && let Some(victim) = registry.keys().next().cloned()
@@ -152,10 +157,7 @@ fn park_as_pending(
         .map(|t| t.platform_user_id.clone())
         .unwrap_or_default();
     let turn_origin = crate::agent::tenant::current_turn_origin();
-    let tier_label = match ctx
-        .approval
-        .map(|mgr| mgr.risk_tier(tool_name))
-    {
+    let tier_label = match ctx.approval.map(|mgr| mgr.risk_tier(tool_name)) {
         Some(zeroclaw_config::schema::ToolRiskTier::Irreversible) => "irreversible",
         _ => "reversible",
     };
@@ -341,8 +343,11 @@ mod tests {
             irreversible: vec![],
             reversible: vec!["create_lead".to_string()],
         };
-        ApprovalManager::for_non_interactive(&profile)
-            .with_risk_taxonomy(tiers, None, Some(Arc::clone(store)))
+        ApprovalManager::for_non_interactive(&profile).with_risk_taxonomy(
+            tiers,
+            None,
+            Some(Arc::clone(store)),
+        )
     }
 
     fn velocity_ctx<'a>(
@@ -429,7 +434,11 @@ mod tests {
                             }
                             other => panic!(
                                 "expected velocity park, got {}",
-                                if other.is_some() { "unexpected outcome" } else { "None" }
+                                if other.is_some() {
+                                    "unexpected outcome"
+                                } else {
+                                    "None"
+                                }
                             ),
                         };
                         // Still inside the scope: the summary is taken, not copied.
@@ -459,8 +468,11 @@ mod tests {
             irreversible: vec![],
             reversible: vec![],
         };
-        let mgr = ApprovalManager::for_non_interactive(&profile)
-            .with_risk_taxonomy(tiers, None, Some(Arc::clone(&store)));
+        let mgr = ApprovalManager::for_non_interactive(&profile).with_risk_taxonomy(
+            tiers,
+            None,
+            Some(Arc::clone(&store)),
+        );
         let pacing = test_pacing(2);
         let observer = NoopObserver;
         let tools: Vec<String> = Vec::new();
@@ -486,8 +498,11 @@ mod tests {
             irreversible: vec![],
             reversible: vec!["create_lead".to_string()],
         };
-        let mgr = ApprovalManager::for_non_interactive(&profile)
-            .with_risk_taxonomy(tiers, None, Some(Arc::clone(&store)));
+        let mgr = ApprovalManager::for_non_interactive(&profile).with_risk_taxonomy(
+            tiers,
+            None,
+            Some(Arc::clone(&store)),
+        );
         let pacing = test_pacing(1);
         let observer = NoopObserver;
         let tools: Vec<String> = Vec::new();

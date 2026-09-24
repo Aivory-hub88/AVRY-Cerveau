@@ -13906,10 +13906,12 @@ impl ToolConcurrencyConfig {
     /// Whether `tool_name` is declared read-only/concurrency-safe by the operator.
     #[must_use]
     pub fn declares_parallel_safe(&self, tool_name: &str) -> bool {
-        self.parallel_safe.iter().any(|entry| match entry.strip_suffix('*') {
-            Some(prefix) => !prefix.is_empty() && tool_name.starts_with(prefix),
-            None => entry == tool_name,
-        })
+        self.parallel_safe
+            .iter()
+            .any(|entry| match entry.strip_suffix('*') {
+                Some(prefix) => !prefix.is_empty() && tool_name.starts_with(prefix),
+                None => entry == tool_name,
+            })
     }
 }
 
@@ -45992,8 +45994,14 @@ mod tool_concurrency_tests {
         assert!(c.declares_parallel_safe("memory_recall"));
         assert!(c.declares_parallel_safe("tenant_aivory-mail__search_mail"));
         assert!(c.declares_parallel_safe("tenant_aivory-mail__search_threads"));
-        assert!(!c.declares_parallel_safe("tenant_aivory-mail__send_mail"), "sibling write tool");
-        assert!(!c.declares_parallel_safe("memory_recall_all"), "exact entry is not a prefix");
+        assert!(
+            !c.declares_parallel_safe("tenant_aivory-mail__send_mail"),
+            "sibling write tool"
+        );
+        assert!(
+            !c.declares_parallel_safe("memory_recall_all"),
+            "exact entry is not a prefix"
+        );
         assert!(!c.declares_parallel_safe("memory_store"));
     }
 

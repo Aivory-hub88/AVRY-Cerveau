@@ -291,7 +291,11 @@ mod tests {
     fn status_never_claims_an_untouched_key() {
         let l = ToolIdemLedger::new_in_memory().unwrap();
         let k = derive_key("t1", "task", "turn", "send_email", "{}");
-        assert_eq!(l.status(&k).unwrap(), None, "no attempt yet — must not fabricate one");
+        assert_eq!(
+            l.status(&k).unwrap(),
+            None,
+            "no attempt yet — must not fabricate one"
+        );
         // Confirm the lookup truly didn't claim it: a real claim afterward
         // still sees a fresh Claimed, not InFlight/AlreadyDone from a
         // phantom row `status` might have inserted.

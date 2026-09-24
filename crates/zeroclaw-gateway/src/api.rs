@@ -998,23 +998,21 @@ pub(crate) async fn resolve_memory_handle_scoped(
         .and_then(|(_, _, cfg)| cfg.api_key.clone());
 
     match tenant {
-        Some(sel) => {
-            zeroclaw_memory::create_memory_for_tenant(
-                &config,
-                alias,
-                &sel.tenant_id(),
-                api_key.as_deref(),
+        Some(sel) => zeroclaw_memory::create_memory_for_tenant(
+            &config,
+            alias,
+            &sel.tenant_id(),
+            api_key.as_deref(),
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!(
+                    "Failed to build tenant-scoped memory: {e:#}"
+                )})),
             )
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!(
-                        "Failed to build tenant-scoped memory: {e:#}"
-                    )})),
-                )
-            })
-        }
+        }),
         None => zeroclaw_memory::create_memory_for_agent(&config, alias, api_key.as_deref())
             .await
             .map_err(|e| {
@@ -1183,12 +1181,11 @@ pub async fn handle_api_memory_store(
         Ok(t) => t,
         Err(e) => return e.into_response(),
     };
-    let mem = match resolve_memory_handle_scoped(&state, body.agent.as_deref(), tenant.as_ref())
-        .await
-    {
-        Ok(m) => m,
-        Err(e) => return e.into_response(),
-    };
+    let mem =
+        match resolve_memory_handle_scoped(&state, body.agent.as_deref(), tenant.as_ref()).await {
+            Ok(m) => m,
+            Err(e) => return e.into_response(),
+        };
 
     match mem.store(&body.key, &body.content, category, None).await {
         Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
@@ -1221,12 +1218,11 @@ pub async fn handle_api_memory_delete(
         Ok(t) => t,
         Err(e) => return e.into_response(),
     };
-    let mem = match resolve_memory_handle_scoped(&state, query.agent.as_deref(), tenant.as_ref())
-        .await
-    {
-        Ok(m) => m,
-        Err(e) => return e.into_response(),
-    };
+    let mem =
+        match resolve_memory_handle_scoped(&state, query.agent.as_deref(), tenant.as_ref()).await {
+            Ok(m) => m,
+            Err(e) => return e.into_response(),
+        };
 
     match mem.forget(&key).await {
         Ok(deleted) => {
@@ -5771,7 +5767,6 @@ pub(crate) mod tests {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tenant_memory_gate_tests {

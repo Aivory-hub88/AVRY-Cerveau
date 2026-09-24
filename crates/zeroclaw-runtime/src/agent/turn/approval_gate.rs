@@ -59,11 +59,19 @@ fn observe_gate(
     };
     let (gate_action, pending_id) = match outcome {
         ApprovalGateOutcome::Proceed { approved } => (
-            if *approved { "proceed (approved)" } else { "proceed (unapproved)" },
+            if *approved {
+                "proceed (approved)"
+            } else {
+                "proceed (unapproved)"
+            },
             None,
         ),
         ApprovalGateOutcome::Deny(o) => (
-            if pending_id_of(o).is_some() { "deny (pending)" } else { "deny" },
+            if pending_id_of(o).is_some() {
+                "deny (pending)"
+            } else {
+                "deny"
+            },
             pending_id_of(o),
         ),
         ApprovalGateOutcome::Replace(_) => ("replace", None),

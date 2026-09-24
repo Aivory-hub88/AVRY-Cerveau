@@ -76,11 +76,7 @@ impl RedisRateLimiter {
     /// already-connected [`ConnectionManager`] — avoids a second TCP/AUTH
     /// round trip when constructing the pair/webhook/tenant limiters
     /// together at startup.
-    pub fn with_shared_connection(
-        &self,
-        limit_per_window: u32,
-        window: Duration,
-    ) -> Self {
+    pub fn with_shared_connection(&self, limit_per_window: u32, window: Duration) -> Self {
         Self {
             conn: self.conn.clone(),
             script: redis::Script::new(SLIDING_WINDOW_SCRIPT),
@@ -185,9 +181,10 @@ mod tests {
             return;
         };
         let prefix = format!("test:{}:", uuid_like());
-        let instance_a = RedisRateLimiter::connect(&url, prefix.clone(), 3, Duration::from_secs(60))
-            .await
-            .expect("connect a");
+        let instance_a =
+            RedisRateLimiter::connect(&url, prefix.clone(), 3, Duration::from_secs(60))
+                .await
+                .expect("connect a");
         let instance_b = RedisRateLimiter::connect(&url, prefix, 3, Duration::from_secs(60))
             .await
             .expect("connect b");

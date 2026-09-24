@@ -1051,7 +1051,9 @@ mod tests {
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/api/v1/tenant-mcp-servers/internal/user_d09/customer_service"))
+            .and(path(
+                "/api/v1/tenant-mcp-servers/internal/user_d09/customer_service",
+            ))
             .and(header("X-Internal-Token", "secret-tok"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "servers": [{

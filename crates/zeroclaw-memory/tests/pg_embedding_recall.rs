@@ -123,12 +123,28 @@ async fn semantic_recall_finds_a_zero_keyword_overlap_match() {
     .expect("connect + migrate + enable pgvector");
 
     let uuid = mem.ensure_agent_uuid("tenant").await.expect("uuid");
-    mem.store_with_agent("k_apple", "apple", MemoryCategory::Core, None, None, None, Some(&uuid))
-        .await
-        .expect("store apple");
-    mem.store_with_agent("k_shoe", "shoe", MemoryCategory::Core, None, None, None, Some(&uuid))
-        .await
-        .expect("store shoe");
+    mem.store_with_agent(
+        "k_apple",
+        "apple",
+        MemoryCategory::Core,
+        None,
+        None,
+        None,
+        Some(&uuid),
+    )
+    .await
+    .expect("store apple");
+    mem.store_with_agent(
+        "k_shoe",
+        "shoe",
+        MemoryCategory::Core,
+        None,
+        None,
+        None,
+        Some(&uuid),
+    )
+    .await
+    .expect("store shoe");
 
     // "fruit" shares ZERO keywords with "apple" or "shoe" — a pure keyword
     // search would return nothing for either. Only the embedder's learned
@@ -167,14 +183,31 @@ async fn embedding_column_is_actually_populated_on_store() {
 
     let embedder: Arc<dyn EmbeddingProvider> = Arc::new(FakeEmbedder);
     let mem = PostgresMemory::new(
-        "test", &url, &schema, "memories", Some(5), Some(true), Some(3), Some(embedder), 0.7, 0.3,
+        "test",
+        &url,
+        &schema,
+        "memories",
+        Some(5),
+        Some(true),
+        Some(3),
+        Some(embedder),
+        0.7,
+        0.3,
     )
     .expect("connect + migrate + enable pgvector");
 
     let uuid = mem.ensure_agent_uuid("tenant").await.expect("uuid");
-    mem.store_with_agent("k_apple", "apple", MemoryCategory::Core, None, None, None, Some(&uuid))
-        .await
-        .expect("store apple");
+    mem.store_with_agent(
+        "k_apple",
+        "apple",
+        MemoryCategory::Core,
+        None,
+        None,
+        None,
+        Some(&uuid),
+    )
+    .await
+    .expect("store apple");
 
     // Independent proof, not the model's/library's own claim: query the
     // raw column directly and confirm a real vector landed there — this is
@@ -219,14 +252,31 @@ async fn no_embedder_stays_keyword_only_zero_overlap_finds_nothing() {
     // No embedder at all (None) — must behave exactly like the pre-patch
     // keyword-only backend: a zero-keyword-overlap query finds nothing.
     let mem = PostgresMemory::new(
-        "test", &url, &schema, "memories", Some(5), Some(true), Some(3), None, 0.7, 0.3,
+        "test",
+        &url,
+        &schema,
+        "memories",
+        Some(5),
+        Some(true),
+        Some(3),
+        None,
+        0.7,
+        0.3,
     )
     .expect("connect + migrate + enable pgvector");
 
     let uuid = mem.ensure_agent_uuid("tenant").await.expect("uuid");
-    mem.store_with_agent("k_apple", "apple", MemoryCategory::Core, None, None, None, Some(&uuid))
-        .await
-        .expect("store apple");
+    mem.store_with_agent(
+        "k_apple",
+        "apple",
+        MemoryCategory::Core,
+        None,
+        None,
+        None,
+        Some(&uuid),
+    )
+    .await
+    .expect("store apple");
 
     let results = mem
         .recall_for_agents(&[&uuid], "fruit", 10, None, None, None)
@@ -258,7 +308,16 @@ async fn failing_embedder_degrades_to_keyword_only_not_a_hard_error() {
 
     let embedder: Arc<dyn EmbeddingProvider> = Arc::new(FailingEmbedder);
     let mem = PostgresMemory::new(
-        "test", &url, &schema, "memories", Some(5), Some(true), Some(3), Some(embedder), 0.7, 0.3,
+        "test",
+        &url,
+        &schema,
+        "memories",
+        Some(5),
+        Some(true),
+        Some(3),
+        Some(embedder),
+        0.7,
+        0.3,
     )
     .expect("connect + migrate + enable pgvector");
 
@@ -289,7 +348,11 @@ async fn failing_embedder_degrades_to_keyword_only_not_a_hard_error() {
         .recall_for_agents(&[&uuid], "apple", 10, None, None, None)
         .await
         .expect("recall must still succeed on a keyword match");
-    assert_eq!(results.len(), 1, "keyword recall must still work with a failing embedder");
+    assert_eq!(
+        results.len(),
+        1,
+        "keyword recall must still work with a failing embedder"
+    );
 
     exec(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE;")).await;
 }

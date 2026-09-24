@@ -190,7 +190,9 @@ fn phase1_scanner_against_synthetic_email_corpus() {
             ScanOutcome::Suspicious { patterns, score } => {
                 format!("score={score:.2} [{}]", patterns.join(", "))
             }
-            ScanOutcome::Sanitized { patterns, score, .. } => {
+            ScanOutcome::Sanitized {
+                patterns, score, ..
+            } => {
                 format!("SANITIZED score={score:.2} [{}]", patterns.join(", "))
             }
             ScanOutcome::Safe => "-".to_string(),

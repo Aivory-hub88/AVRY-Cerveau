@@ -252,7 +252,12 @@ mod tests {
 
     #[test]
     fn build_embed_body_includes_dimensions_when_dims_positive() {
-        let p = OpenAiEmbedding::new("https://openrouter.ai/api/v1", "key", "text-embedding-3-small", 768);
+        let p = OpenAiEmbedding::new(
+            "https://openrouter.ai/api/v1",
+            "key",
+            "text-embedding-3-small",
+            768,
+        );
         let body = p.build_embed_body(&["hello world"]);
         assert_eq!(body["model"], "text-embedding-3-small");
         assert_eq!(body["input"], serde_json::json!(["hello world"]));
@@ -271,7 +276,12 @@ mod tests {
 
     #[test]
     fn build_embed_body_carries_multiple_texts() {
-        let p = OpenAiEmbedding::new("https://api.openai.com", "key", "text-embedding-3-small", 768);
+        let p = OpenAiEmbedding::new(
+            "https://api.openai.com",
+            "key",
+            "text-embedding-3-small",
+            768,
+        );
         let body = p.build_embed_body(&["a", "b", "c"]);
         assert_eq!(body["input"], serde_json::json!(["a", "b", "c"]));
     }

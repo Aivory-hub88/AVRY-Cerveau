@@ -3153,10 +3153,7 @@ async fn authorize_webhook_request(
     // deferred — not skipped — for claimants: an invalid secret is still
     // charged to the IP bucket in the mismatch arm below before the 401,
     // so brute-force protection is unchanged.
-    let claims_tenant = matches!(
-        tenant::TenantSelector::from_headers(headers),
-        Ok(Some(_))
-    );
+    let claims_tenant = matches!(tenant::TenantSelector::from_headers(headers), Ok(Some(_)));
 
     // ── The single authorization policy read for this request ──
     // (positioned above the per-IP gate so the deferral decision sees the
@@ -3935,7 +3932,9 @@ async fn handle_webhook_stream(
 
     use tokio_stream::StreamExt as _;
     let sse_stream = tokio_stream::wrappers::ReceiverStream::new(frame_rx).map(|frame| {
-        Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(frame.to_string()))
+        Ok::<_, std::convert::Infallible>(
+            axum::response::sse::Event::default().data(frame.to_string()),
+        )
     });
 
     axum::response::sse::Sse::new(sse_stream)
@@ -7372,7 +7371,8 @@ path = "{trigger_path}"
         let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
 
         // Read #1: no control configured at all.
-        let verdict = authorize_webhook_request(&state, test_connect_info().0, &HeaderMap::new()).await
+        let verdict = authorize_webhook_request(&state, test_connect_info().0, &HeaderMap::new())
+            .await
             .expect("no configured control -> authorization itself passes");
 
         // Concurrent operator action lands between authorization and dispatch.
@@ -7462,7 +7462,8 @@ path = "{trigger_path}"
         let tmp = tempfile::tempdir().unwrap();
         let (state, provider) = webhook_sop_state(&tmp, "/webhook");
 
-        let verdict = authorize_webhook_request(&state, test_connect_info().0, &HeaderMap::new()).await
+        let verdict = authorize_webhook_request(&state, test_connect_info().0, &HeaderMap::new())
+            .await
             .expect("no configured control -> authorization itself passes");
 
         // Simulate the parse/match window: config mutates before dispatch.
@@ -7511,7 +7512,8 @@ path = "{trigger_path}"
         let (state, _provider) = webhook_sop_state(&tmp, "/sop/deploy");
 
         let unconfigured =
-            authorize_webhook_request(&state, test_connect_info().0, &HeaderMap::new()).await
+            authorize_webhook_request(&state, test_connect_info().0, &HeaderMap::new())
+                .await
                 .expect("no control configured");
         let before = require_sop_dispatch_credentials(unconfigured).is_ok();
 
@@ -8220,7 +8222,8 @@ path = "{trigger_path}"
             "channel listener aliases must never become gateway credentials"
         );
         assert!(
-            authorize_webhook_request(&state, test_connect_info().0, &HeaderMap::new()).await
+            authorize_webhook_request(&state, test_connect_info().0, &HeaderMap::new())
+                .await
                 .map(require_sop_dispatch_credentials)
                 .is_ok_and(|dispatch| dispatch.is_err()),
             "multiple channel aliases without a gateway credential must fail closed"

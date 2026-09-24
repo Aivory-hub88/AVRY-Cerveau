@@ -727,15 +727,17 @@ fn apply_skill_bundle(
             return;
         }
     };
-    let dir =
-        match zeroclaw_config::skill_bundles::resolve_directory(config, install_root, bundle_alias)
-        {
-            Ok(d) => d,
-            Err(e) => {
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "bundle": bundle_alias, "e": e.to_string()})), "skipping skill bundle: ");
-                return;
-            }
-        };
+    let dir = match zeroclaw_config::skill_bundles::resolve_directory(
+        config,
+        install_root,
+        bundle_alias,
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "bundle": bundle_alias, "e": e.to_string()})), "skipping skill bundle: ");
+            return;
+        }
+    };
     let (bundle_skills, bundle_dropped) = load_skills_from_directory(&dir, allow_scripts);
     dropped.extend(bundle_dropped.into_iter().map(|mut d| {
         d.origin_hint = "bundle".into();

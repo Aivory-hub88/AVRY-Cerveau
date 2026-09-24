@@ -1294,10 +1294,7 @@ mod tests {
         let ledger_path = tmp.path().join("state").join("costs.jsonl");
         let contents = fs::read_to_string(&ledger_path).unwrap();
         let record: CostRecord = serde_json::from_str(contents.lines().last().unwrap()).unwrap();
-        assert_eq!(
-            record.tenant_id.as_deref(),
-            Some("user-a.customer_service")
-        );
+        assert_eq!(record.tenant_id.as_deref(), Some("user-a.customer_service"));
     }
 
     #[test]

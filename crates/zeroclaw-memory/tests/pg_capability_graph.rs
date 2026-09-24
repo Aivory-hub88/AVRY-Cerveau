@@ -62,10 +62,7 @@ async fn capability_graph_end_to_end() {
 
     // ── Scenario 2: co-activation creates a learned edge, reranking boosts it ──
     graph
-        .record_co_activation(
-            "tenant-a",
-            &["srv__x".to_string(), "srv__b".to_string()],
-        )
+        .record_co_activation("tenant-a", &["srv__x".to_string(), "srv__b".to_string()])
         .await;
     let ranked = graph
         .rerank(

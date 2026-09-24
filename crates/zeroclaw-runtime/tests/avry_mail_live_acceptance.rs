@@ -103,8 +103,9 @@ fn phase1_wraps_and_flags_a_real_mcp_servers_injection_payload_but_never_blocks(
     // history — reproduce that wrap here to prove the full shape the model
     // actually sees.
     let tool_name = "avry_mail__get_thread_memory";
-    let wrapped =
-        format!("<untrusted_tool_result source=\"{tool_name}\">\n{sanitized}\n</untrusted_tool_result>");
+    let wrapped = format!(
+        "<untrusted_tool_result source=\"{tool_name}\">\n{sanitized}\n</untrusted_tool_result>"
+    );
     assert!(wrapped.starts_with("<untrusted_tool_result source=\"avry_mail__get_thread_memory\">"));
     assert!(wrapped.trim_end().ends_with("</untrusted_tool_result>"));
 

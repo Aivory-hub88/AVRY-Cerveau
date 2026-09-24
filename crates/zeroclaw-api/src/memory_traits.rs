@@ -728,7 +728,9 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         // Over-fetch before filtering client-side, since an unknown fraction
         // of the unfiltered top-`limit` results won't be Conversation rows.
         let over_fetch = limit.saturating_mul(4).max(limit).min(500);
-        let mut entries = self.recall(query, over_fetch, session_id, since, until).await?;
+        let mut entries = self
+            .recall(query, over_fetch, session_id, since, until)
+            .await?;
         entries.retain(|e| matches!(e.category, MemoryCategory::Conversation));
         entries.truncate(limit);
         Ok(entries)

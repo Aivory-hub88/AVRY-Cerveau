@@ -347,7 +347,12 @@ pub(crate) fn preactivate_always_filter_groups(
     let mut activated_names: HashSet<String> = HashSet::new();
     let always_patterns: Vec<&str> = groups
         .iter()
-        .filter(|group| matches!(group.mode, ToolFilterGroupMode::Always | ToolFilterGroupMode::Preload))
+        .filter(|group| {
+            matches!(
+                group.mode,
+                ToolFilterGroupMode::Always | ToolFilterGroupMode::Preload
+            )
+        })
         .flat_map(|group| group.tools.iter().map(String::as_str))
         .collect();
     if always_patterns.is_empty() {
@@ -3678,7 +3683,15 @@ pub async fn process_message_streamed(
     origin: TurnOrigin,
     event_tx: tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>,
 ) -> Result<String> {
-    process_message_impl(config, agent_alias, message, session_id, origin, Some(event_tx)).await
+    process_message_impl(
+        config,
+        agent_alias,
+        message,
+        session_id,
+        origin,
+        Some(event_tx),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -6569,7 +6582,8 @@ mod tests {
                             observer: &observer,
                             silent: true,
                             approval: None,
-                            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(
+                            ),
                             config: Some(&config),
                             max_tool_iterations: 3,
                             hooks: None,
@@ -6641,13 +6655,21 @@ mod tests {
 
         // Opted in + tenant turn: graph line is INSIDE the memory block, before the question.
         let msg = user_message_after_turn(cognee(true, sidecar.uri()), tenant()).await;
-        assert!(msg.starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN), "{msg}");
+        assert!(
+            msg.starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN),
+            "{msg}"
+        );
         assert!(
             msg.contains("- graph_knowledge: Toko Melati: Rp 50 juta, contact Bu Sari."),
             "{msg}"
         );
-        let close = msg.find(zeroclaw_memory::MEMORY_CONTEXT_CLOSE).expect("close tag");
-        assert!(msg.find("graph_knowledge").unwrap() < close, "graph line inside the tags");
+        let close = msg
+            .find(zeroclaw_memory::MEMORY_CONTEXT_CLOSE)
+            .expect("close tag");
+        assert!(
+            msg.find("graph_knowledge").unwrap() < close,
+            "graph line inside the tags"
+        );
         assert!(msg.ends_with("what about Toko Melati?"), "{msg}");
 
         // Not opted in: never touches the graph.
@@ -6657,9 +6679,13 @@ mod tests {
         let msg = user_message_after_turn(cognee(true, sidecar.uri()), None).await;
         assert!(!msg.contains("graph_knowledge"), "{msg}");
         // Sidecar down: the turn still completes with its ordinary memory context.
-        let msg = user_message_after_turn(cognee(true, "http://127.0.0.1:1".into()), tenant()).await;
+        let msg =
+            user_message_after_turn(cognee(true, "http://127.0.0.1:1".into()), tenant()).await;
         assert!(!msg.contains("graph_knowledge"), "{msg}");
-        assert!(msg.starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN), "{msg}");
+        assert!(
+            msg.starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN),
+            "{msg}"
+        );
     }
 
     #[tokio::test]
@@ -14712,8 +14738,16 @@ Let me check the result."#;
             tools: vec!["mail__*".into()],
             keywords: vec![],
         }];
-        assert!(mcp_tool_included_for_turn("mail__search_mail", &always, "x"));
-        assert!(!mcp_tool_included_for_turn("crm__create_lead", &always, "x"));
+        assert!(mcp_tool_included_for_turn(
+            "mail__search_mail",
+            &always,
+            "x"
+        ));
+        assert!(!mcp_tool_included_for_turn(
+            "crm__create_lead",
+            &always,
+            "x"
+        ));
         let _ = mcp;
     }
 
@@ -14733,10 +14767,26 @@ Let me check the result."#;
                 keywords: vec!["website".into()],
             },
         ];
-        assert!(mcp_tool_included_for_turn("mail__search_mail", &groups, "hello"));
-        assert!(!mcp_tool_included_for_turn("browser__open", &groups, "hello"));
-        assert!(mcp_tool_included_for_turn("browser__open", &groups, "open this website"));
-        assert!(!mcp_tool_included_for_turn("crm__create_lead", &groups, "hello"));
+        assert!(mcp_tool_included_for_turn(
+            "mail__search_mail",
+            &groups,
+            "hello"
+        ));
+        assert!(!mcp_tool_included_for_turn(
+            "browser__open",
+            &groups,
+            "hello"
+        ));
+        assert!(mcp_tool_included_for_turn(
+            "browser__open",
+            &groups,
+            "open this website"
+        ));
+        assert!(!mcp_tool_included_for_turn(
+            "crm__create_lead",
+            &groups,
+            "hello"
+        ));
     }
 
     #[test]
