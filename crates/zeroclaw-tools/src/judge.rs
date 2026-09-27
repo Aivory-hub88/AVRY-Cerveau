@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use zeroclaw_api::model_provider::ModelProvider;
-use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_api::model_provider::{ChatMessage, ChatRequest, ChatResponse, ModelProvider};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, ToolSpec};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_providers::ProviderDispatch;
@@ -102,10 +102,116 @@ fn build_judge_prompt(state: &Value, questions: &Map<String, Value>) -> String {
          and a Noul answer is {{\"noul\": 0.0-1.0}}. \
          `confidence` is your certainty in THIS answer, never permission to act. \
          Use no-match outcomes (\"other\"/low noul) instead of forcing a fit. \
+         If a `{SUBMIT_TOOL}` tool is offered, call it once with that object as \
+         its arguments instead of replying in text. \
          No explanation, no markdown, JSON only.\n\n\
          ## State\n```json\n{state_json}\n```\n\n## Questions\n{blocks}",
         blocks = blocks.join("\n")
     )
+}
+
+/// The one tool the judge offers when the provider calls tools natively.
+/// Its parameters are the answer schema, so the provider's own tool-call
+/// handling shapes the output (the extractor pattern Rig uses: a typed
+/// "submit" tool instead of free-text JSON). The call is never executed;
+/// its arguments are the answer envelope.
+const SUBMIT_TOOL: &str = "submit_judgments";
+
+/// Property keys every strict backend accepts (Anthropic rejects the whole
+/// request on one key outside this set; ADR-015 §1.1). Question ids that
+/// fail it keep the judge on the text path rather than risking a 400.
+fn is_schema_safe_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 64
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+/// JSON Schema for the answer envelope `{"answers": {...}}`, derived from
+/// the question definitions: Choice options become an `enum`, Score levels
+/// an integer range, Noul a 0..=1 number. Advisory only: `parse_answers`
+/// still validates every answer and fails closed.
+fn build_answers_schema(questions: &Map<String, Value>) -> Value {
+    let unit = json!({"type": "number", "minimum": 0.0, "maximum": 1.0});
+    let mut props = Map::new();
+    for (qid, q) in questions {
+        let schema = match q.get("type").and_then(|v| v.as_str()) {
+            Some("choice") => {
+                let options: Vec<&String> = q
+                    .get("criteria")
+                    .and_then(|v| v.as_object())
+                    .map(|m| m.keys().collect())
+                    .unwrap_or_default();
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "choice": {"type": "string", "enum": options},
+                        "confidence": unit,
+                    },
+                    "required": ["choice", "confidence"],
+                    "additionalProperties": false,
+                })
+            }
+            Some("score") => {
+                let levels = q
+                    .get("criteria")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let mut score = json!({"type": "integer", "minimum": 0});
+                if levels > 0 {
+                    score["maximum"] = json!(levels - 1);
+                }
+                json!({
+                    "type": "object",
+                    "properties": {"score": score, "confidence": unit},
+                    "required": ["score", "confidence"],
+                    "additionalProperties": false,
+                })
+            }
+            Some("noul") => json!({
+                "type": "object",
+                "properties": {"noul": unit},
+                "required": ["noul"],
+                "additionalProperties": false,
+            }),
+            // Unknown types are rejected by `parse_answer`; keep the schema
+            // permissive so the rejection names the question.
+            _ => json!({"type": "object"}),
+        };
+        props.insert(qid.clone(), schema);
+    }
+    let required: Vec<&String> = questions.keys().collect();
+    json!({
+        "type": "object",
+        "properties": {
+            "answers": {
+                "type": "object",
+                "properties": props,
+                "required": required,
+                "additionalProperties": false,
+            }
+        },
+        "required": ["answers"],
+        "additionalProperties": false,
+    })
+}
+
+/// Pull the answer envelope out of a response: the `submit_judgments` call
+/// when the model made one, otherwise the text body. Returns the envelope,
+/// which path produced it (echoed for shadow comparison), and the raw
+/// payload for error output.
+fn extract_envelope(response: &ChatResponse) -> (Result<Value, String>, &'static str, String) {
+    if let Some(call) = response.tool_calls.iter().find(|c| c.name == SUBMIT_TOOL) {
+        let parsed = serde_json::from_str(&call.arguments)
+            .map_err(|e| format!("{SUBMIT_TOOL} arguments are invalid JSON: {e}"));
+        return (parsed, "tool_call", call.arguments.clone());
+    }
+    let text = response.text.clone().unwrap_or_default();
+    let parsed = serde_json::from_str(strip_fences(&text))
+        .map_err(|e| format!("Judge returned invalid JSON: {e}"));
+    (parsed, "text", text)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -461,12 +567,32 @@ impl Tool for JudgeTool {
                     });
                 }
             };
+        // Offer the schema-typed submit tool only where tool calls are native
+        // and every question id is a safe schema key; otherwise the prompt's
+        // text envelope is the whole contract, as before.
+        let native_tools = model_provider
+            .capabilities_for_model(&self.default_model)
+            .native_tool_calling;
+        let submit_tool =
+            (native_tools && questions.keys().all(|k| is_schema_safe_key(k))).then(|| {
+                ToolSpec::new(
+                    SUBMIT_TOOL,
+                    "Submit one typed answer per question id. Call exactly once.",
+                    build_answers_schema(&questions),
+                )
+            });
+        let messages = [ChatMessage::user(prompt)];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: submit_tool.as_ref().map(std::slice::from_ref),
+            thinking: None,
+        };
         // Temperature fixed at 0: judgments must be deterministic.
         let response = match ProviderDispatch::from_ref(&*model_provider)
-            .simple_chat(&prompt, &self.default_model, Some(0.0))
+            .chat(request, &self.default_model, Some(0.0))
             .await
         {
-            Ok(text) => text,
+            Ok(r) => r,
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
@@ -477,13 +603,14 @@ impl Tool for JudgeTool {
         };
 
         // Fail-closed parse: any malformed answer is an error, never a guess.
-        let parsed: Value = match serde_json::from_str(strip_fences(&response)) {
+        let (parsed, extraction, response) = extract_envelope(&response);
+        let parsed = match parsed {
             Ok(v) => v,
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: response.clone().into(),
-                    error: Some(format!("Judge returned invalid JSON: {e}")),
+                    output: response.into(),
+                    error: Some(e),
                 });
             }
         };
@@ -535,6 +662,7 @@ impl Tool for JudgeTool {
                 "action": decision.action,
                 "reasons": decision.reasons,
                 "answers": answers_json,
+                "extraction": extraction,
             })
             .to_string()
             .into(),
@@ -734,6 +862,84 @@ mod tests {
             serde_json::from_value(json!({"intent": {"choice": "how_to", "confidence": 0.9}}))
                 .unwrap();
         assert!(parse_answers(&qs, &raw).is_err());
+    }
+
+    fn response(text: Option<&str>, calls: &[(&str, &str)]) -> ChatResponse {
+        ChatResponse {
+            text: text.map(str::to_string),
+            tool_calls: calls
+                .iter()
+                .map(|(name, args)| zeroclaw_api::model_provider::ToolCall {
+                    id: "call_1".into(),
+                    name: (*name).into(),
+                    arguments: (*args).into(),
+                    extra_content: None,
+                })
+                .collect(),
+            usage: None,
+            reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn schema_types_every_question() {
+        let s = build_answers_schema(&triage_questions());
+        let a = &s["properties"]["answers"];
+        assert_eq!(a["required"].as_array().unwrap().len(), 4);
+        assert_eq!(a["additionalProperties"], json!(false));
+        let intent_enum = a["properties"]["intent"]["properties"]["choice"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(intent_enum.contains(&json!("complaint")));
+        assert_eq!(intent_enum.len(), 3);
+        assert_eq!(
+            a["properties"]["severity"]["properties"]["score"]["maximum"],
+            json!(3)
+        );
+        assert_eq!(
+            a["properties"]["wants_human"]["properties"]["noul"]["maximum"],
+            json!(1.0)
+        );
+    }
+
+    #[test]
+    fn schema_safe_keys() {
+        assert!(is_schema_safe_key("intent"));
+        assert!(is_schema_safe_key("bant.need-1"));
+        assert!(!is_schema_safe_key(""));
+        assert!(!is_schema_safe_key("has space"));
+        assert!(!is_schema_safe_key(&"x".repeat(65)));
+    }
+
+    #[test]
+    fn extract_prefers_submit_call_over_text() {
+        let r = response(
+            Some("ignored"),
+            &[
+                ("other_tool", "{}"),
+                (SUBMIT_TOOL, r#"{"answers": {"a": {"noul": 0.1}}}"#),
+            ],
+        );
+        let (parsed, source, _) = extract_envelope(&r);
+        assert_eq!(source, "tool_call");
+        assert_eq!(parsed.unwrap()["answers"]["a"]["noul"], json!(0.1));
+    }
+
+    #[test]
+    fn extract_falls_back_to_fenced_text() {
+        let r = response(Some("```json\n{\"answers\": {}}\n```"), &[]);
+        let (parsed, source, _) = extract_envelope(&r);
+        assert_eq!(source, "text");
+        assert!(parsed.unwrap()["answers"].is_object());
+    }
+
+    #[test]
+    fn extract_rejects_bad_submit_arguments() {
+        let r = response(None, &[(SUBMIT_TOOL, "{\"answers\": ")]);
+        let (parsed, source, raw) = extract_envelope(&r);
+        assert_eq!(source, "tool_call");
+        assert!(parsed.is_err());
+        assert_eq!(raw, "{\"answers\": ");
     }
 
     #[test]
