@@ -3593,12 +3593,13 @@ async fn webhook_prelude(
                     let tenant_custom_mcp_servers = tenant::TenantCustomMcpResolver::global()
                         .resolve(&sel)
                         .await;
-                    Some(tenant::build_tenant_context(
+                    Some(tenant::build_tenant_context_with_active(
                         &sel,
                         persona.as_deref(),
                         connected_toolkits,
                         disabled_toolkits,
                         tenant_custom_mcp_servers,
+                        tenant::parse_active_agents(headers),
                     ))
                 }
                 Err(e) => {

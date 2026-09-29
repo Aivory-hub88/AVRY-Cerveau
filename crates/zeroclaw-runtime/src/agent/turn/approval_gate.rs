@@ -543,6 +543,7 @@ mod tests {
             connected_toolkits: Vec::new(),
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: Vec::new(),
+            active_agents: None,
         });
         let turn_origin = Arc::new(TurnOriginContext {
             session_id: Some("sess-1".to_string()),

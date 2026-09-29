@@ -322,6 +322,27 @@ pub fn build_tenant_context(
     disabled_toolkits: Vec<String>,
     tenant_custom_mcp_servers: Vec<zeroclaw_runtime::agent::tenant::TenantCustomMcpServer>,
 ) -> Arc<TenantContext> {
+    build_tenant_context_with_active(
+        sel,
+        persona,
+        connected_toolkits,
+        disabled_toolkits,
+        tenant_custom_mcp_servers,
+        None,
+    )
+}
+
+/// [`build_tenant_context`] plus the tenant's active agents (ADR-020), parsed
+/// from `X-Active-Agents` by [`parse_active_agents`]. Callers with no header
+/// in hand (e.g. approval resume) use the plain builder and get `None`.
+pub fn build_tenant_context_with_active(
+    sel: &TenantSelector,
+    persona: Option<&TenantPersona>,
+    connected_toolkits: Vec<String>,
+    disabled_toolkits: Vec<String>,
+    tenant_custom_mcp_servers: Vec<zeroclaw_runtime::agent::tenant::TenantCustomMcpServer>,
+    active_agents: Option<Vec<String>>,
+) -> Arc<TenantContext> {
     Arc::new(TenantContext {
         tenant_id: sel.tenant_id(),
         platform_user_id: sel.user_id.clone(),
@@ -330,7 +351,46 @@ pub fn build_tenant_context(
         connected_toolkits,
         disabled_toolkits,
         tenant_custom_mcp_servers,
+        active_agents,
     })
+}
+
+/// Max entries honoured from `X-Active-Agents` (there are six product types;
+/// the cap only bounds a hostile header).
+const ACTIVE_AGENTS_MAX: usize = 16;
+
+/// Parse the bridge's `X-Active-Agents: a,b,c` header (ADR-020).
+///
+/// Deliberately lenient, unlike the tenant headers: this only ever *narrows*
+/// delegation, so a missing, empty or malformed value yields `None` (no
+/// filtering — today's behaviour) rather than rejecting the turn. Entries
+/// are trimmed, must match `[a-z0-9_]{1,64}`, and are de-duplicated; any bad
+/// entry invalidates the whole header so a half-parsed set never silently
+/// hides teammates.
+pub fn parse_active_agents(headers: &HeaderMap) -> Option<Vec<String>> {
+    let raw = headers.get("X-Active-Agents")?.to_str().ok()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let mut out: Vec<String> = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty()
+            || part.len() > 64
+            || !part
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            return None;
+        }
+        if !out.iter().any(|existing| existing == part) {
+            out.push(part.to_owned());
+        }
+        if out.len() > ACTIVE_AGENTS_MAX {
+            return None;
+        }
+    }
+    Some(out)
 }
 
 /// Read-only resolver for which Composio toolkits a tenant has a live
@@ -841,6 +901,48 @@ mod tests {
                 "should reject {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn active_agents_header_parses_and_dedupes() {
+        let h = headers(&[(
+            "x-active-agents",
+            "leads_qualifier, customer_service,leads_qualifier",
+        )]);
+        assert_eq!(
+            parse_active_agents(&h),
+            Some(vec![
+                "leads_qualifier".to_string(),
+                "customer_service".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn active_agents_header_absent_empty_or_malformed_means_no_filter() {
+        assert_eq!(parse_active_agents(&headers(&[])), None);
+        assert_eq!(
+            parse_active_agents(&headers(&[("x-active-agents", "  ")])),
+            None
+        );
+        // one bad entry invalidates the whole header
+        for bad in ["a,,b", "a,B", "a;b", "a b", "a,../b"] {
+            assert_eq!(
+                parse_active_agents(&headers(&[("x-active-agents", bad)])),
+                None,
+                "{bad:?}"
+            );
+        }
+        let long = vec!["x"; ACTIVE_AGENTS_MAX + 1]
+            .iter()
+            .enumerate()
+            .map(|(i, x)| format!("{x}{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            parse_active_agents(&headers(&[("x-active-agents", &long)])),
+            None
+        );
     }
 
     #[test]

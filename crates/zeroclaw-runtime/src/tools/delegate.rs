@@ -210,6 +210,29 @@ const PRODUCT_AGENT_TYPES: [&str; 6] = [
     "chief_of_staff",
 ];
 
+/// ADR-020: does the tenant's active set permit delegating to `target`?
+///
+/// `active` is `TenantContext::active_agents`. `None` (no header, or not a
+/// tenant turn) permits everything, i.e. today's static-config behaviour.
+/// With a set, only *product* agent types are filtered — host brains have no
+/// per-tenant deployment and are never gated by it.
+pub(super) fn active_set_permits(active: Option<&[String]>, target: &str) -> bool {
+    match active {
+        None => true,
+        Some(active) => {
+            !PRODUCT_AGENT_TYPES.contains(&target) || active.iter().any(|a| a == target)
+        }
+    }
+}
+
+/// [`active_set_permits`] against the current turn's tenant overlay.
+fn active_agents_permit(target: &str) -> bool {
+    match crate::agent::tenant::current_tenant() {
+        Some(tenant) => active_set_permits(tenant.active_agents.as_deref(), target),
+        None => true,
+    }
+}
+
 /// Tenant id that keys the memory scope of a delegate target's sub-turn.
 ///
 /// Tenant memory is keyed by `<platform_user_id>.<agent_type>` (see
@@ -246,6 +269,7 @@ pub(super) fn delegate_tenant_overlay(
             connected_toolkits: parent.connected_toolkits.clone(),
             disabled_toolkits: parent.disabled_toolkits.clone(),
             tenant_custom_mcp_servers: parent.tenant_custom_mcp_servers.clone(),
+            active_agents: parent.active_agents.clone(),
         })
     } else {
         parent
@@ -733,8 +757,7 @@ impl DelegateTool {
 
         // Resolve reachability and execution mode through `Config` so
         // admission follows the same canonical roster advertised to callers.
-        let Some(target_mode) = config.delegate_target_mode(&self.caller_alias, target_alias)
-        else {
+        let Some(target_mode) = self.scoped_target_mode(config, target_alias) else {
             let error = self.unreachable_target_error(config, target_alias);
             let caller_profile = config
                 .agents
@@ -790,6 +813,14 @@ impl DelegateTool {
     }
 
     fn unreachable_target_error(&self, config: &Config, target_alias: &str) -> String {
+        if !active_agents_permit(target_alias) {
+            return format!(
+                "delegate target {target_alias:?} is not one of this tenant's active agents; \
+                 it has not been deployed, so it cannot be reached from {:?}",
+                self.caller_alias
+            );
+        }
+
         let Some(caller) = config.agents.get(&self.caller_alias) else {
             return format!(
                 "delegate target {target_alias:?} is not reachable because caller {:?} \
@@ -854,17 +885,30 @@ impl DelegateTool {
         )
     }
 
+    /// `Config::delegate_target_mode` narrowed by the tenant's active agents
+    /// (ADR-020). Admission and the advertised roster both go through this so
+    /// they cannot disagree.
+    fn scoped_target_mode(
+        &self,
+        config: &Config,
+        target_alias: &str,
+    ) -> Option<DelegateExecutionMode> {
+        if !active_agents_permit(target_alias) {
+            return None;
+        }
+        config.delegate_target_mode(&self.caller_alias, target_alias)
+    }
+
     fn mode_for_target(&self, target_alias: &str) -> DelegateExecutionMode {
         self.root_config
             .as_ref()
-            .and_then(|config| config.delegate_target_mode(&self.caller_alias, target_alias))
+            .and_then(|config| self.scoped_target_mode(config, target_alias))
             .unwrap_or(DelegateExecutionMode::Bounded)
     }
 
     fn independent_always_ask_refusal(&self, target_alias: &str) -> Option<ToolResult> {
         let config = self.root_config.as_ref()?;
-        if config.delegate_target_mode(&self.caller_alias, target_alias)
-            != Some(DelegateExecutionMode::Independent)
+        if self.scoped_target_mode(config, target_alias) != Some(DelegateExecutionMode::Independent)
         {
             return None;
         }
@@ -1298,7 +1342,11 @@ impl Tool for DelegateTool {
         let mut agent_names: Vec<String> = if !delegation_permitted {
             Vec::new()
         } else if let Some(config) = self.root_config.as_ref() {
-            config.reachable_delegate_targets(&self.caller_alias)
+            config
+                .reachable_delegate_targets(&self.caller_alias)
+                .into_iter()
+                .filter(|target| active_agents_permit(target))
+                .collect()
         } else {
             let mut names: Vec<String> = self
                 .agents
@@ -1575,10 +1623,7 @@ impl DelegateTool {
     }
 
     fn mode_label(&self, target: &str) -> Option<&'static str> {
-        let mode = self
-            .root_config
-            .as_ref()?
-            .delegate_target_mode(&self.caller_alias, target)?;
+        let mode = self.scoped_target_mode(self.root_config.as_ref()?, target)?;
         Some(match mode {
             DelegateExecutionMode::Bounded => "bounded",
             DelegateExecutionMode::Independent => "independent",
@@ -3912,6 +3957,32 @@ impl Observer for NoopObserver {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn active_set_none_permits_everything() {
+        assert!(active_set_permits(None, "leads_qualifier"));
+        assert!(active_set_permits(None, "analyst_brain"));
+    }
+
+    #[test]
+    fn active_set_filters_only_product_agents() {
+        let active = vec!["customer_service".to_string(), "autonomous".to_string()];
+        let a = Some(active.as_slice());
+        assert!(active_set_permits(a, "customer_service"));
+        assert!(active_set_permits(a, "autonomous"));
+        assert!(!active_set_permits(a, "leads_qualifier"));
+        assert!(!active_set_permits(a, "chief_of_staff"));
+        // host brains are never gated by the tenant's deployments
+        assert!(active_set_permits(a, "analyst_brain"));
+        assert!(active_set_permits(a, "verifier_brain"));
+    }
+
+    #[test]
+    fn active_set_empty_hides_every_product_agent() {
+        let empty: Vec<String> = Vec::new();
+        assert!(!active_set_permits(Some(empty.as_slice()), "autonomous"));
+        assert!(active_set_permits(Some(empty.as_slice()), "analyst_brain"));
+    }
+
     use super::*;
     use crate::platform::{NativeRuntime, RuntimeAdapter};
     use crate::security::{AutonomyLevel, SecurityPolicy};
@@ -6469,6 +6540,7 @@ mod tests {
             connected_toolkits: Vec::new(),
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: Vec::new(),
+            active_agents: None,
         }))
     }
 
@@ -10066,6 +10138,101 @@ mod tests {
         DelegateTool::new(config.agents.clone(), None, caller_policy)
             .with_root_config(config)
             .with_caller_alias("caller")
+    }
+
+    fn tenant_with_active(
+        active: Option<Vec<String>>,
+    ) -> Option<Arc<crate::agent::tenant::TenantContext>> {
+        Some(Arc::new(crate::agent::tenant::TenantContext {
+            tenant_id: "u1.chief_of_staff".into(),
+            platform_user_id: "u1".into(),
+            agent_type: "chief_of_staff".into(),
+            persona: None,
+            connected_toolkits: Vec::new(),
+            disabled_toolkits: Vec::new(),
+            tenant_custom_mcp_servers: Vec::new(),
+            active_agents: active,
+        }))
+    }
+
+    #[tokio::test]
+    async fn undeployed_product_agent_is_unreachable_and_absent_from_roster() {
+        // ADR-020: config says chief_of_staff -> leads_qualifier is reachable,
+        // but a tenant that only deployed customer_service must not reach it,
+        // and the model must not be offered it either.
+        let config = config_with_two_agents("chief_of_staff", 5, "leads_qualifier", 5);
+        let caller_policy = Arc::new(
+            SecurityPolicy::for_agent(&config, "chief_of_staff").expect("caller policy resolves"),
+        );
+        let tool = DelegateTool::new(config.agents.clone(), None, caller_policy)
+            .with_root_config(config.clone())
+            .with_caller_alias("chief_of_staff");
+
+        // No tenant scope / no header: unchanged, reachable.
+        assert!(
+            tool.scoped_target_mode(&config, "leads_qualifier")
+                .is_some(),
+            "static config must still make the target reachable"
+        );
+
+        // The roster is advertised inside the `agent` parameter's description.
+        let roster_of = |tool: &DelegateTool| -> String {
+            tool.parameters_schema()["properties"]["agent"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        // Active set omits the target: refused with the deployment-specific error.
+        crate::agent::tenant::TENANT_CONTEXT
+            .scope(
+                tenant_with_active(Some(vec![
+                    "chief_of_staff".into(),
+                    "customer_service".into(),
+                ])),
+                async {
+                    assert!(
+                        tool.scoped_target_mode(&config, "leads_qualifier")
+                            .is_none()
+                    );
+                    assert!(
+                        tool.unreachable_target_error(&config, "leads_qualifier")
+                            .contains("not one of this tenant's active agents")
+                    );
+                    assert!(!roster_of(&tool).contains("leads_qualifier"));
+                },
+            )
+            .await;
+
+        // Active set includes the target: reachable again.
+        crate::agent::tenant::TENANT_CONTEXT
+            .scope(
+                tenant_with_active(Some(vec![
+                    "chief_of_staff".into(),
+                    "leads_qualifier".into(),
+                ])),
+                async {
+                    assert!(
+                        tool.scoped_target_mode(&config, "leads_qualifier")
+                            .is_some()
+                    );
+                    assert!(
+                        roster_of(&tool).contains("leads_qualifier"),
+                        "roster assertion above would be vacuous if this fails"
+                    );
+                },
+            )
+            .await;
+
+        // Header absent (None) inside a tenant scope: no filtering.
+        crate::agent::tenant::TENANT_CONTEXT
+            .scope(tenant_with_active(None), async {
+                assert!(
+                    tool.scoped_target_mode(&config, "leads_qualifier")
+                        .is_some()
+                );
+            })
+            .await;
     }
 
     #[tokio::test]
