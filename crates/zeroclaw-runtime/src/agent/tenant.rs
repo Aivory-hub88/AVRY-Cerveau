@@ -123,6 +123,13 @@ pub struct TenantContext {
     /// `apply_toolkit_scope_gate` chain entirely, since they're not
     /// Composio-sourced) in `Config::mcp_servers_for_agent_and_tenant`.
     pub tenant_custom_mcp_servers: Vec<TenantCustomMcpServer>,
+    /// ADR-020: the tenant's deployed agent types, from the bridge's
+    /// `X-Active-Agents` header (deployments, plus the agent handling the
+    /// turn). `None` — header absent, empty or unparseable — means "no
+    /// filtering": delegation behaves exactly as the static config says.
+    /// When `Some`, product-agent delegate targets outside this set are
+    /// unreachable for this tenant (see `DelegateTool`).
+    pub active_agents: Option<Vec<String>>,
 }
 
 /// One tenant-registered MCP server, already decrypted and verified —
@@ -517,6 +524,7 @@ mod tests {
             connected_toolkits: Vec::new(),
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: Vec::new(),
+            active_agents: None,
         });
         TENANT_CONTEXT
             .scope(Some(ctx.clone()), async {
@@ -548,6 +556,7 @@ mod tests {
                         connected_toolkits: Vec::new(),
                         disabled_toolkits: Vec::new(),
                         tenant_custom_mcp_servers: Vec::new(),
+                        active_agents: None,
                     })),
                     "resolvable-empty-persona" => Some(Arc::new(TenantContext {
                         tenant_id: format!("{tenant_id}:{agent_type}"),
@@ -557,6 +566,7 @@ mod tests {
                         connected_toolkits: Vec::new(),
                         disabled_toolkits: Vec::new(),
                         tenant_custom_mcp_servers: Vec::new(),
+                        active_agents: None,
                     })),
                     _ => None,
                 }
@@ -621,6 +631,7 @@ mod tests {
             connected_toolkits: Vec::new(),
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: vec![sample_custom_server()],
+            active_agents: None,
         };
         let configs = ctx.custom_mcp_server_configs();
         assert_eq!(configs.len(), 1);
@@ -656,6 +667,7 @@ mod tests {
             connected_toolkits: Vec::new(),
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: vec![server],
+            active_agents: None,
         };
         assert_eq!(
             ctx.custom_mcp_server_configs()[0].transport,
@@ -676,6 +688,7 @@ mod tests {
             connected_toolkits: Vec::new(),
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: vec![server],
+            active_agents: None,
         };
         assert!(ctx.custom_mcp_server_configs()[0].headers.is_empty());
     }
@@ -690,6 +703,7 @@ mod tests {
             connected_toolkits: Vec::new(),
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: vec![sample_custom_server()],
+            active_agents: None,
         };
         assert!(ctx.is_tenant_custom_mcp_tool("tenant_orders__get_order"));
         assert!(!ctx.is_tenant_custom_mcp_tool("tenant_other__get_order"));
@@ -726,6 +740,7 @@ mod tests {
             connected_toolkits: Vec::new(),
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: vec![aivory_mail],
+            active_agents: None,
         };
         // The real thing: exempt from the hard floor.
         assert!(!ctx.is_tenant_custom_mcp_tool("tenant_aivory-mail__send_mail"));
@@ -750,6 +765,7 @@ mod tests {
             connected_toolkits: Vec::new(),
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: vec![lookalike],
+            active_agents: None,
         };
         assert!(ctx.is_tenant_custom_mcp_tool("tenant_aivory-mail__send_mail"));
     }
@@ -773,6 +789,7 @@ mod tests {
             connected_toolkits: Vec::new(),
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: vec![server],
+            active_agents: None,
         };
 
         let ctx = ctx_with(odoo("https://odoo-mcp.aivory.uk/mcp?token=abc"));

@@ -6644,6 +6644,7 @@ mod tests {
                 connected_toolkits: Vec::new(),
                 disabled_toolkits: Vec::new(),
                 tenant_custom_mcp_servers: Vec::new(),
+                active_agents: None,
             }))
         };
         let cognee = |auto_recall: bool, base_url: String| zeroclaw_config::schema::CogneeConfig {
