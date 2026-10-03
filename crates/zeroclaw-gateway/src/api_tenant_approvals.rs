@@ -352,6 +352,27 @@ fn continuation_prompt(
         .as_deref()
         .unwrap_or("(original message not captured)");
     match (decision, tool_result) {
+        // The decision was "yes" but the approved call itself did not run
+        // (connect/auth/tool error). Handing the raw failure to the model with
+        // "continue" made it retry the same call, which parked a fresh approval
+        // — an unbounded approve -> fail -> re-park loop. The approval is spent:
+        // tell the model so, forbid the retry, and have it report the error.
+        ("approve", Some(result)) if approved_call_failed(result) => {
+            let error = result
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(|| result.to_string(), str::to_string);
+            format!(
+                "[approval-resume:{}] The user asked: \"{origin}\". You called {} with arguments \
+                 {}, which required human approval. The user approved it, but the approved call \
+                 FAILED to run: {error}. That approval is now used up. Do NOT call {} again in \
+                 this reply and do NOT request another approval for it. Tell the user plainly \
+                 that the action did not go through, include the error above, and say what they \
+                 can do next (for example try again later or ask an operator). Do not claim the \
+                 action succeeded.",
+                row.id, row.tool_name, row.arguments, row.tool_name
+            )
+        }
         ("approve", Some(result)) => format!(
             "[approval-resume:{}] The user asked: \"{origin}\". You called {} with arguments \
              {}, which required human approval before it could run. The user approved it. \
@@ -367,6 +388,13 @@ fn continuation_prompt(
             row.id, row.tool_name, row.arguments
         ),
     }
+}
+
+/// True when `execute_approved_tool` reported that the approved call did not
+/// run (`{"success": false, ...}`). Anything else — including a payload with no
+/// `success` field — is treated as a result to continue from, as before.
+fn approved_call_failed(result: &serde_json::Value) -> bool {
+    result.get("success").and_then(serde_json::Value::as_bool) == Some(false)
 }
 
 /// Re-resolve fresh tenant context (persona, connected toolkits) exactly as
@@ -737,6 +765,55 @@ mod tests {
         assert!(prompt.contains("zendesk__reply_ticket"));
         assert!(prompt.contains("The user approved it"));
         assert!(prompt.contains("\"success\":true"));
+    }
+
+    fn failed_call_row() -> PendingApproval {
+        PendingApproval {
+            id: "pa_3".into(),
+            principal: "u1".into(),
+            tool_name: "composio-googledrive-share__GOOGLEDRIVE_CREATE_PERMISSION".into(),
+            arguments: "{\"role\":\"reader\"}".into(),
+            risk_tier: "irreversible".into(),
+            requested_at: "2026-01-01T00:00:00Z".into(),
+            status: "approved".into(),
+            resolved_at: None,
+            resolved_by: None,
+            tenant_id: Some("u1.autonomous".into()),
+            agent_type: Some("autonomous".into()),
+            session_id: Some("sess-1".into()),
+            origin_message: Some("share the doc".into()),
+            delivered_at: None,
+            verifier_finding: None,
+            schedule_id: None,
+        }
+    }
+
+    #[test]
+    fn a_failed_approved_call_tells_the_model_not_to_retry() {
+        let result = serde_json::json!({"success": false, "error": "unknown MCP tool `x`"});
+        let prompt = continuation_prompt(&failed_call_row(), "approve", Some(&result));
+        assert!(prompt.contains("FAILED to run: unknown MCP tool `x`"));
+        assert!(prompt.contains("Do NOT call composio-googledrive-share__GOOGLEDRIVE_CREATE_PERMISSION again"));
+        assert!(prompt.contains("do NOT request another approval"));
+        // Must not read like a success the model should build on.
+        assert!(!prompt.contains("incorporating this result"));
+        assert!(!prompt.contains("Result:"));
+    }
+
+    #[test]
+    fn a_successful_approved_call_keeps_the_continue_prompt() {
+        let result = serde_json::json!({"success": true, "output": "ok"});
+        let prompt = continuation_prompt(&failed_call_row(), "approve", Some(&result));
+        assert!(prompt.contains("incorporating this result"));
+        assert!(!prompt.contains("FAILED"));
+    }
+
+    #[test]
+    fn approved_call_failed_only_on_an_explicit_false() {
+        assert!(approved_call_failed(&serde_json::json!({"success": false})));
+        assert!(!approved_call_failed(&serde_json::json!({"success": true})));
+        assert!(!approved_call_failed(&serde_json::json!({"output": "no success field"})));
+        assert!(!approved_call_failed(&serde_json::json!("string")));
     }
 
     #[test]
