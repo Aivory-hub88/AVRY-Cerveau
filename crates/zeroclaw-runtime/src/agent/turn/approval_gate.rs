@@ -101,6 +101,48 @@ fn pending_id_of(outcome: &ToolExecutionOutcome) -> Option<&str> {
         .and_then(|v| v.as_str())
 }
 
+/// An identical call approved this many times inside the window is not parked
+/// again. Two allows one legitimate retry after a first approved attempt that
+/// did not finish; a third request means approving it again will not help.
+const REPARK_MAX_APPROVED: usize = 2;
+const REPARK_WINDOW_MINUTES: i64 = 15;
+
+/// `Some(deny outcome)` when this exact call has already been approved
+/// `REPARK_MAX_APPROVED` times within `REPARK_WINDOW_MINUTES`. A store read
+/// error returns `None`: the guard fails open, so a store hiccup can never
+/// block a legitimate approval (the normal gate still applies).
+fn repeated_approval_denial(
+    store: &crate::control_plane::pending_approvals::PendingApprovalsStore,
+    principal: &str,
+    tool_name: &str,
+    arguments: &str,
+) -> Option<ToolExecutionOutcome> {
+    let approved = store
+        .count_recent_approved(
+            principal,
+            tool_name,
+            arguments,
+            chrono::Duration::minutes(REPARK_WINDOW_MINUTES),
+        )
+        .ok()?;
+    if approved < REPARK_MAX_APPROVED {
+        return None;
+    }
+    Some(ToolExecutionOutcome {
+        output: format!(
+            "This exact call to {tool_name} was already approved {approved} times in the last \
+             {REPARK_WINDOW_MINUTES} minutes and still has not completed, so no new approval \
+             was requested. Do not try it again. Tell the user it keeps failing after approval, \
+             and ask them to check the integration or contact an operator."
+        ),
+        success: false,
+        error_reason: Some("repeated approval for an identical call".to_string()),
+        duration: Duration::ZERO,
+        receipt: None,
+        output_data: None,
+    })
+}
+
 async fn gate_tool_approval_inner(
     ctx: &TurnCtx<'_>,
     tool_name: &str,
@@ -132,6 +174,16 @@ async fn gate_tool_approval_inner(
         // before — out-of-band execution only.
         let pending_id: Option<String> = match ctx.approval.and_then(|mgr| mgr.pending_store()) {
             Some(store) => {
+                // Hard guard against an approve -> not-done -> re-park loop:
+                // the same call already approved REPARK_MAX_APPROVED times in
+                // the last REPARK_WINDOW_MINUTES is not parked again. The
+                // continuation prompt already tells the model not to retry;
+                // this does not rely on it obeying.
+                if let Some(denied) =
+                    repeated_approval_denial(store, &principal, tool_name, &tool_args.to_string())
+                {
+                    return ApprovalGateOutcome::Deny(denied);
+                }
                 let id = match store.insert_with_context(
                     &principal,
                     tool_name,
@@ -630,5 +682,43 @@ mod tests {
         assert_eq!(row.tool_name, "finalize_invoice");
         assert_eq!(row.tenant_id.as_deref(), Some("u1.leads_qualifier"));
         assert_eq!(row.agent_type.as_deref(), Some("leads_qualifier"));
+    }
+
+    fn approve_once(store: &PendingApprovalsStore, principal: &str, tool: &str, args: &str) {
+        let id = store.insert(principal, tool, args, "irreversible").unwrap();
+        assert!(store.resolve(&id, "approved", "tenant-webhook").unwrap());
+    }
+
+    #[test]
+    fn repeated_approval_guard_allows_a_retry_then_refuses_the_next_park() {
+        let store = PendingApprovalsStore::new_in_memory().unwrap();
+        let (tool, args) = ("composio-x__DO_THING", r#"{"a":1}"#);
+
+        assert!(repeated_approval_denial(&store, "u1", tool, args).is_none());
+        approve_once(&store, "u1", tool, args);
+        // One approval: a legitimate retry is still allowed.
+        assert!(repeated_approval_denial(&store, "u1", tool, args).is_none());
+        approve_once(&store, "u1", tool, args);
+        // Two approvals of the identical call and it is back again: refuse.
+        let denied = repeated_approval_denial(&store, "u1", tool, args)
+            .expect("third request for an identical, twice-approved call is refused");
+        assert!(!denied.success);
+        assert!(denied.output.contains("approved 2 times"));
+        assert!(denied.output.contains("Do not try it again"));
+        assert_eq!(
+            denied.error_reason.as_deref(),
+            Some("repeated approval for an identical call")
+        );
+    }
+
+    #[test]
+    fn repeated_approval_guard_ignores_other_calls_and_other_tenants() {
+        let store = PendingApprovalsStore::new_in_memory().unwrap();
+        let (tool, args) = ("composio-x__DO_THING", r#"{"a":1}"#);
+        approve_once(&store, "u1", tool, args);
+        approve_once(&store, "u1", tool, args);
+        assert!(repeated_approval_denial(&store, "u1", tool, r#"{"a":2}"#).is_none());
+        assert!(repeated_approval_denial(&store, "u1", "composio-x__OTHER", args).is_none());
+        assert!(repeated_approval_denial(&store, "u2", tool, args).is_none());
     }
 }
