@@ -261,6 +261,42 @@ impl PendingApprovalsStore {
         Ok(id)
     }
 
+    /// How many times this exact call (same principal, tool and arguments) has
+    /// been *approved* within the last `within`. Used by the approval gate to
+    /// stop an approve -> still-not-done -> re-park loop: an approval that
+    /// keeps coming back for an identical call means approving it again will
+    /// not help, so the gate refuses to park another one.
+    pub fn count_recent_approved(
+        &self,
+        principal: &str,
+        tool_name: &str,
+        arguments: &str,
+        within: chrono::Duration,
+    ) -> Result<usize> {
+        let cutoff = chrono::Utc::now() - within;
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT resolved_at FROM pending_approvals
+              WHERE principal = ?1 AND tool_name = ?2 AND arguments = ?3
+                AND status = 'approved' AND resolved_at IS NOT NULL
+              ORDER BY resolved_at DESC LIMIT 50",
+        )?;
+        let rows = stmt.query_map(params![principal, tool_name, arguments], |r| {
+            r.get::<_, String>(0)
+        })?;
+        let mut n = 0;
+        for resolved_at in rows {
+            // An unparseable timestamp is not counted: the guard must never
+            // block a legitimate approval because of a malformed row.
+            if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&resolved_at?) {
+                if t.with_timezone(&chrono::Utc) >= cutoff {
+                    n += 1;
+                }
+            }
+        }
+        Ok(n)
+    }
+
     /// Move a row's `requested_at` backwards so an age-dependent test does
     /// not have to sleep. Test-only: nothing in the running system may
     /// rewrite when an approval was asked for.
@@ -720,5 +756,68 @@ mod tests {
         let candidates = store.list_undelivered_resolved().unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].id, candidate);
+    }
+
+    #[test]
+    fn count_recent_approved_counts_only_identical_recent_approvals() {
+        let store = PendingApprovalsStore::new_in_memory().unwrap();
+        let tool = "composio-googledrive-share__GOOGLEDRIVE_CREATE_PERMISSION";
+        let args = r#"{"file_id":"f1","role":"reader"}"#;
+        let approve = |tool: &str, args: &str, principal: &str| {
+            let id = store.insert(principal, tool, args, "irreversible").unwrap();
+            assert!(store.resolve(&id, "approved", "tenant-webhook").unwrap());
+            id
+        };
+        approve(tool, args, "u1");
+        approve(tool, args, "u1");
+        // Different arguments, different tool, different principal: not counted.
+        approve(tool, r#"{"file_id":"f2","role":"reader"}"#, "u1");
+        approve("other__tool", args, "u1");
+        approve(tool, args, "u2");
+        // Denied and still-pending rows are not approvals.
+        let denied = store.insert("u1", tool, args, "irreversible").unwrap();
+        store.resolve(&denied, "denied", "tenant-webhook").unwrap();
+        store.insert("u1", tool, args, "irreversible").unwrap();
+
+        let window = chrono::Duration::minutes(15);
+        assert_eq!(
+            store
+                .count_recent_approved("u1", tool, args, window)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .count_recent_approved("u2", tool, args, window)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .count_recent_approved("u3", tool, args, window)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn count_recent_approved_ignores_approvals_outside_the_window() {
+        let store = PendingApprovalsStore::new_in_memory().unwrap();
+        let id = store.insert("u1", "t__x", "{}", "irreversible").unwrap();
+        store.resolve(&id, "approved", "tenant-webhook").unwrap();
+        // Age the resolution past the window.
+        {
+            let old = (chrono::Utc::now() - chrono::Duration::minutes(40)).to_rfc3339();
+            let conn = store.conn.lock();
+            conn.execute(
+                "UPDATE pending_approvals SET resolved_at = ?2 WHERE id = ?1",
+                params![id, old],
+            )
+            .unwrap();
+        }
+        let n = store
+            .count_recent_approved("u1", "t__x", "{}", chrono::Duration::minutes(15))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 }
