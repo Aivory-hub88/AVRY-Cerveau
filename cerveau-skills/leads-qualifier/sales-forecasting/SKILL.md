@@ -77,6 +77,7 @@ the warning.
 - `open_quotes` (`count`, optional `value`) and `follow_up_close_rate`: when they want quotes already out included. If they track a follow-up or second-connect close rate, pass it as `follow_up_close_rate` (0–1); otherwise the historical close rate is used.
 - `currency` (ISO code, ask if unknown, never assume) and `units_label` (e.g. "squares").
 - `weighting`: leave as `recent` unless the user asks for a plain average.
+- `rate_overrides`: only for a what-if (see step 5).
 
 ### 4. Report the result
 
@@ -91,11 +92,27 @@ Lead with the answer to what they asked, then the supporting numbers:
 End with one concrete next action, usually the stage with the biggest drop-off.
 
 Never put a number on a what-if ("raising the hold rate to 85% adds N jobs")
-unless that number came from a second `sales_funnel_forecast` call in this
-turn, made with the adjusted counts (e.g. `appointments_held` scaled so the
-hold rate is the new value). Mental estimates of chained rates are
-routinely off by an order of magnitude. If you did not make that call, name
-the weak stage without a figure and offer to run the scenario.
+unless that number came from a `sales_funnel_forecast` call with
+`rate_overrides`. Mental estimates of chained rates are routinely off by an
+order of magnitude. If you did not make that call, name the weak stage
+without a figure and offer to run the scenario.
+
+### 5. What-if scenarios
+
+To answer "what if the hold rate were 85%?", call the tool again with the
+SAME weeks and `rate_overrides: {"hold_rate": 0.85}`. Overridable rates:
+`set_rate`, `bleed_rate`, `hold_rate`, `presentation_rate`,
+`quotation_rate`, `close_rate`; several can be combined in one call. The
+result keeps the baseline and adds a `scenario` block (projection, totals,
+`change_vs_baseline`, and the leads needed for the target at the new rates).
+
+Never simulate a scenario by editing the weekly counts. Raising
+`appointments_held` alone also lowers the presentation rate, so closes come
+out unchanged and the scenario looks worthless when it is not.
+
+Keep the weekly table you used in the conversation (repeat it back once
+before the first call), so a follow-up scenario can reuse it without asking
+the user to paste it again.
 
 ## Examples
 
