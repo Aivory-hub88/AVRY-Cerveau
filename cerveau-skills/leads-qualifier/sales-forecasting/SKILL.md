@@ -88,11 +88,14 @@ Lead with the answer to what they asked, then the supporting numbers:
 4. Expected closes from open quotes, if requested.
 5. The tool's `warnings` and `assumptions`, in plain words. Always mention that the forecast assumes this week's leads convert within the forecast window (there is no lag model).
 
-End with one concrete next action, usually the stage with the biggest drop-off
-and what moving it would be worth, e.g. "lifting the hold rate from 70% to 80%
-adds about 3 jobs a week at your current lead flow". If you give a figure like
-that, get it by calling the tool again with adjusted counts, not by
-estimating it yourself.
+End with one concrete next action, usually the stage with the biggest drop-off.
+
+Never put a number on a what-if ("raising the hold rate to 85% adds N jobs")
+unless that number came from a second `sales_funnel_forecast` call in this
+turn, made with the adjusted counts (e.g. `appointments_held` scaled so the
+hold rate is the new value). Mental estimates of chained rates are
+routinely off by an order of magnitude. If you did not make that call, name
+the weak stage without a figure and offer to run the scenario.
 
 ## Examples
 
