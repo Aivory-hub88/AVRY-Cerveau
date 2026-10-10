@@ -49,18 +49,19 @@ trend; fewer gives a flat projection (the tool warns about this).
 Use only complete weeks: the window ends on the Sunday before the current
 week and starts N Mondays earlier (for 12 weeks on Saturday 2026-10-10, that
 is Monday 2026-07-13 to Sunday 2026-10-04, ISO weeks 29–40). Leave the
-current week out; a half-finished week drags the trend down. Write the list
-of N weeks out first, then fill it in:
-- A source that groups by week (Odoo `read_group`) returns no row for a week
-  with no records. That week is a real zero, not missing data: keep it in the
-  list with 0 for every stage. Dropping it shortens the window and hides a
-  slowdown, which is exactly what a forecast should show.
-- Match each returned group to its week by the week start date in the
-  group's value for the groupby key (e.g. `2026-07-13`), not by parsing
-  a label such as "W29 2026".
-- Pass exactly N week objects to the tool. If the business has less history
-  than asked for (the first records start partway through the window), use
-  what exists and say how many weeks the forecast is built on.
+current week out; a half-finished week drags the trend down.
+
+Let the tool hold the window; do not lay it out yourself:
+- Pass `window_start` (that Monday) and `window_weeks` (N).
+- In `weeks`, pass only the weeks your query returned, each with its
+  `week_start` taken from the group's week start date (e.g. `2026-07-13`),
+  not parsed from a label such as "W29 2026".
+- A week-grouped query (Odoo `read_group`) returns no row for an empty week.
+  Do not add those weeks yourself; the tool counts every week in the window
+  that you did not pass as zero, and says which ones.
+- If the business has less history than the window (records start partway
+  through), the leading zero weeks are real; say how many weeks actually
+  have data.
 
 **If the tenant has Odoo connected** (Od-MCP tools), count per week with
 `odoo_read_group`, grouping by the date field with a `:week` suffix. Typical
@@ -123,8 +124,11 @@ the warning.
 
 Every number in your answer comes from a tool result: the weekly rows you
 passed in, or a field the forecast returned. Do no arithmetic of your own,
-not even a column total. For the total of the history table, quote
-`history_totals`; if a total you want is not in the result, leave it out.
+not even a column total. The weekly table you show is the returned
+`history` (zero-filled weeks included, marked as having no records), and its
+totals are `history_totals`; never rebuild the table from your own notes. Say
+how many weeks it covers using `weeks_used`. If a total you want is not in
+the result, leave it out.
 When you list the Odoo models and filters you used, copy the domain from the
 calls you actually made, not from this skill's suggested mapping.
 
