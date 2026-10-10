@@ -55,8 +55,9 @@ of N weeks out first, then fill it in:
   with no records. That week is a real zero, not missing data: keep it in the
   list with 0 for every stage. Dropping it shortens the window and hides a
   slowdown, which is exactly what a forecast should show.
-- Match each returned group to its week by the group's date range
-  (`__range` / `__domain` in the result), not by parsing the label.
+- Match each returned group to its week by the week start date in the
+  group's value for the groupby key (e.g. `2026-07-13`), not by parsing
+  a label such as "W29 2026".
 - Pass exactly N week objects to the tool. If the business has less history
   than asked for (the first records start partway through the window), use
   what exists and say how many weeks the forecast is built on.
@@ -80,6 +81,11 @@ stage names and fields with `odoo_get_model_metadata` or a small
 calls to the same tool, before you reach the forecast. Plan for at most six
 Od-MCP calls in total, one per stage, then call `sales_funnel_forecast` in
 the same turn:
+- `odoo_read_group` arguments: the date bucket goes ONLY in `groupby`
+  (`["date_order:week"]`); `fields` holds only aggregates written as
+  `field:agg` (e.g. `["amount_untaxed:sum"]`), and the count comes back on its
+  own. Never repeat `date_order:week` in `fields`: on Odoo 19 that is read as
+  an aggregate and every call fails.
 - Use a single `odoo_read_group` per model and date field, covering the
   whole window with a closed date domain, e.g.
   `["date_order", ">=", "2026-07-13"], ["date_order", "<", "2026-10-05"]`
