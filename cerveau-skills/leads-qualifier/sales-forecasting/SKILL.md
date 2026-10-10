@@ -51,14 +51,30 @@ mapping on a standard Odoo CRM + Sales setup:
 
 - `leads`: `crm.lead`, group by `create_date:week`, `["type", "in", ["lead", "opportunity"]]`. Include archived lost leads with `["active", "in", [true, false]]`, or the bleed rate will look better than it is.
 - `appointments_set` / `appointments_held`: `calendar.event` linked to an opportunity (`["opportunity_id", "!=", false]`), group by `start:week`. Held vs set needs a field or tag the business uses for no-shows; ask if it is not obvious.
-- `quotes`: `sale.order`, group by `create_date:week`, with `["opportunity_id", "!=", false]` if they only want quotes from the CRM pipeline.
-- `closes` and `revenue`: `sale.order` with `["state", "=", "sale"]`, group by `date_order:week`, sum `amount_untaxed`.
+- `quotes`: `sale.order`, group by `date_order:week` (the quotation date), `["state", "!=", "cancel"]`, plus `["opportunity_id", "!=", false]` if they only want quotes from the CRM pipeline. Avoid `create_date` on orders: imported or migrated orders all carry the import date.
+- `closes` and `revenue`: `sale.order` with `["state", "=", "sale"]`, group by `date_order:week`, sum `amount_untaxed`. One call returns both the count and the sum.
 - `units`: sum `product_uom_qty` on `sale.order.line` of confirmed orders, filtered to the product(s) sold per unit (e.g. roofing per square). Ask which product or unit of measure is the unit.
 - `cost`: the `margin` field on `sale.order` (cost = `amount_untaxed - margin`) when the sale-margin module is installed; otherwise ask how they track job cost.
 
 Every business configures Odoo differently. Before trusting a mapping, check
 stage names and fields with `odoo_get_model_metadata` or a small
 `odoo_search_read`, and tell the user which models and filters you used.
+
+**Stay within the call budget.** The runtime stops a turn after about nine
+calls to the same tool, before you reach the forecast. Plan for at most six
+Od-MCP calls in total, one per stage, then call `sales_funnel_forecast` in
+the same turn:
+- Use a single `odoo_read_group` per model and date field, covering all 12
+  weeks with a date domain (e.g. `["date_order", ">=", "<12 weeks ago>"]`);
+  never one call per week.
+- Check metadata only for a field you are unsure exists (e.g. `margin`), and
+  only once. If a mapping you saved earlier is in `graph_recall`, skip the
+  checks.
+- If a stage turns out to be empty or unusable (e.g. almost no
+  `calendar.event` linked to opportunities), drop that stage and carry on
+  with the ones you have. Do not keep probing. Tell the user in your answer.
+- If you still run short, stop pulling, run the forecast on the stages you
+  have, and offer to add the rest next turn.
 
 **If there is no connected CRM/ERP**, or a stage cannot be found in it, ask
 the user for the weekly numbers directly. A pasted table or spreadsheet is
