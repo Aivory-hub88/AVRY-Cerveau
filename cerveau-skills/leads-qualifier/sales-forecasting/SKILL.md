@@ -121,6 +121,13 @@ the warning.
 
 ### 4. Report the result
 
+Every number in your answer comes from a tool result: the weekly rows you
+passed in, or a field the forecast returned. Do no arithmetic of your own,
+not even a column total. For the total of the history table, quote
+`history_totals`; if a total you want is not in the result, leave it out.
+When you list the Odoo models and filters you used, copy the domain from the
+calls you actually made, not from this skill's suggested mapping.
+
 Lead with the answer to what they asked, then the supporting numbers:
 
 1. Projected jobs and revenue for the horizon (with the low–high range when returned).
