@@ -45,6 +45,22 @@ Check `graph_recall` for a saved mapping before asking.
 Aim for 8–12 weeks, oldest first. Four or more weeks lets the tool apply a
 trend; fewer gives a flat projection (the tool warns about this).
 
+**Fix the week window before pulling anything.** Weeks run Monday to Sunday.
+Use only complete weeks: the window ends on the Sunday before the current
+week and starts N Mondays earlier (for 12 weeks on Saturday 2026-10-10, that
+is Monday 2026-07-13 to Sunday 2026-10-04, ISO weeks 29–40). Leave the
+current week out; a half-finished week drags the trend down. Write the list
+of N weeks out first, then fill it in:
+- A source that groups by week (Odoo `read_group`) returns no row for a week
+  with no records. That week is a real zero, not missing data: keep it in the
+  list with 0 for every stage. Dropping it shortens the window and hides a
+  slowdown, which is exactly what a forecast should show.
+- Match each returned group to its week by the group's date range
+  (`__range` / `__domain` in the result), not by parsing the label.
+- Pass exactly N week objects to the tool. If the business has less history
+  than asked for (the first records start partway through the window), use
+  what exists and say how many weeks the forecast is built on.
+
 **If the tenant has Odoo connected** (Od-MCP tools), count per week with
 `odoo_read_group`, grouping by the date field with a `:week` suffix. Typical
 mapping on a standard Odoo CRM + Sales setup:
@@ -64,9 +80,11 @@ stage names and fields with `odoo_get_model_metadata` or a small
 calls to the same tool, before you reach the forecast. Plan for at most six
 Od-MCP calls in total, one per stage, then call `sales_funnel_forecast` in
 the same turn:
-- Use a single `odoo_read_group` per model and date field, covering all 12
-  weeks with a date domain (e.g. `["date_order", ">=", "<12 weeks ago>"]`);
-  never one call per week.
+- Use a single `odoo_read_group` per model and date field, covering the
+  whole window with a closed date domain, e.g.
+  `["date_order", ">=", "2026-07-13"], ["date_order", "<", "2026-10-05"]`
+  (window start, and the Monday of the current week); never one call per
+  week.
 - Check metadata only for a field you are unsure exists (e.g. `margin`), and
   only once. If a mapping you saved earlier is in `graph_recall`, skip the
   checks.
