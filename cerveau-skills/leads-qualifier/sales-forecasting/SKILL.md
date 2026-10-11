@@ -190,6 +190,15 @@ several can be combined in one call. The
 result keeps the baseline and adds a `scenario` block (projection, totals,
 `change_vs_baseline`, and the leads needed for the target at the new rates).
 
+**Refuse a scenario the funnel cannot run, in one step.** When the rate the
+user names is not in the previous result's `available_overrides` (or its stage
+is not in `funnel_stages`), answer right away with no tool call: say that
+stage is not tracked in their data, name the rates you can run (usually only
+`close_rate`), and offer one of those. Do not call `tool_search`, do not
+search Drive or Sheets for another dataset, and do not re-pull Odoo to
+"check again"; the earlier result already settled it. Look elsewhere only if
+the user pastes weekly numbers or points to a specific file themselves.
+
 Never simulate a scenario by editing the weekly counts. Raising
 `appointments_held` alone also lowers the presentation rate, so closes come
 out unchanged and the scenario looks worthless when it is not.
