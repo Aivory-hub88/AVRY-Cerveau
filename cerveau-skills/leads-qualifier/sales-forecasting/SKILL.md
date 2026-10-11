@@ -95,9 +95,12 @@ the same turn:
 - Check metadata only for a field you are unsure exists (e.g. `margin`), and
   only once. If a mapping you saved earlier is in `graph_recall`, skip the
   checks.
-- If a stage turns out to be empty or unusable (e.g. almost no
-  `calendar.event` linked to opportunities), drop that stage and carry on
-  with the ones you have. Do not keep probing. Tell the user in your answer.
+- If a stage comes back nearly empty (e.g. few `calendar.event` linked to
+  opportunities), do not keep probing and do not drop it yourself: pass the
+  counts you got. The tool decides whether a stage is tracked; it leaves an
+  untracked stage out and says why in `warnings`. Report which stages were
+  used from `funnel_stages`, and explain a dropped stage by quoting that
+  warning, not with a reason of your own.
 - If you still run short, stop pulling, run the forecast on the stages you
   have, and offer to add the rest next turn.
 
@@ -141,6 +144,9 @@ Lead with the answer to what they asked, then the supporting numbers:
 5. The tool's `warnings` and `assumptions`, in plain words. Always mention that the forecast assumes this week's leads convert within the forecast window (there is no lag model).
 
 End with one concrete next action, usually the stage with the biggest drop-off.
+Only offer what-if scenarios on rates listed in `available_overrides`; never
+offer one for a stage that is not in `funnel_stages` (no hold-rate scenario
+when appointments are untracked).
 
 Never put a number on a what-if ("raising the hold rate to 85% adds N jobs")
 unless that number came from a `sales_funnel_forecast` call with
@@ -151,9 +157,9 @@ without a figure and offer to run the scenario.
 ### 5. What-if scenarios
 
 To answer "what if the hold rate were 85%?", call the tool again with the
-SAME weeks and `rate_overrides: {"hold_rate": 0.85}`. Overridable rates:
-`set_rate`, `bleed_rate`, `hold_rate`, `presentation_rate`,
-`quotation_rate`, `close_rate`; several can be combined in one call. The
+SAME weeks and `rate_overrides: {"hold_rate": 0.85}`. Only the rates in the
+previous result's `available_overrides` can be overridden for this funnel;
+several can be combined in one call. The
 result keeps the baseline and adds a `scenario` block (projection, totals,
 `change_vs_baseline`, and the leads needed for the target at the new rates).
 
