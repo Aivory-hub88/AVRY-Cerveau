@@ -149,9 +149,11 @@ Lead with the answer to what they asked, then the supporting numbers:
 5. The tool's `warnings` and `assumptions`, in plain words. Always mention that the forecast assumes this week's leads convert within the forecast window (there is no lag model).
 
 End with one concrete next action, usually the stage with the biggest drop-off.
-Only offer what-if scenarios on rates listed in `available_overrides`; never
-offer one for a stage that is not in `funnel_stages` (no hold-rate scenario
-when appointments are untracked).
+When you offer what-if scenarios, base the offer on the returned
+`what_if_note` and name only the rates it lists. Never mention a rate for a
+stage that is not in `funnel_stages` (no hold-rate scenario when appointments
+are untracked). If a scenario call fails because the rate is not in this
+funnel, tell the user that scenario cannot be run on their data and why.
 
 Never put a number on a what-if ("raising the hold rate to 85% adds N jobs")
 unless that number came from a `sales_funnel_forecast` call with
