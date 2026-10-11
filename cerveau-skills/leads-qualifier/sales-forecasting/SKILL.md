@@ -69,8 +69,7 @@ mapping on a standard Odoo CRM + Sales setup:
 
 - `leads`: `crm.lead`, group by `create_date:week`, `["type", "in", ["lead", "opportunity"]]`. Include archived lost leads with `["active", "in", [true, false]]`, or the bleed rate will look better than it is.
 - `appointments_set` / `appointments_held`: `calendar.event` linked to an opportunity (`["opportunity_id", "!=", false]`), group by `start:week`. Held vs set needs a field or tag the business uses for no-shows; ask if it is not obvious.
-- `quotes`: `sale.order`, group by `date_order:week` (the quotation date), `["state", "!=", "cancel"]`, plus `["opportunity_id", "!=", false]` if they only want quotes from the CRM pipeline. Avoid `create_date` on orders: imported or migrated orders all carry the import date.
-- `closes` and `revenue`: `sale.order` with `["state", "=", "sale"]`, group by `date_order:week`, sum `amount_untaxed`. One call returns both the count and the sum.
+- `quotes`, `closes` and `revenue` in ONE call: `sale.order`, `["state", "!=", "cancel"]`, groupby `["date_order:week", "state"]`, fields `["amount_untaxed:sum"]`. Per week, `quotes` is the count over all returned states and `closes`/`revenue` are the `sale` rows. Add `["opportunity_id", "!=", false]` if they only want orders from the CRM pipeline. Avoid `create_date` on orders: imported or migrated orders all carry the import date.
 - `units`: sum `product_uom_qty` on `sale.order.line` of confirmed orders, filtered to the product(s) sold per unit (e.g. roofing per square). Ask which product or unit of measure is the unit.
 - `cost`: the `margin` field on `sale.order` (cost = `amount_untaxed - margin`) when the sale-margin module is installed; otherwise ask how they track job cost.
 
@@ -78,10 +77,19 @@ Every business configures Odoo differently. Before trusting a mapping, check
 stage names and fields with `odoo_get_model_metadata` or a small
 `odoo_search_read`, and tell the user which models and filters you used.
 
-**Stay within the call budget.** The runtime stops a turn after about nine
-calls to the same tool, before you reach the forecast. Plan for at most six
-Od-MCP calls in total, one per stage, then call `sales_funnel_forecast` in
-the same turn:
+**Stay within the time and call budget.** A turn is cut off after 180
+seconds, and every sequential tool step costs a model round trip; the full
+pull plus forecast has run out of time when the calls went one by one. So:
+- Issue all the Odoo reads in ONE step, as parallel tool calls: `crm.lead`,
+  the combined `sale.order` call, and `calendar.event` together, plus at most
+  one metadata check if you need it. Then call `sales_funnel_forecast` in the
+  next step. That is two steps, not eight.
+- Skip checks that do not change the forecast (e.g. a separate currency
+  check: read the currency from the order rows you already have, or ask).
+- Check `margin` at most once, on `sale.order` only. If it is missing, report
+  no cost; do not try `sale.order.line` or other models.
+- Never more than six Od-MCP calls in total; the runtime also stops a turn
+  after about nine calls to the same tool.
 - `odoo_read_group` arguments: the date bucket goes ONLY in `groupby`
   (`["date_order:week"]`); `fields` holds only aggregates written as
   `field:agg` (e.g. `["amount_untaxed:sum"]`), and the count comes back on its
