@@ -6,6 +6,7 @@ author: aivory
 version: 0.1.0
 category: sales
 tags: [forecasting, funnel, metrics, odoo, tenant-scoped]
+always: true
 ---
 
 # Sales Forecasting
