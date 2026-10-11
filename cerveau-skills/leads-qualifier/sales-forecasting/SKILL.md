@@ -97,7 +97,12 @@ the same turn:
   checks.
 - If a stage comes back nearly empty (e.g. few `calendar.event` linked to
   opportunities), do not keep probing and do not drop it yourself: pass the
-  counts you got. The tool decides whether a stage is tracked; it leaves an
+  counts you got. Example: `calendar.event` returns one group, 4 events in
+  the week starting 2026-09-20. Pass `appointments_set: 4` on that week; the
+  tool zero-fills the other weeks, judges the stage, and explains it. Never
+  call a result "empty" unless it returned no groups. Odoo week buckets may
+  start on Sunday; pass the group's date as `week_start` unchanged, the tool
+  maps it to the right Monday week. The tool decides whether a stage is tracked; it leaves an
   untracked stage out and says why in `warnings`. Report which stages were
   used from `funnel_stages`, and explain a dropped stage by quoting that
   warning, not with a reason of your own.
