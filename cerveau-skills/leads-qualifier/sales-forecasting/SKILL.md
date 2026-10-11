@@ -80,10 +80,16 @@ stage names and fields with `odoo_get_model_metadata` or a small
 **Stay within the time and call budget.** A turn is cut off after 180
 seconds, and every sequential tool step costs a model round trip; the full
 pull plus forecast has run out of time when the calls went one by one. So:
-- Issue all the Odoo reads in ONE step, as parallel tool calls: `crm.lead`,
-  the combined `sale.order` call, and `calendar.event` together, plus at most
-  one metadata check if you need it. Then call `sales_funnel_forecast` in the
-  next step. That is two steps, not eight.
+- The whole turn is three model steps, no more. Step 1: in ONE batch of
+  parallel calls, send the `crm.lead` read, the combined `sale.order` read,
+  the `calendar.event` read, plus any `graph_recall` or
+  `odoo_list_instances` you want; do not spend a separate step on those
+  first. Step 2: `sales_funnel_forecast`. Step 3: the answer. Every extra
+  step costs 20-60 seconds and has pushed this turn past the cap.
+- Do not add `margin:sum` to a read unless you already know the field
+  exists (from a saved mapping). If you are unsure, include one
+  `odoo_get_model_metadata` for `sale.order` in the step-1 batch; when it
+  shows no `margin`, report no cost and never request it afterwards.
 - Skip checks that do not change the forecast (e.g. a separate currency
   check: read the currency from the order rows you already have, or ask).
 - Check `margin` at most once, on `sale.order` only. If it is missing, report
@@ -137,6 +143,11 @@ the warning.
 - `rate_overrides`: only for a what-if (see step 5).
 
 ### 4. Report the result
+
+Keep it compact, because writing a long answer is itself slow: the
+`history` table, the forecast totals plus a one-line-per-week projection,
+the target block, then the warnings as short bullets. No restating of the
+method or the mapping beyond one line per model.
 
 Every number in your answer comes from a tool result: the weekly rows you
 passed in, or a field the forecast returned. Do no arithmetic of your own,
