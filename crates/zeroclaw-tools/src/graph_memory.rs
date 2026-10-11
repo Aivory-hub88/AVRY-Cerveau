@@ -34,6 +34,70 @@ use zeroclaw_config::schema::CogneeConfig;
 
 const DATASET_NAME: &str = "cerveau_graph";
 
+// ── Fail fast when the sidecar is down ──────────────────────────────────
+//
+// 2026-10-03: cerveau-server hung while staying "active" -- the kernel kept
+// accepting connections into its listen backlog, nothing ever answered. With
+// only the shared client's 60 s timeout, every graph_recall/graph_remember
+// waited a full minute before failing, for 8 days, and pushed tool-heavy
+// turns past the 180 s turn cap (AVRY-V2-Main
+// docs/INCIDENT-2026-10-03-COGNEE-CERVEAU-HANG.md). Two layers now:
+//
+// 1. Per-request budgets for the calls a turn waits on. The client keeps its
+//    60 s ceiling only for `cognify` (an LLM extraction pipeline, ~40 s when
+//    run in the foreground). A healthy `add` is sub-second; a healthy
+//    GraphCompletion search is 2-6 s.
+// 2. A per-sidecar circuit breaker: after a transport failure (timeout,
+//    refused, reset), calls to that base URL fail immediately for
+//    BREAKER_COOLDOWN instead of each one waiting out its own timeout. HTTP
+//    error statuses do not trip it -- the sidecar answered.
+
+#[cfg(not(test))]
+const ADD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(not(test))]
+const SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+#[cfg(test)]
+const ADD_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+#[cfg(test)]
+const SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+const BREAKER_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn breaker() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static OPEN_UNTIL: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    OPEN_UNTIL.get_or_init(Default::default)
+}
+
+/// Remaining cooldown if the breaker for `base` is open.
+fn breaker_open(base: &str) -> Option<std::time::Duration> {
+    let map = breaker().lock().unwrap_or_else(|e| e.into_inner());
+    let until = map.get(base)?;
+    until.checked_duration_since(std::time::Instant::now())
+}
+
+fn trip_breaker(base: &str) {
+    breaker().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        base.to_string(),
+        std::time::Instant::now() + BREAKER_COOLDOWN,
+    );
+}
+
+fn reset_breaker(base: &str) {
+    breaker()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(base);
+}
+
+fn breaker_error(base: &str, remaining: std::time::Duration) -> String {
+    format!(
+        "graph memory unavailable: sidecar at {base} did not respond to a recent call; \
+         failing fast for another {}s instead of waiting on it",
+        remaining.as_secs().max(1)
+    )
+}
+
 /// One shared client: building it (proxy resolution, TLS roots) is far too slow
 /// for the per-turn `recall_context` path, and `reqwest::Client` is a cheap
 /// `Arc` handle to share.
@@ -162,6 +226,9 @@ pub async fn add_fact(
 ) -> anyhow::Result<()> {
     let client = client();
     let base = cfg.base_url.trim_end_matches('/');
+    if let Some(remaining) = breaker_open(base) {
+        anyhow::bail!(breaker_error(base, remaining));
+    }
 
     let part = reqwest::multipart::Part::bytes(text.as_bytes().to_vec())
         .file_name("fact.txt")
@@ -177,12 +244,14 @@ pub async fn add_fact(
         tenant_id,
         agent_type,
     )
-    .multipart(form);
+    .multipart(form)
+    .timeout(ADD_TIMEOUT);
 
-    let add_resp = add_req
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("graph memory unavailable: {e}"))?;
+    let add_resp = add_req.send().await.map_err(|e| {
+        trip_breaker(base);
+        anyhow::anyhow!("graph memory unavailable: {e}")
+    })?;
+    reset_breaker(base);
     if !add_resp.status().is_success() {
         let status = add_resp.status();
         let body = add_resp.text().await.unwrap_or_default();
@@ -197,6 +266,12 @@ pub async fn add_fact(
 pub async fn cognify(cfg: &CogneeConfig, tenant_id: &str, agent_type: &str) -> anyhow::Result<()> {
     let client = client();
     let base = cfg.base_url.trim_end_matches('/');
+    if let Some(remaining) = breaker_open(base) {
+        anyhow::bail!(
+            "graph_remember: stored but graph extraction skipped: {}",
+            breaker_error(base, remaining)
+        );
+    }
     let cognify_req = apply_tenant_headers(
         client.post(format!("{base}/api/v1/cognify")),
         cfg,
@@ -206,6 +281,7 @@ pub async fn cognify(cfg: &CogneeConfig, tenant_id: &str, agent_type: &str) -> a
     .json(&json!({"datasets": [DATASET_NAME], "runInBackground": false}));
 
     let cognify_resp = cognify_req.send().await.map_err(|e| {
+        trip_breaker(base);
         anyhow::anyhow!("graph_remember: stored but graph extraction request failed: {e}")
     })?;
     if !cognify_resp.status().is_success() {
@@ -288,6 +364,9 @@ pub async fn recall_context(
         return None;
     }
     let base = cfg.base_url.trim_end_matches('/');
+    if breaker_open(base).is_some() {
+        return None;
+    }
     let request = apply_tenant_headers(
         client().post(format!("{base}/api/v1/search")),
         cfg,
@@ -301,13 +380,25 @@ pub async fn recall_context(
     }))
     .send();
 
-    let response = tokio::time::timeout(
+    // Only a transport error trips the breaker here. Running past this
+    // deliberately tight per-turn budget does not: a slow-but-alive sidecar
+    // should not also lose its graph_recall/graph_remember calls.
+    let response = match tokio::time::timeout(
         std::time::Duration::from_millis(cfg.recall_timeout_ms.max(1)),
         request,
     )
     .await
     .ok()?
-    .ok()?;
+    {
+        Ok(response) => {
+            reset_breaker(base);
+            response
+        }
+        Err(_) => {
+            trip_breaker(base);
+            return None;
+        }
+    };
     if !response.status().is_success() {
         return None;
     }
@@ -399,6 +490,13 @@ impl Tool for GraphRecallTool {
 
         let client = client();
         let base = self.cfg.base_url.trim_end_matches('/');
+        if let Some(remaining) = breaker_open(base) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(breaker_error(base, remaining)),
+            });
+        }
 
         let req = apply_tenant_headers(
             client.post(format!("{base}/api/v1/search")),
@@ -406,11 +504,16 @@ impl Tool for GraphRecallTool {
             tenant_id,
             agent_type,
         )
-        .json(&json!({"query": query, "datasets": [DATASET_NAME]}));
+        .json(&json!({"query": query, "datasets": [DATASET_NAME]}))
+        .timeout(SEARCH_TIMEOUT);
 
         let resp = match req.send().await {
-            Ok(r) => r,
+            Ok(r) => {
+                reset_breaker(base);
+                r
+            }
             Err(e) => {
+                trip_breaker(base);
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
@@ -668,5 +771,109 @@ mod tests {
             .await
             .unwrap();
         cognify(&cfg, "user1", "leads_qualifier").await.unwrap();
+    }
+
+    /// The 2026-10-03 failure shape: a socket that is listening (connect()
+    /// succeeds into the kernel backlog) but never accept()s or answers.
+    fn hung_sidecar() -> (std::net::TcpListener, CogneeConfig) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = CogneeConfig {
+            enabled: true,
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            ..CogneeConfig::default()
+        };
+        (listener, cfg)
+    }
+
+    #[tokio::test]
+    async fn graph_recall_on_a_hung_sidecar_times_out_then_fails_fast() {
+        let (_listener, cfg) = hung_sidecar();
+        let tool = GraphRecallTool::new(cfg.clone(), "u".into(), "a".into());
+        warm_client();
+
+        let started = std::time::Instant::now();
+        let first = tool
+            .execute(json!({"query": "who is the contact?"}))
+            .await
+            .unwrap();
+        assert!(!first.success);
+        assert!(
+            first
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("graph memory unavailable")
+        );
+        assert!(
+            started.elapsed() < SEARCH_TIMEOUT + std::time::Duration::from_secs(2),
+            "bounded by the per-request budget, not the client's 60 s"
+        );
+
+        let started = std::time::Instant::now();
+        let second = tool
+            .execute(json!({"query": "who is the contact?"}))
+            .await
+            .unwrap();
+        assert!(!second.success);
+        assert!(second.error.as_deref().unwrap().contains("failing fast"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "breaker open: no network wait at all"
+        );
+
+        // graph_remember and auto-recall share the breaker.
+        let err = add_fact(&cfg, "u", "a", "fact").await.unwrap_err();
+        assert!(err.to_string().contains("failing fast"));
+        assert!(recall_context(&cfg, "u", "a", "q").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn add_fact_on_a_hung_sidecar_is_bounded_and_trips_the_breaker() {
+        let (_listener, cfg) = hung_sidecar();
+        warm_client();
+        let started = std::time::Instant::now();
+        assert!(add_fact(&cfg, "u", "a", "fact").await.is_err());
+        assert!(started.elapsed() < ADD_TIMEOUT + std::time::Duration::from_secs(2));
+        assert!(breaker_open(cfg.base_url.trim_end_matches('/')).is_some());
+    }
+
+    #[tokio::test]
+    async fn open_breaker_skips_the_network_and_a_success_closes_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{"searchResult": "ok"}])))
+            .mount(&server)
+            .await;
+        let cfg = cfg_for(&server);
+        let tool = GraphRecallTool::new(cfg.clone(), "u".into(), "a".into());
+
+        trip_breaker(&server.uri());
+        let skipped = tool.execute(json!({"query": "q"})).await.unwrap();
+        assert!(!skipped.success);
+        assert_eq!(server.received_requests().await.unwrap().len(), 0);
+
+        // Cooldown over (simulated): the next call goes through and closes it.
+        reset_breaker(&server.uri());
+        let ok = tool.execute(json!({"query": "q"})).await.unwrap();
+        assert!(ok.success);
+        assert!(breaker_open(&server.uri()).is_none());
+    }
+
+    #[tokio::test]
+    async fn http_error_status_does_not_trip_the_breaker() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/search"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({"detail": "boom"})))
+            .mount(&server)
+            .await;
+        let tool = GraphRecallTool::new(cfg_for(&server), "u".into(), "a".into());
+        let res = tool.execute(json!({"query": "q"})).await.unwrap();
+        assert!(!res.success);
+        assert!(
+            breaker_open(&server.uri()).is_none(),
+            "the sidecar answered"
+        );
     }
 }
