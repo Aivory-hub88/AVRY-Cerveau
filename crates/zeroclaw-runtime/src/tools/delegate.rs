@@ -415,6 +415,9 @@ impl DelegateAmbient {
     }
 
     async fn scope<F: std::future::Future>(self, fut: F) -> F::Output {
+        // Boxed: three task-local layers around a whole delegated loop would
+        // otherwise copy its (large) state machine onto a debug-build stack.
+        let fut = Box::pin(fut);
         crate::approval::scope_delegation_approval(
             self.approval,
             crate::agent::tenant::TENANT_CONTEXT.scope(
@@ -468,7 +471,6 @@ fn effective_context_turn_cap(config: &DelegateToolConfig) -> u32 {
         .context_turn_cap
         .clamp(1, zeroclaw_config::schema::MAX_DELEGATE_CONTEXT_TURN_CAP)
 }
-
 
 pub struct DelegateTool {
     agents: Arc<HashMap<String, AliasedAgentConfig>>,
@@ -3074,7 +3076,6 @@ impl DelegateTool {
     }
 }
 
-
 impl DelegateTool {
     /// Original synchronous delegation path (extracted for reuse).
     async fn execute_sync(
@@ -3222,6 +3223,9 @@ impl DelegateTool {
             admission,
             execution_admission,
         ));
+        // ADR-021: a delegated sub-turn is not a room turn of its own; its
+        // team actions would be posted as the caller's, so it gets none.
+        let inner = crate::agent::tenant::TEAM_ACTIONS.scope(None, inner);
         match crate::agent::tenant::current_tenant() {
             Some(parent) => {
                 let overlay = delegate_tenant_overlay(parent, agent_name.trim());
@@ -3815,8 +3819,11 @@ impl DelegateTool {
             // The row exists but no delegation will ever run for it: settle it
             // rather than leave an `in_progress` card that can never finish.
             if let Some(link) = &closure_link {
-                link.finish(&task_id, &unstarted_row(format!("could not record the delegation: {e}")))
-                    .await;
+                link.finish(
+                    &task_id,
+                    &unstarted_row(format!("could not record the delegation: {e}")),
+                )
+                .await;
             }
             return Err(e);
         }
@@ -4567,37 +4574,40 @@ impl DelegateTool {
                         progress: None,
                     };
                     let agent_name_for_return = agent_name.clone();
-                    let result = ambient.scope(ExecutionTreeBudget::scope_optional(
-                        inherited_budget,
-                        TOOL_LOOP_THREAD_ID.scope(
-                            thread_scope,
-                            crate::sop::active_scope::with_inherited_headless_step_scope(
-                                step_scope,
-                                scope_delegate_session_key(session_key, async move {
-                                    crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
-                                        .scope(receipt_scope, async move {
-                                            let worker: std::pin::Pin<
-                                                Box<
-                                                    dyn std::future::Future<
-                                                            Output = anyhow::Result<ToolResult>,
-                                                        > + Send
-                                                        + '_,
-                                                >,
-                                            > = Box::pin(inner.execute_sync_with_target_admission(
-                                                &agent_name,
-                                                &prompt,
-                                                &args_clone,
-                                                DelegateAdmission::Required,
-                                                target_execution_admission,
-                                            ));
-                                            envelope::capture(worker).await
-                                        })
-                                        .await
-                                }),
+                    let result = ambient
+                        .scope(ExecutionTreeBudget::scope_optional(
+                            inherited_budget,
+                            TOOL_LOOP_THREAD_ID.scope(
+                                thread_scope,
+                                crate::sop::active_scope::with_inherited_headless_step_scope(
+                                    step_scope,
+                                    scope_delegate_session_key(session_key, async move {
+                                        crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+                                            .scope(receipt_scope, async move {
+                                                let worker: std::pin::Pin<
+                                                    Box<
+                                                        dyn std::future::Future<
+                                                                Output = anyhow::Result<ToolResult>,
+                                                            > + Send
+                                                            + '_,
+                                                    >,
+                                                > = Box::pin(
+                                                    inner.execute_sync_with_target_admission(
+                                                        &agent_name,
+                                                        &prompt,
+                                                        &args_clone,
+                                                        DelegateAdmission::Required,
+                                                        target_execution_admission,
+                                                    ),
+                                                );
+                                                envelope::capture(worker).await
+                                            })
+                                            .await
+                                    }),
+                                ),
                             ),
-                        ),
-                    ))
-                    .await;
+                        ))
+                        .await;
                     (agent_name_for_return, result)
                 }
                 .instrument(::zeroclaw_log::attribution_span!(
@@ -4815,9 +4825,10 @@ impl DelegateTool {
                 BackgroundResultState::Lost => {
                     (BackgroundTaskStatus::Running, Some(DelegateReason::Lost))
                 }
-                BackgroundResultState::TimedOut => {
-                    (BackgroundTaskStatus::Running, Some(DelegateReason::TimedOut))
-                }
+                BackgroundResultState::TimedOut => (
+                    BackgroundTaskStatus::Running,
+                    Some(DelegateReason::TimedOut),
+                ),
             };
             let envelope = Self::envelope_from_file(
                 &BackgroundDelegateResult {
@@ -4956,7 +4967,6 @@ impl DelegateTool {
             }
         }
     }
-
 
     /// The `progress` object of a background view: the stored record plus
     /// `elapsed_secs`, measured from the row's start to its finish or to now.
@@ -6371,7 +6381,16 @@ mod tests {
     fn task_control_plane(store: Arc<dyn TaskRegistry>) -> ControlPlaneHandle {
         ControlPlaneHandle {
             store,
+            // The goal surface is never exercised by delegate tests.
+            goal_store: Arc::new(
+                crate::control_plane::SqliteTaskStore::new(
+                    &std::env::temp_dir()
+                        .join(format!("zc-delegate-goal-{}", uuid::Uuid::new_v4())),
+                )
+                .expect("goal store"),
+            ),
             boot_id: "test-boot".into(),
+            resumable_goals: Vec::new(),
         }
     }
 
@@ -6399,6 +6418,7 @@ mod tests {
                 error: None,
                 started_at: "2026-06-21T00:00:00Z".into(),
                 finished_at: Some("2026-06-21T00:00:30Z".into()),
+                meta: None,
             },
         )
         .await
@@ -6433,6 +6453,7 @@ mod tests {
                 error: None,
                 started_at: "2026-06-21T00:00:00Z".into(),
                 finished_at: Some("2026-06-21T00:00:30Z".into()),
+                meta: None,
             },
         )
         .await
@@ -6544,6 +6565,7 @@ mod tests {
             &BackgroundDelegateOutput {
                 task_id: task_id.into(),
                 output: Some("legacy output".into()),
+                meta: None,
             },
         )
         .await
@@ -6700,6 +6722,7 @@ mod tests {
         let value = serde_json::to_value(BackgroundDelegateOutput {
             task_id: "33333333-3333-3333-3333-333333333333".into(),
             output: Some("done".into()),
+            meta: None,
         })
         .unwrap();
         assert!(value.get("status").is_none());
@@ -6721,6 +6744,7 @@ mod tests {
         let result = BackgroundDelegateOutput {
             task_id: task_id.into(),
             output: Some("done".into()),
+            meta: None,
         };
 
         assert!(
@@ -6777,6 +6801,7 @@ mod tests {
             BackgroundDelegateOutput {
                 task_id: task_id.into(),
                 output: Some("done".into()),
+                meta: None,
             },
             TaskStatus::Completed,
             None,
@@ -6834,6 +6859,7 @@ mod tests {
             BackgroundDelegateOutput {
                 task_id: task_id.into(),
                 output: Some("stale output".into()),
+                meta: None,
             },
             TaskStatus::Completed,
             None,
@@ -6878,6 +6904,7 @@ mod tests {
             let bytes = DelegateTool::serialize_result(&BackgroundDelegateOutput {
                 task_id: task_id.clone(),
                 output: Some("recovered worker output".into()),
+                meta: None,
             })
             .unwrap();
             let worker_store = Arc::clone(&store);
@@ -6928,9 +6955,10 @@ mod tests {
                 "live worker must not be reclaimed"
             );
             assert_eq!(
-                crate::control_plane::reaper::recovery_pass(store.as_ref(), owner_boot_id)
+                crate::control_plane::reaper::recovery_pass(store.as_ref(), None, owner_boot_id)
                     .await
-                    .unwrap(),
+                    .unwrap()
+                    .reclaimed,
                 0,
                 "a live parent still suppresses process-based recovery",
             );
@@ -7016,6 +7044,7 @@ mod tests {
         let result = BackgroundDelegateOutput {
             task_id: task_id.into(),
             output: Some("done".into()),
+            meta: None,
         };
 
         assert!(
@@ -7062,6 +7091,7 @@ mod tests {
         let result = BackgroundDelegateOutput {
             task_id: task_id.into(),
             output: Some("done".into()),
+            meta: None,
         };
         let bytes = DelegateTool::serialize_result(&result).unwrap();
         tokio::fs::write(&result_path, &bytes).await.unwrap();
@@ -7085,9 +7115,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            crate::control_plane::reaper::recovery_pass(store.as_ref(), "boot-new")
+            crate::control_plane::reaper::recovery_pass(store.as_ref(), None, "boot-new")
                 .await
-                .unwrap(),
+                .unwrap()
+                .reclaimed,
             1
         );
         let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
@@ -7177,6 +7208,7 @@ mod tests {
         let result = BackgroundDelegateOutput {
             task_id: task_id.into(),
             output: Some("recovered child output".into()),
+            meta: None,
         };
         let bytes = DelegateTool::serialize_result(&result).unwrap();
         DelegateTool::write_bytes_atomic(&result_path, &bytes)
@@ -7257,6 +7289,7 @@ mod tests {
         let result = BackgroundDelegateOutput {
             task_id: task_id.into(),
             output: Some("late output".into()),
+            meta: None,
         };
 
         assert!(
@@ -7504,6 +7537,7 @@ mod tests {
                 &BackgroundDelegateOutput {
                     task_id: task_id.into(),
                     output: None,
+                    meta: None,
                 },
             )
             .await
@@ -7704,6 +7738,7 @@ mod tests {
             &BackgroundDelegateOutput {
                 task_id: task_id.into(),
                 output: Some("done".into()),
+                meta: None,
             },
         )
         .await
@@ -7854,6 +7889,7 @@ mod tests {
                 &BackgroundDelegateOutput {
                     task_id: task_id.into(),
                     output: None,
+                    meta: None,
                 },
             )
             .await
@@ -8016,6 +8052,7 @@ mod tests {
                     let status = match state {
                         BackgroundResultState::Completed => BackgroundTaskStatus::Completed,
                         BackgroundResultState::Cancelled => BackgroundTaskStatus::Cancelled,
+                        BackgroundResultState::InputRequired => BackgroundTaskStatus::InputRequired,
                         BackgroundResultState::Failed
                         | BackgroundResultState::Lost
                         | BackgroundResultState::TimedOut => BackgroundTaskStatus::Failed,
@@ -8029,6 +8066,7 @@ mod tests {
                         error,
                         started_at: view["started_at"].as_str().unwrap_or_default().to_string(),
                         finished_at: view["finished_at"].as_str().map(str::to_string),
+                        meta: None,
                     };
                 }
                 last_status = Some(state);
@@ -8073,6 +8111,7 @@ mod tests {
             error: error.map(str::to_string),
             started_at: "2026-06-29T12:00:00Z".to_string(),
             finished_at,
+            meta: None,
         }
     }
 
@@ -8655,6 +8694,7 @@ mod tests {
         inner_memory: Arc<SqliteMemory>,
         caller_uuid: String,
         target_uuid: String,
+        workspace_dir: PathBuf,
         tool: DelegateTool,
         target_config: AliasedAgentConfig,
     }
@@ -8793,6 +8833,7 @@ mod tests {
             inner_memory,
             caller_uuid,
             target_uuid,
+            workspace_dir: tool.workspace_dir.clone(),
             tool,
             target_config,
         }
@@ -18060,11 +18101,14 @@ command = "rm independent-delegate-marker"
             }),
             "nested tool result must report runtime fail-closed denial: {tool_messages:?}"
         );
+        // Cerveau (C1): shell itself prompts on a headless path, so it is
+        // denied at the gate before its command policy is consulted.
         assert!(
             tool_messages.iter().any(|message| {
                 message.contains("Command requires explicit approval (approved=true)")
+                    || message.contains("'shell' requires approval")
             }),
-            "built-in shell must still receive approved=false and enforce command policy: {tool_messages:?}"
+            "built-in shell must not run without approval: {tool_messages:?}"
         );
     }
 
@@ -18296,8 +18340,10 @@ command = "rm independent-delegate-marker"
     async fn independent_delegate_configured_route_without_registry_controls_shell_execution() {
         // A configured route is authoritative even in a channel-less process.
         // Compare actual shell output with no route and explicit policy grants.
+        // Cerveau (C1): with no route, shell prompts on a headless path, so a
+        // supervised profile that does not auto-approve it never runs it.
         for (route, full, auto_approve, always_ask, executes) in [
-            (false, false, false, false, true),
+            (false, false, false, false, false),
             (true, false, false, false, false),
             (true, false, true, false, true),
             (true, true, false, false, true),
@@ -19200,7 +19246,11 @@ command = "rm independent-delegate-marker"
             "timeout must not carry output: {result:?}"
         );
         let error = result.error.expect("timeout error");
-        assert_eq!(error, "Agent 'target' timed out after 1s");
+        // Cerveau: the ADR-014 envelope tail follows the engine's message.
+        assert!(
+            error.starts_with("Agent 'target' timed out after 1s"),
+            "{error}"
+        );
         assert_eq!(
             backup_requests.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -22413,141 +22463,6 @@ command = "rm independent-delegate-marker"
             "configless delegate must surface a clean tool error: {result:?}"
         );
     }
-}
-
-#[cfg(test)]
-mod tool_arc_ref_spec_tests {
-    use super::*;
-    use zeroclaw_api::tool::ToolSpec;
-
-    struct ArcSchemaTool {
-        schema: Arc<serde_json::Value>,
-    }
-
-    impl ::zeroclaw_api::attribution::Attributable for ArcSchemaTool {
-        fn role(&self) -> ::zeroclaw_api::attribution::Role {
-            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
-        }
-        fn alias(&self) -> &str {
-            "arc-schema-tool"
-        }
-    }
-
-    #[async_trait]
-    impl Tool for ArcSchemaTool {
-        fn name(&self) -> &str {
-            "arc_schema_tool"
-        }
-
-        fn description(&self) -> &str {
-            "test tool with Arc-shared schema"
-        }
-
-        fn parameters_schema(&self) -> serde_json::Value {
-            (*self.schema).clone()
-        }
-
-        fn spec(&self) -> ToolSpec {
-            ToolSpec {
-                name: self.name().to_string(),
-                description: self.description().to_string(),
-                parameters: Arc::clone(&self.schema),
-                output: None,
-                param_domains: std::collections::BTreeMap::new(),
-            }
-        }
-
-        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-            Ok(ToolResult {
-                success: true,
-                output: "ok".into(),
-                error: None,
-            })
-        }
-    }
-
-    #[test]
-    fn tool_arc_ref_forwards_spec_arc_identity() {
-        let inner: Arc<dyn Tool> = Arc::new(ArcSchemaTool {
-            schema: Arc::new(serde_json::json!({
-                "type": "object",
-                "properties": { "path": { "type": "string" } }
-            })),
-        });
-        let inner_params = inner.spec().parameters;
-        let wrapped = ToolArcRef::new(Arc::clone(&inner));
-
-        assert!(
-            Arc::ptr_eq(&wrapped.spec().parameters, &inner_params),
-            "ToolArcRef must forward spec() so the inner Arc-shared schema \
-             survives; the trait default deep-clones it every call"
-        );
-    }
-
-    /// Trigger-owning tool standing in for `send_via` behind bounded
-    /// delegation's `ToolArcRef` wrapper.
-    struct TriggerOwningTool;
-
-    impl ::zeroclaw_api::attribution::Attributable for TriggerOwningTool {
-        fn role(&self) -> ::zeroclaw_api::attribution::Role {
-            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
-        }
-        fn alias(&self) -> &str {
-            "trigger-owning-tool"
-        }
-    }
-
-    #[async_trait]
-    impl Tool for TriggerOwningTool {
-        fn name(&self) -> &str {
-            "trigger_owning_tool"
-        }
-
-        fn description(&self) -> &str {
-            "test tool with invocation triggers"
-        }
-
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({ "type": "object" })
-        }
-
-        fn invocation_triggers(&self) -> Vec<String> {
-            vec!["send this to".into(), "as a voice message".into()]
-        }
-
-        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-            Ok(ToolResult {
-                success: true,
-                output: "ok".into(),
-                error: None,
-            })
-        }
-    }
-
-    #[test]
-    fn tool_arc_ref_forwards_invocation_triggers() {
-        // Regression: bounded delegation re-wraps every admitted parent tool
-        // in `ToolArcRef` (see the sub-tool assembly in `execute`). Without
-        // explicit forwarding the trait default returns an empty vocabulary,
-        // silently erasing a trigger-owning tool's metadata for any consumer
-        // scanning a delegate's assembled tools.
-        let inner: Arc<dyn Tool> = Arc::new(TriggerOwningTool);
-        let wrapped = ToolArcRef::new(Arc::clone(&inner));
-
-        assert_eq!(
-            wrapped.invocation_triggers(),
-            inner.invocation_triggers(),
-            "ToolArcRef must forward invocation_triggers(); the trait \
-             default erases the inner tool's vocabulary"
-        );
-        assert!(
-            wrapped
-                .invocation_triggers()
-                .iter()
-                .any(|t| t == "send this to"),
-            "wrapped trigger vocabulary must survive bounded delegation"
-        );
-    }
 
     // ── Cerveau (ported from the v0.8.5 series onto the v0.8.6 engine) ─────
     zeroclaw_api::mock_tool_attribution!(TenantProbeTool);
@@ -22559,7 +22474,7 @@ mod tool_arc_ref_spec_tests {
     #[async_trait]
     impl Tool for TenantProbeTool {
         fn name(&self) -> &str {
-            "tenant_probe"
+            "identity_probe"
         }
         fn description(&self) -> &str {
             "Records the current tenant overlay."
@@ -23168,7 +23083,7 @@ mod tool_arc_ref_spec_tests {
             .scope(tenant_ctx("user1", "chief_of_staff"), async {
                 let mem = fixture
                     .tool
-                    .memory_for_target_agent("leads_qualifier")
+                    .memory_for_target_agent(None, "leads_qualifier")
                     .await
                     .unwrap()
                     .expect("memory handle");
@@ -23187,7 +23102,7 @@ mod tool_arc_ref_spec_tests {
             .scope(tenant_ctx("user2", "chief_of_staff"), async {
                 let mem = fixture
                     .tool
-                    .memory_for_target_agent("leads_qualifier")
+                    .memory_for_target_agent(None, "leads_qualifier")
                     .await
                     .unwrap()
                     .expect("memory handle");
@@ -23223,7 +23138,7 @@ mod tool_arc_ref_spec_tests {
             .scope(tenant_ctx("user1", "chief_of_staff"), async {
                 let mem = fixture
                     .tool
-                    .memory_for_target_agent("target")
+                    .memory_for_target_agent(None, "target")
                     .await
                     .unwrap()
                     .expect("memory handle");
@@ -23261,7 +23176,7 @@ mod tool_arc_ref_spec_tests {
         // No TENANT_CONTEXT: vanilla single-operator path, host alias scope.
         let via_delegate = fixture
             .tool
-            .memory_for_target_agent("target")
+            .memory_for_target_agent(None, "target")
             .await
             .unwrap()
             .expect("memory handle");
@@ -23308,9 +23223,9 @@ mod tool_arc_ref_spec_tests {
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
             .with_runtime_profiles(agentic_runtime_profiles(10))
             .with_risk_profiles(risk_profiles)
-            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(CountingEchoTool(
-                Arc::clone(&executions),
-            ))])));
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(CountingEchoTool {
+                executions: Arc::clone(&executions),
+            })])));
         let config = agentic_agent_config();
         let model_provider = OneToolThenFinalModelProvider;
 
@@ -23385,9 +23300,13 @@ mod tool_arc_ref_spec_tests {
 
     #[tokio::test]
     async fn delegate_without_a_parent_approval_manager_is_unchanged() {
-        // Vanilla / no-approval parents keep the pre-existing behaviour, so the
-        // change is inert for every caller that never had a manager.
+        // Without a parent template the upstream fail-closed bounded manager
+        // applies: the target's own auto_approve decides, nothing is parked.
         let (ran, pending) = run_gated_delegate(echo_tiers(true), Vec::new(), false).await;
+        assert_eq!(ran, 0);
+        assert!(pending.is_empty());
+        let (ran, pending) =
+            run_gated_delegate(echo_tiers(true), vec!["echo_tool".into()], false).await;
         assert_eq!(ran, 1);
         assert!(pending.is_empty());
     }
@@ -23437,7 +23356,7 @@ mod tool_arc_ref_spec_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let uri = format!("http://{}", listener.local_addr().unwrap());
         let responses = vec![
-            chat_completion_tool_call("tenant_probe", "call_probe", serde_json::json!({})),
+            chat_completion_tool_call("identity_probe", "call_probe", serde_json::json!({})),
             serde_json::json!({"choices": [{"message": {"content": "probe done"}}]}),
         ];
         let task = zeroclaw_spawn::spawn!(async move {
@@ -23447,7 +23366,11 @@ mod tool_arc_ref_spec_tests {
                 write_json_response(&mut socket, response).await;
             }
         });
-        LocalChatServer { uri, _task: task }
+        LocalChatServer {
+            uri,
+            hung_up_before_release: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            _task: task,
+        }
     }
 
     /// Run one SYNC delegate hop to `target` from `caller_tenant` and return the
@@ -23464,12 +23387,11 @@ mod tool_arc_ref_spec_tests {
         // the shared `agentic_test` risk profile (used by both caller and
         // target) must admit the probe.
         let mut config = (**fixture.tool.root_config.as_ref().expect("root config")).clone();
-        config
-            .risk_profiles
-            .get_mut("agentic_test")
-            .unwrap()
-            .allowed_tools
-            .push("tenant_probe".to_string());
+        let profile = config.risk_profiles.get_mut("agentic_test").unwrap();
+        profile.allowed_tools.push("identity_probe".to_string());
+        // v0.8.6 bounded children run under a fail-closed manager: the probe
+        // must be auto-approved to execute at all.
+        profile.auto_approve.push("identity_probe".to_string());
         let config = Arc::new(config);
         let caller_security = Arc::new(SecurityPolicy::for_agent(&config, "caller").unwrap());
         let tool = DelegateTool::new(config.agents.clone(), None, caller_security)
@@ -23831,7 +23753,7 @@ mod tool_arc_ref_spec_tests {
                 .as_str()
                 .expect("the start envelope names the board row")
                 .to_string();
-            let file = wait_for_terminal_background_result(&workspace, &delegation_id).await;
+            let file = wait_for_terminal_background_result(&tool, &delegation_id).await;
             assert_eq!(file.status, BackgroundTaskStatus::Failed);
             let row = row_eventually(&ledger, &user, &row_id, |r| {
                 r.status == LedgerStatus::Blocked
@@ -24056,7 +23978,7 @@ mod tool_arc_ref_spec_tests {
                     .await
                     .unwrap()
             );
-            let stopped = wait_for_terminal_background_result(&slow_ws, &slow_id).await;
+            let stopped = wait_for_terminal_background_result(&slow_tool, &slow_id).await;
             assert_eq!(
                 stopped.status,
                 BackgroundTaskStatus::Cancelled,
@@ -24104,6 +24026,7 @@ mod tool_arc_ref_spec_tests {
                     principal_id: None,
                     started_at: "2026-09-19T00:00:00Z".into(),
                     finished_at: None,
+                    originator_chain: Vec::new(),
                 };
                 let mut rows = HashMap::new();
                 for (name, status) in [
@@ -24354,6 +24277,7 @@ mod tool_arc_ref_spec_tests {
                         principal_id: None,
                         started_at: "2026-09-19T00:00:00Z".into(),
                         finished_at: None,
+                        originator_chain: Vec::new(),
                     })
                     .await
                     .unwrap();
@@ -24395,6 +24319,7 @@ mod tool_arc_ref_spec_tests {
                         principal_id: None,
                         started_at: "2026-09-19T00:00:00Z".into(),
                         finished_at: None,
+                        originator_chain: Vec::new(),
                     })
                     .await
                     .unwrap();
@@ -24557,7 +24482,7 @@ mod tool_arc_ref_spec_tests {
                 .await;
                 assert_eq!(row.context_id.as_deref(), Some("ctx_fresh_e2e"));
                 let _ = wait_for_terminal_background_result(
-                    &workspace,
+                    &tool,
                     accepted_data["task_id"].as_str().unwrap(),
                 )
                 .await;
@@ -24582,5 +24507,142 @@ mod tool_arc_ref_spec_tests {
                 .unwrap()
                 .status
         }
+    }
+
+    // ── Cerveau test fixtures (v0.8.5 series) ──
+}
+
+#[cfg(test)]
+mod tool_arc_ref_spec_tests {
+    use super::*;
+    use zeroclaw_api::tool::ToolSpec;
+
+    struct ArcSchemaTool {
+        schema: Arc<serde_json::Value>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ArcSchemaTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            "arc-schema-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ArcSchemaTool {
+        fn name(&self) -> &str {
+            "arc_schema_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test tool with Arc-shared schema"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            (*self.schema).clone()
+        }
+
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name().to_string(),
+                description: self.description().to_string(),
+                parameters: Arc::clone(&self.schema),
+                output: None,
+                param_domains: std::collections::BTreeMap::new(),
+            }
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn tool_arc_ref_forwards_spec_arc_identity() {
+        let inner: Arc<dyn Tool> = Arc::new(ArcSchemaTool {
+            schema: Arc::new(serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } }
+            })),
+        });
+        let inner_params = inner.spec().parameters;
+        let wrapped = ToolArcRef::new(Arc::clone(&inner));
+
+        assert!(
+            Arc::ptr_eq(&wrapped.spec().parameters, &inner_params),
+            "ToolArcRef must forward spec() so the inner Arc-shared schema \
+             survives; the trait default deep-clones it every call"
+        );
+    }
+
+    /// Trigger-owning tool standing in for `send_via` behind bounded
+    /// delegation's `ToolArcRef` wrapper.
+    struct TriggerOwningTool;
+
+    impl ::zeroclaw_api::attribution::Attributable for TriggerOwningTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            "trigger-owning-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for TriggerOwningTool {
+        fn name(&self) -> &str {
+            "trigger_owning_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test tool with invocation triggers"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+
+        fn invocation_triggers(&self) -> Vec<String> {
+            vec!["send this to".into(), "as a voice message".into()]
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn tool_arc_ref_forwards_invocation_triggers() {
+        // Regression: bounded delegation re-wraps every admitted parent tool
+        // in `ToolArcRef` (see the sub-tool assembly in `execute`). Without
+        // explicit forwarding the trait default returns an empty vocabulary,
+        // silently erasing a trigger-owning tool's metadata for any consumer
+        // scanning a delegate's assembled tools.
+        let inner: Arc<dyn Tool> = Arc::new(TriggerOwningTool);
+        let wrapped = ToolArcRef::new(Arc::clone(&inner));
+
+        assert_eq!(
+            wrapped.invocation_triggers(),
+            inner.invocation_triggers(),
+            "ToolArcRef must forward invocation_triggers(); the trait \
+             default erases the inner tool's vocabulary"
+        );
+        assert!(
+            wrapped
+                .invocation_triggers()
+                .iter()
+                .any(|t| t == "send this to"),
+            "wrapped trigger vocabulary must survive bounded delegation"
+        );
     }
 }

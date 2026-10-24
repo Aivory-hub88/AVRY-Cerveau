@@ -262,7 +262,7 @@ fn age_secs(ts: &str, now: DateTime<Utc>) -> Option<i64> {
 /// is reconciled to `Lost` exactly as before.
 pub async fn recovery_pass(
     store: &dyn TaskRegistry,
-    goal_store: &dyn GoalTaskRegistry,
+    goal_store: Option<&dyn GoalTaskRegistry>,
     boot_id: &str,
 ) -> anyhow::Result<RecoveryOutcome> {
     // Upstream v0.8.6: promote durable terminal settlements before any
@@ -278,6 +278,7 @@ pub async fn recovery_pass(
         }
         if rec.kind == TaskKind::Goal
             && is_authoritative(&rec)
+            && let Some(goal_store) = goal_store
             && let Some(context) = goal_store.get_continuation_context(&rec.id).await?
         {
             let crashed_boot_id = rec.owner_boot_id.clone();
@@ -438,7 +439,13 @@ mod tests {
         let intent = intent(task_id, &path, TaskStatus::Completed, bytes);
         assert!(s.persist_terminal_settlement_intent(intent).await.unwrap());
 
-        assert_eq!(recovery_pass(&s, "boot-NEW").await.unwrap(), 1);
+        assert_eq!(
+            recovery_pass(&s, Some(&s), "boot-NEW")
+                .await
+                .unwrap()
+                .reclaimed,
+            1
+        );
         let snapshot = s.get_snapshot(task_id).await.unwrap().unwrap();
         assert_eq!(snapshot.task.status, TaskStatus::Completed);
         assert_eq!(
@@ -520,7 +527,13 @@ mod tests {
         let intent = intent(task_id, &path, TaskStatus::Completed, b"published later");
         assert!(s.persist_terminal_settlement_intent(intent).await.unwrap());
 
-        assert_eq!(recovery_pass(&s, "boot-NEW").await.unwrap(), 1);
+        assert_eq!(
+            recovery_pass(&s, Some(&s), "boot-NEW")
+                .await
+                .unwrap()
+                .reclaimed,
+            1
+        );
         let snapshot = s.get_snapshot(task_id).await.unwrap().unwrap();
         assert_eq!(snapshot.task.status, TaskStatus::Failed);
         assert_ne!(snapshot.task.status, TaskStatus::Completed);
@@ -545,7 +558,13 @@ mod tests {
         let intent = intent(task_id, &path, TaskStatus::Completed, b"original bytes");
         assert!(s.persist_terminal_settlement_intent(intent).await.unwrap());
 
-        assert_eq!(recovery_pass(&s, "boot-NEW").await.unwrap(), 1);
+        assert_eq!(
+            recovery_pass(&s, Some(&s), "boot-NEW")
+                .await
+                .unwrap()
+                .reclaimed,
+            1
+        );
         let snapshot = s.get_snapshot(task_id).await.unwrap().unwrap();
         assert_eq!(snapshot.task.status, TaskStatus::Failed);
         assert!(
@@ -570,7 +589,13 @@ mod tests {
         let intent = intent(task_id, &path, TaskStatus::Completed, bytes);
         assert!(s.persist_terminal_settlement_intent(intent).await.unwrap());
 
-        assert_eq!(recovery_pass(&s, "boot-NEW").await.unwrap(), 1);
+        assert_eq!(
+            recovery_pass(&s, Some(&s), "boot-NEW")
+                .await
+                .unwrap()
+                .reclaimed,
+            1
+        );
         let snapshot = s.get_snapshot(task_id).await.unwrap().unwrap();
         assert_eq!(snapshot.task.status, TaskStatus::Failed);
         assert!(
@@ -605,7 +630,7 @@ mod tests {
             .unwrap()
         );
 
-        recovery_pass(&s, "boot-NEW").await.unwrap();
+        recovery_pass(&s, Some(&s), "boot-NEW").await.unwrap();
         let snapshot = s.get_snapshot(task_id).await.unwrap().unwrap();
         assert_eq!(snapshot.task.status, TaskStatus::Cancelled);
         assert_eq!(snapshot.error.as_deref(), Some("cancelled by user request"));
@@ -626,7 +651,7 @@ mod tests {
         s.create(rec("mine", "boot-NEW", std::process::id(), Some(0)))
             .await
             .unwrap();
-        let outcome = recovery_pass(&s, &s, "boot-NEW").await.unwrap();
+        let outcome = recovery_pass(&s, Some(&s), "boot-NEW").await.unwrap();
         assert_eq!(outcome.reclaimed, 1);
         assert!(outcome.resumable_goals.is_empty());
         assert_eq!(
@@ -678,7 +703,7 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = recovery_pass(&s, &s, "boot-NEW").await.unwrap();
+        let outcome = recovery_pass(&s, Some(&s), "boot-NEW").await.unwrap();
 
         assert_eq!(outcome.reclaimed, 1, "only the non-goal orphan is Lost");
         assert_eq!(
@@ -722,7 +747,7 @@ mod tests {
         .await
         .unwrap();
 
-        let outcome = recovery_pass(&s, &s, "boot-NEW").await.unwrap();
+        let outcome = recovery_pass(&s, Some(&s), "boot-NEW").await.unwrap();
         assert_eq!(outcome.reclaimed, 1);
         assert!(outcome.resumable_goals.is_empty());
         assert_eq!(
@@ -766,7 +791,7 @@ mod tests {
         .await
         .unwrap();
 
-        let outcome = recovery_pass(&s, &s, "boot-NEW").await.unwrap();
+        let outcome = recovery_pass(&s, Some(&s), "boot-NEW").await.unwrap();
         assert_eq!(outcome.reclaimed, 0);
         assert!(outcome.resumable_goals.is_empty());
         assert_eq!(

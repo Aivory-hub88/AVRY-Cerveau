@@ -216,6 +216,7 @@ keeps constructing them.
 | Canvas | `canvas` | The canvas store shared with the gateway. |
 | ACP delivery | `deliver_file` | Admitted only on ACP turns; its helpers are used by the ACP server. |
 | Provider-bound | `llm_task` | Builds a provider from the agent's credential outside the provider source. |
+| Aivory Cerveau | `judge`, `session_search` | Fork tools. `judge` builds a provider like `llm_task`; `session_search` reads the agent's memory handle. |
 | Sandbox-bound coding CLIs | `claude_code`, `codex_cli`, `gemini_cli`, `opencode_cli` | The coding-CLI executor wraps the runtime adapter and the shared sandbox. Opt-in by config, but runtime-constructed. |
 | Live config | `a2a_discover`, `a2a_send`, `a2a_get_task`, `a2a_cancel`, `file_download` | They hold the live config handle; the A2A client also uses a process-wide route cache. |
 | Runtime-defined | `security_ops` | Lives in the runtime crate and uses its security playbook and vulnerability modules. |

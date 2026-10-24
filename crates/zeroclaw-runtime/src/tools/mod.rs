@@ -42,6 +42,7 @@ pub mod sop_list;
 pub mod sop_status;
 pub mod sop_workshop;
 pub mod spawn_subagent;
+pub mod team_comms;
 pub mod todo_write;
 pub mod verifiable_intent;
 
@@ -1741,10 +1742,23 @@ fn all_tools_with_runtime_on_thread(
         "memory_purge",
         Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone()))
     );
+    // ADR-021: team communication tools, only on a Team Space room turn
+    // (the gateway scopes `TEAM_ACTIONS` for those) and only for a tenant.
+    if crate::agent::tenant::team_actions_available()
+        && crate::agent::tenant::current_tenant().is_some()
+    {
+        for tool in team_comms::TeamCommsTool::all() {
+            tool_arcs.push(Arc::new(tool));
+        }
+    }
+
     // Aivory Cerveau tools below are pushed directly rather than through
     // `register_tool!`: they are not upstream built-ins, so the `[tools]`
     // built-in selection does not apply to them.
-    tool_arcs.push(Arc::new(SessionSearchTool::new(memory.clone())));
+    register_tool!(
+        "session_search",
+        Arc::new(SessionSearchTool::new(memory.clone()))
+    );
 
     // Aivory Cerveau: graph_remember/graph_recall onto the cognee-rs sidecar
     // (see docs/ADR-007-CERVEAU-COGNEE-INTEGRATION.md in AVRY-V2-Main).
@@ -1976,16 +1990,19 @@ fn all_tools_with_runtime_on_thread(
         // llm_task, one bounded call, policy in code. Shadow-mode first —
         // decisions are logged by the caller; behaviour is unchanged until
         // the shadow numbers match P1 on real traffic.
-        tool_arcs.push(Arc::new(JudgeTool::new(
-            security.clone(),
-            family.to_string(),
-            entry
-                .model
-                .clone()
-                .unwrap_or_else(|| "openai/gpt-4o-mini".to_string()),
-            entry.api_key.clone(),
-            zeroclaw_providers::provider_runtime_options_for_alias(root_config, family, alias),
-        )));
+        register_tool!(
+            "judge",
+            Arc::new(JudgeTool::new(
+                security.clone(),
+                family.to_string(),
+                entry
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "openai/gpt-4o-mini".to_string()),
+                entry.api_key.clone(),
+                zeroclaw_providers::provider_runtime_options_for_alias(root_config, family, alias),
+            ))
+        );
     }
 
     if matches!(

@@ -41,10 +41,10 @@ pub mod canvas;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
-pub mod redis_rate_limiter;
 #[cfg(feature = "plugins-wasm")]
 mod plugin_webhook;
 pub mod principal_gate;
+pub mod redis_rate_limiter;
 pub mod security_headers;
 pub mod session_queue;
 pub mod sse;
@@ -3892,6 +3892,9 @@ struct WebhookPrelude {
     agent_override: Option<String>,
     tenant_ctx: Option<std::sync::Arc<zeroclaw_runtime::agent::tenant::TenantContext>>,
     model_label: String,
+    /// ADR-021: the turn came from a Team Space room (`X-Room-Channel:
+    /// discussion`), so team tools are offered and their actions returned.
+    room_turn: bool,
     /// Upstream SSE opt-in (`stream: true`); honoured only for untenanted
     /// requests, because the upstream streaming path has no tenant overlay.
     stream: bool,
@@ -4324,6 +4327,10 @@ async fn webhook_prelude(
         agent_override: agent_override.map(str::to_string),
         tenant_ctx,
         model_label,
+        room_turn: headers
+            .get("x-room-channel")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("discussion")),
         stream: webhook_body.stream,
         _admission_permit,
     })
@@ -4346,6 +4353,7 @@ async fn handle_webhook(
         agent_override,
         tenant_ctx,
         model_label,
+        room_turn,
         stream,
         _admission_permit,
     } = prelude;
@@ -4367,15 +4375,25 @@ async fn handle_webhook(
         .await;
     }
 
-    match run_gateway_chat_with_tools(
+    // ADR-021: a tenant turn from a room gets a team-actions cell; the team
+    // tools record into it and the room carries the actions out.
+    let team_cell = (room_turn && tenant_ctx.is_some())
+        .then(|| std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())));
+    let chat = Box::pin(run_gateway_chat_with_tools(
         &state,
         &message,
         session_id.as_deref(),
         agent_override.as_deref(),
         tenant_ctx,
-    )
-    .await
-    {
+    ));
+    let outcome = zeroclaw_runtime::agent::tenant::TEAM_ACTIONS
+        .scope(team_cell.clone(), chat)
+        .await;
+    let team_actions = team_cell
+        .map(|cell| std::mem::take(&mut *cell.lock()))
+        .unwrap_or_default();
+
+    match outcome {
         // `input_tokens`/`output_tokens`/`cost_usd` are still populated on the
         // outcome but deliberately NOT read here: upstream v0.8.4 made
         // `process_message`'s runtime turn guard the sole emitter of
@@ -4405,6 +4423,8 @@ async fn handle_webhook(
                 "response": response,
                 "model": model_label,
                 "pending_approval": pending_approval,
+                // ADR-021: additive, `[]` outside a room turn.
+                "team_actions": team_actions,
             });
             (StatusCode::OK, Json(body)).into_response()
         }
@@ -4476,6 +4496,7 @@ async fn handle_webhook_stream(
         agent_override,
         tenant_ctx,
         model_label,
+        room_turn: _,
         stream: _,
         _admission_permit,
     } = prelude;
@@ -4977,7 +4998,7 @@ async fn dispatch_gateway_turn_streaming(
         // through the same Agent construction and cost scope as production.
         let configured_agent = {
             let config = state.config.read();
-            resolve_gateway_chat_agent_alias(&config, agent_override)
+            resolve_gateway_chat_agent_alias(&config, agent_override, None)
                 .is_some_and(|alias| config.agent(&alias).is_some())
         };
         if configured_agent {
@@ -8835,7 +8856,7 @@ path = "{trigger_path}"
             auto_save: false,
             pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -8878,6 +8899,7 @@ path = "{trigger_path}"
             sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            llm_admission: None,
             sop_driver_handles: None,
         }
     }
@@ -10527,13 +10549,16 @@ data: [DONE]\n\n";
             Duration::from_millis(50),
         ));
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         let state = AppState {
             // Upstream v0.8.4 added this to AppState. Informational-only
             // LAN peer hints that never authorize or connect a peer, so a
             // default (empty) registry is correct for this test.
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
+            sop_driver_handles: None,
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10544,7 +10569,11 @@ data: [DONE]\n\n";
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             llm_admission: Some(admission.clone()),
@@ -10599,6 +10628,7 @@ data: [DONE]\n\n";
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            stream: false,
         }));
         let saturated = handle_webhook(
             State(state.clone()),
@@ -10620,6 +10650,7 @@ data: [DONE]\n\n";
         drop(held_permit);
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            stream: false,
         }));
         let recovered = handle_webhook(
             State(state),
@@ -12192,9 +12223,12 @@ data: [DONE]\n\n";
         let mut config = Config::default();
         config.gateway.webhook_secret = Some(secret.clone());
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         let state = AppState {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
+            sop_driver_handles: None,
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -12205,7 +12239,11 @@ data: [DONE]\n\n";
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 1, 100, 100)),
             llm_admission: None,
@@ -12271,6 +12309,7 @@ data: [DONE]\n\n";
                 headers,
                 Ok(Json(WebhookBody {
                     message: "hello".into(),
+                    stream: false,
                 })),
             )
             .await
@@ -12298,9 +12337,12 @@ data: [DONE]\n\n";
         let mut config = Config::default();
         config.gateway.webhook_secret = Some(valid_secret.clone());
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         let state = AppState {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
+            sop_driver_handles: None,
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -12311,7 +12353,11 @@ data: [DONE]\n\n";
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 1, 100, 100)),
             llm_admission: None,
@@ -12374,6 +12420,7 @@ data: [DONE]\n\n";
             headers.clone(),
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                stream: false,
             })),
         )
         .await
@@ -12387,6 +12434,7 @@ data: [DONE]\n\n";
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                stream: false,
             })),
         )
         .await
@@ -12412,9 +12460,12 @@ data: [DONE]\n\n";
         let mut config = Config::default();
         config.gateway.webhook_secret = Some(secret.clone());
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         let state = AppState {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
+            sop_driver_handles: None,
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -12425,7 +12476,11 @@ data: [DONE]\n\n";
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 1, 100, 100)),
             llm_admission: None,
@@ -12485,6 +12540,7 @@ data: [DONE]\n\n";
             headers.clone(),
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                stream: false,
             })),
         )
         .await
@@ -12499,6 +12555,7 @@ data: [DONE]\n\n";
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                stream: false,
             })),
         )
         .await

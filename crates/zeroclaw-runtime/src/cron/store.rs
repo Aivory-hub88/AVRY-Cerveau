@@ -538,7 +538,8 @@ pub fn get_job_for_agent(config: &Config, job_id: &str, agent_alias: &str) -> Re
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                      enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format,
+                     tenant_id, tenant_agent_type
              FROM cron_jobs WHERE id = ?1 AND agent_alias = ?2",
         )?;
 

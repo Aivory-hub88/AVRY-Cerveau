@@ -446,6 +446,7 @@ mod tests {
             principal_id: None,
             started_at: "2026-06-18T00:00:00Z".into(),
             finished_at: None,
+            originator_chain: Vec::new(),
         };
         task.status = TaskStatus::Paused; // recovery_pass already parked it
         goal_store

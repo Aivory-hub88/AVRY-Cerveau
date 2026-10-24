@@ -72,7 +72,8 @@ impl ControlPlaneRecoveryOwner {
         let sqlite = Arc::new(SqliteTaskStore::new(data_dir)?);
         let store: Arc<dyn TaskRegistry> = sqlite.clone();
         let goal_store: Arc<dyn GoalTaskRegistry> = sqlite;
-        let outcome = reaper::recovery_pass(store.as_ref(), goal_store.as_ref(), &boot_id).await?;
+        let outcome =
+            reaper::recovery_pass(store.as_ref(), Some(goal_store.as_ref()), &boot_id).await?;
         if outcome.reclaimed > 0 {
             ::zeroclaw_log::record!(
                 INFO,

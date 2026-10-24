@@ -1001,6 +1001,9 @@ mod tests {
             turn_id,
             agent_alias: None,
             parent_agent_alias: None,
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+            serving_provider_name: None,
+            serving_model: None,
         }
     }
 
@@ -1257,6 +1260,7 @@ mod tests {
             name: name.to_string(),
             arguments,
             tool_call_id: Some(tool_call_id.to_string()),
+            arguments_parse_error: None,
         }
     }
 
@@ -1361,6 +1365,7 @@ mod tests {
                 duration: Duration::ZERO,
                 receipt: None,
             }],
+            &[None],
             &mut prepared.ordered_results,
             0,
         )

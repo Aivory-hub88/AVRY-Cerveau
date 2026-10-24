@@ -378,6 +378,7 @@ impl ToolSearchTool {
         }
         // Block-scoped so the non-`Send` guards are out of scope before the
         // capability-graph `.await` below.
+        #[cfg_attr(not(feature = "memory-postgres"), allow(unused_variables))]
         let (output, newly_activated, returned_names) = {
             let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
             let mut guard = self
@@ -437,6 +438,7 @@ impl ToolSearchTool {
     async fn select_tools(&self, names: &[&str]) -> anyhow::Result<ToolResult> {
         // Block-scoped so the non-`Send` guards are out of scope before the
         // capability-graph `.await` below.
+        #[cfg_attr(not(feature = "memory-postgres"), allow(unused_variables))]
         let (mut output, not_found, newly_activated, returned_names) = {
             let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
             let mut output = String::from("<functions>\n");

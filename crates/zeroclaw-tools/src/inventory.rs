@@ -361,6 +361,17 @@ pub const BUILTIN_TOOLS: &[BuiltinToolSpec] = &[
         tier: ToolTier::Host,
         compilation: BuiltinToolCompilation::Always,
     },
+    // Aivory Cerveau fork tools that also register on non-tenant turns.
+    BuiltinToolSpec {
+        name: "judge",
+        tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
+    },
+    BuiltinToolSpec {
+        name: "session_search",
+        tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
+    },
     // Sandbox-bound coding CLIs.
     BuiltinToolSpec {
         name: "claude_code",
@@ -776,6 +787,17 @@ mod tests {
         );
     }
 
+    /// Aivory Cerveau tools built outside the registry factory (tenant turns, or
+    /// opt-in on a Docker runtime), so they are not registry built-ins.
+    const CERVEAU_TENANT_TOOLS: &[&str] = &[
+        "task_create",
+        "task_update_status",
+        "task_list",
+        "graph_recall",
+        "graph_remember",
+        "python_execute",
+    ];
+
     #[test]
     fn default_approval_and_otp_tool_lists_are_inventoried() {
         let profile = zeroclaw_config::schema::RiskProfileConfig::default();
@@ -785,7 +807,12 @@ mod tests {
             ("risk profile always_ask", &profile.always_ask),
             ("security.otp gated_actions", &otp.gated_actions),
         ] {
-            let missing = uninventoried(names.iter().map(String::as_str));
+            // Cerveau: these tools are built outside the registry factory, so they
+            // can be pre-approved or OTP-gated by default without being built-ins.
+            let missing: Vec<_> = uninventoried(names.iter().map(String::as_str))
+                .into_iter()
+                .filter(|name| !CERVEAU_TENANT_TOOLS.contains(&name.as_ref()))
+                .collect();
             assert!(
                 missing.is_empty(),
                 "the default {list} list names tools missing from BUILTIN_TOOLS: {missing:?}"

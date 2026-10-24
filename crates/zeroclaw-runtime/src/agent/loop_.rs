@@ -4545,7 +4545,14 @@ pub async fn process_message_streamed(
     TURN_EVENT_TX
         .scope(
             parking_lot::Mutex::new(Some(event_tx)),
-            process_message_shared(Arc::new(config), agent_alias, message, session_id, origin, None),
+            process_message_shared(
+                Arc::new(config),
+                agent_alias,
+                message,
+                session_id,
+                origin,
+                None,
+            ),
         )
         .await
 }
@@ -8217,12 +8224,14 @@ mod tests {
                 .scope(tenant, async {
                     run_tool_call_loop(ToolLoop {
                         parent_agent_alias: None,
+                        served_route_sink: None,
                         sop_reassembly: None,
                         exec: ResolvedAgentExecution {
                             model_access: ResolvedModelAccess {
                                 model_provider: &model_provider,
                                 provider_name: "scripted",
                                 model: "scripted-model",
+                                dispatch_model: "scripted-model",
                                 temperature: Some(0.0),
                             },
                             tools_registry: &tools_registry,
@@ -8242,11 +8251,15 @@ mod tests {
                             strict_tool_parsing: false,
                             parallel_tools: false,
                             max_tool_result_chars: 0,
-                            context_token_budget: 0,
+                            context_limits: test_context_limits(0),
+                            context_limits_resolver: None,
                             receipt_generator: None,
                             knobs: &LoopKnobs::default(),
+                            security: None,
                         },
                         history: &mut history,
+                        history_has_trim_breadcrumb: &mut false,
+                        injected_memory_preamble: &mut None,
                         channel_name: "cli",
                         channel_reply_target: None,
                         cancellation_token: None,

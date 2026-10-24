@@ -15739,6 +15739,13 @@ const DEFAULT_SAFE_TOOLS: &[&str] = &[
     "glob_search",
     "web_search_tool",
     "calculator",
+    // ADR-021: they only record a speech act for the room; the room carries
+    // it out after the turn, under the same user's credential and approvals.
+    "team_message",
+    "team_ask",
+    "team_delegate",
+    "team_handoff",
+    "team_remind",
 ];
 
 /// Apply a tenant's entity id to one `[[mcp.servers]]` entry, if it's

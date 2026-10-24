@@ -3042,7 +3042,7 @@ mod tests {
         let security = test_security(&config);
 
         let (success, output) =
-            Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
+            Box::pin(run_agent_job(&config, &security, "test-agent", &job, None)).await;
         assert!(!success);
         assert!(
             output.contains("tenant resolution failed"),
@@ -3067,15 +3067,17 @@ mod tests {
         let security = test_security(&config);
 
         let (success, output) =
-            Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
+            Box::pin(run_agent_job(&config, &security, "test-agent", &job, None)).await;
         // Same eventual failure as the untenanted case (no provider key
         // configured in this test's config) — the point is *which* failure:
         // it must get past the tenant check to reach the agent-run attempt,
         // proving resolution succeeded and TENANT_CONTEXT was populated
         // rather than the job being refused.
         assert!(!success);
+        // v0.8.6 reports an agent-run failure with a generic operator line
+        // (details go to the log), so match that rather than the old prefix.
         assert!(
-            output.contains("agent job failed:"),
+            output.contains("could not be completed"),
             "expected the job to reach (and fail) the agent run itself, got: {output}"
         );
         assert!(!output.contains("tenant resolution failed"));

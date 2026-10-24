@@ -47,9 +47,9 @@ pub mod scanned;
 pub mod skill_insight_ledger;
 pub mod snapshot;
 pub mod sqlite;
+mod sqlite_permissions;
 #[cfg(feature = "memory-postgres")]
 pub mod task_ledger;
-mod sqlite_permissions;
 pub mod threat;
 pub mod traits;
 pub mod vector;

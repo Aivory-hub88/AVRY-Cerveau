@@ -752,7 +752,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("one result")
-            .1
+            .output
     }
 
     /// Same as `collect_single`, but scanned through a real
@@ -799,7 +799,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("one result")
-            .1
+            .output
     }
 
     #[test]
@@ -914,6 +914,7 @@ mod tests {
             name: "shell".to_string(),
             arguments: serde_json::json!({ "command": "cat source.txt" }),
             tool_call_id: None,
+            arguments_parse_error: None,
         }];
         let ordered = vec![Some(("shell".to_string(), None, outcome(&output, true)))];
         let collected = collect_tool_results(
@@ -927,6 +928,7 @@ mod tests {
             "test-model",
             0,
             "turn-test",
+            None,
         )
         .unwrap();
 
@@ -959,6 +961,7 @@ mod tests {
                 name: "shell".to_string(),
                 arguments: serde_json::json!({ "command": "ls" }),
                 tool_call_id: None,
+                arguments_parse_error: None,
             });
             ordered.push(Some(("shell".to_string(), None, outcome("same", true))));
         }
@@ -973,6 +976,7 @@ mod tests {
             "test-model",
             0,
             "turn-test",
+            None,
         );
         let err = match err {
             Ok(_) => panic!("identical tool+args must break the turn"),

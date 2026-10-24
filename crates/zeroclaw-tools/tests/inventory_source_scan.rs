@@ -61,6 +61,30 @@ const OUTSIDE_INVENTORY: &[(&str, &str)] = &[
         "vi_verify",
         "withheld from the model-visible registry until a chain verifier exists",
     ),
+    (
+        "graph_recall",
+        "Aivory Cerveau: built per tenant turn against the cognee sidecar, not by the registry factory",
+    ),
+    (
+        "graph_remember",
+        "Aivory Cerveau: built per tenant turn against the cognee sidecar, not by the registry factory",
+    ),
+    (
+        "task_create",
+        "Aivory Cerveau: built per tenant turn against the Postgres task ledger, not by the registry factory",
+    ),
+    (
+        "task_list",
+        "Aivory Cerveau: built per tenant turn against the Postgres task ledger, not by the registry factory",
+    ),
+    (
+        "task_update_status",
+        "Aivory Cerveau: built per tenant turn against the Postgres task ledger, not by the registry factory",
+    ),
+    (
+        "python_execute",
+        "Aivory Cerveau: opt-in, registered only on a Docker runtime outside the selection macro",
+    ),
 ];
 
 fn repo_root() -> PathBuf {

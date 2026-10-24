@@ -794,7 +794,9 @@ mod tests {
         let result = serde_json::json!({"success": false, "error": "unknown MCP tool `x`"});
         let prompt = continuation_prompt(&failed_call_row(), "approve", Some(&result));
         assert!(prompt.contains("FAILED to run: unknown MCP tool `x`"));
-        assert!(prompt.contains("Do NOT call composio-googledrive-share__GOOGLEDRIVE_CREATE_PERMISSION again"));
+        assert!(prompt.contains(
+            "Do NOT call composio-googledrive-share__GOOGLEDRIVE_CREATE_PERMISSION again"
+        ));
         assert!(prompt.contains("do NOT request another approval"));
         // Must not read like a success the model should build on.
         assert!(!prompt.contains("incorporating this result"));
@@ -813,7 +815,9 @@ mod tests {
     fn approved_call_failed_only_on_an_explicit_false() {
         assert!(approved_call_failed(&serde_json::json!({"success": false})));
         assert!(!approved_call_failed(&serde_json::json!({"success": true})));
-        assert!(!approved_call_failed(&serde_json::json!({"output": "no success field"})));
+        assert!(!approved_call_failed(
+            &serde_json::json!({"output": "no success field"})
+        ));
         assert!(!approved_call_failed(&serde_json::json!("string")));
     }
 

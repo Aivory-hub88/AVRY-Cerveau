@@ -2285,6 +2285,7 @@ mod shadow_tests {
             tenant_id: None,
             agent_alias: None,
             agent_id: None,
+            principal_id: None,
         }
     }
 

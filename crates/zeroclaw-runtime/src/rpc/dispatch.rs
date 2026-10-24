@@ -21406,7 +21406,11 @@ mod tests {
                     )
                     .await;
                 assert!(!denied.success);
-                assert_eq!(denied.output, "Unknown tool: delegate");
+                assert!(
+                    denied.output.starts_with("Unknown tool: delegate"),
+                    "{}",
+                    denied.output
+                );
             }
         }
     }
@@ -21508,7 +21512,11 @@ mod tests {
             );
             let revoked = agent.dispatch_tool_for_test(TOOL, json!({})).await;
             assert!(!revoked.success);
-            assert_eq!(revoked.output, format!("Unknown tool: {TOOL}"));
+            assert!(
+                revoked.output.starts_with(&format!("Unknown tool: {TOOL}")),
+                "{}",
+                revoked.output
+            );
             if helper {
                 let selected = agent
                     .dispatch_tool_for_test(

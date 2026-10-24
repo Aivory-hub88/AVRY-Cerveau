@@ -1136,6 +1136,9 @@ mod cerveau_tests {
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+            serving_provider_name: None,
+            serving_model: None,
         };
 
         let tool_args = serde_json::json!({"invoice_id": "inv_123"});
@@ -1150,6 +1153,7 @@ mod cerveau_tests {
                             "finalize_invoice",
                             &tool_args,
                             0,
+                            zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
                         )
                         .await
                         {
@@ -1169,6 +1173,7 @@ mod cerveau_tests {
                                     ApprovalGateOutcome::Proceed { .. } => "Proceed",
                                     ApprovalGateOutcome::Deny(_) => "Deny",
                                     ApprovalGateOutcome::Replace(_) => "Replace",
+                                    ApprovalGateOutcome::Cancelled => "Cancelled",
                                 }
                             ),
                         };
