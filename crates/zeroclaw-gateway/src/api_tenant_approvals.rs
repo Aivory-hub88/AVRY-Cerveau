@@ -502,6 +502,7 @@ async fn run_continuation(
                     &prompt,
                     row.session_id.as_deref(),
                     TurnOrigin::Daemon,
+                    None,
                 ),
             ),
         ),

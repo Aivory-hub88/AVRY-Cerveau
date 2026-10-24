@@ -265,6 +265,7 @@ fn park_as_pending(
         duration: StdDuration::ZERO,
         receipt: None,
         output_data: pending_id.map(|id| serde_json::json!({"pending_id": id})),
+        attachments: Vec::new(),
     })
 }
 
@@ -310,6 +311,7 @@ fn deny_unrecorded(
         duration: StdDuration::ZERO,
         receipt: None,
         output_data: None,
+        attachments: Vec::new(),
     })
 }
 
