@@ -23733,8 +23733,10 @@ command = "rm independent-delegate-marker"
             let workspace =
                 std::env::temp_dir().join(format!("zc_link_e2e_{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&workspace).unwrap();
-            let tool = DelegateTool::new(sample_agents(), None, test_security())
-                .with_workspace_dir(workspace.clone());
+            let tool = with_in_memory_task_store(
+                DelegateTool::new(sample_agents(), None, test_security())
+                    .with_workspace_dir(workspace.clone()),
+            );
 
             // ── A. a background delegation gets a row; when it fails the row is
             //       `blocked` with an outcome, not silently `in_progress` ──
@@ -23931,16 +23933,18 @@ command = "rm independent-delegate-marker"
             let slow_ws =
                 std::env::temp_dir().join(format!("zc_link_slow_{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&slow_ws).unwrap();
-            let slow_tool = DelegateTool::new_with_options(
-                agents,
-                None,
-                test_security(),
-                zeroclaw_providers::ModelProviderRuntimeOptions {
-                    provider_api_url: Some(hang_uri),
-                    ..zeroclaw_providers::ModelProviderRuntimeOptions::default()
-                },
-            )
-            .with_workspace_dir(slow_ws.clone());
+            let slow_tool = with_in_memory_task_store(
+                DelegateTool::new_with_options(
+                    agents,
+                    None,
+                    test_security(),
+                    zeroclaw_providers::ModelProviderRuntimeOptions {
+                        provider_api_url: Some(hang_uri),
+                        ..zeroclaw_providers::ModelProviderRuntimeOptions::default()
+                    },
+                )
+                .with_workspace_dir(slow_ws.clone()),
+            );
             let running = in_tenant(
                 &user,
                 slow_tool.execute(json!({
@@ -23959,7 +23963,7 @@ command = "rm independent-delegate-marker"
             .await;
             assert_eq!(live.delegation_id.as_deref(), Some(slow_id.as_str()));
             assert_eq!(
-                wait_for_terminal_or_running(&slow_ws, &slow_id).await,
+                wait_for_terminal_or_running(&slow_tool, &slow_id).await,
                 BackgroundTaskStatus::Running,
                 "still running against the hanging provider"
             );
@@ -24493,19 +24497,27 @@ command = "rm independent-delegate-marker"
         }
 
         /// Like `wait_for_terminal_background_result`, but returns the status
-        /// after a short wait even when it is still `Running`.
+        /// after a short wait even when it is still `Running`. v0.8.6 keeps the
+        /// status in the task row, so it is read through the tool's own view.
         async fn wait_for_terminal_or_running(
-            workspace: &Path,
+            tool: &DelegateTool,
             task_id: &str,
         ) -> BackgroundTaskStatus {
             tokio::time::sleep(Duration::from_millis(800)).await;
-            let path = workspace
-                .join("delegate_results")
-                .join(format!("{task_id}.json"));
-            let text = std::fs::read_to_string(path).unwrap();
-            serde_json::from_str::<BackgroundDelegateResult>(&text)
+            let (state, _, _) = tool
+                .read_background_view(task_id, true)
+                .await
                 .unwrap()
-                .status
+                .expect("task is visible to its caller");
+            match state {
+                BackgroundResultState::Running => BackgroundTaskStatus::Running,
+                BackgroundResultState::Completed => BackgroundTaskStatus::Completed,
+                BackgroundResultState::Cancelled => BackgroundTaskStatus::Cancelled,
+                BackgroundResultState::InputRequired => BackgroundTaskStatus::InputRequired,
+                BackgroundResultState::Failed
+                | BackgroundResultState::Lost
+                | BackgroundResultState::TimedOut => BackgroundTaskStatus::Failed,
+            }
         }
     }
 
