@@ -1660,6 +1660,9 @@ mod tests {
                 Some(5),
                 Some(false),
                 None,
+                None,
+                0.7,
+                0.3,
             )
             .unwrap();
 
