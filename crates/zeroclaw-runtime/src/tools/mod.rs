@@ -1356,6 +1356,10 @@ pub(crate) fn all_tools_with_runtime_context(
 ) -> anyhow::Result<AllToolsResult> {
     #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
     let late_trace = late_tool_search_observer::capture();
+    // ADR-021: task-locals do not cross onto the builder thread, so read the
+    // room-turn and tenant scopes here, on the turn's task.
+    let team_tools = crate::agent::tenant::team_actions_available()
+        && crate::agent::tenant::current_tenant().is_some();
     let builder = move || {
         #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
         let _late_guard = late_tool_search_observer::enter_builder(late_trace);
@@ -1391,6 +1395,7 @@ pub(crate) fn all_tools_with_runtime_context(
             live_config,
             execution_capability,
             acp_sessions,
+            team_tools,
         )
     };
     std::thread::scope(|scope| -> anyhow::Result<AllToolsResult> {
@@ -1561,6 +1566,7 @@ fn all_tools_with_runtime_on_thread(
     live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
+    team_tools: bool,
 ) -> anyhow::Result<AllToolsResult> {
     #[cfg(feature = "tools-external")]
     let browser_config = _browser_config;
@@ -1744,9 +1750,9 @@ fn all_tools_with_runtime_on_thread(
     );
     // ADR-021: team communication tools, only on a Team Space room turn
     // (the gateway scopes `TEAM_ACTIONS` for those) and only for a tenant.
-    if crate::agent::tenant::team_actions_available()
-        && crate::agent::tenant::current_tenant().is_some()
-    {
+    // `team_tools` is read on the caller's task: this body runs on the
+    // builder thread, where those task-locals are not set.
+    if team_tools {
         for tool in team_comms::TeamCommsTool::all() {
             tool_arcs.push(Arc::new(tool));
         }
@@ -3839,6 +3845,82 @@ mod tests {
         core.sort();
         assert_eq!(names, core);
         assert_eq!(names.len(), 11);
+    }
+
+    fn team_tool_names_built_in(room: bool, tenant: bool) -> Vec<String> {
+        let tmp = TempDir::new().unwrap();
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let cfg = test_config(&tmp);
+        let build = || {
+            all_tools(
+                Arc::new(Config::default()),
+                &Arc::new(SecurityPolicy::default()),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+                "test-agent",
+                mem.clone(),
+                None,
+                None,
+                &BrowserConfig::default(),
+                &zeroclaw_config::schema::HttpRequestConfig::default(),
+                &zeroclaw_config::schema::WebFetchConfig::default(),
+                tmp.path(),
+                &HashMap::new(),
+                None,
+                &cfg,
+                None,
+                false,
+                None,
+            )
+            .expect("tool registry builds")
+            .tools
+            .iter()
+            .map(|t| t.name().to_string())
+            .filter(|n| n.starts_with("team_"))
+            .collect::<Vec<_>>()
+        };
+        let tenant_ctx = tenant.then(|| {
+            Arc::new(crate::agent::tenant::TenantContext {
+                tenant_id: "user1.autonomous".into(),
+                platform_user_id: "user1".into(),
+                agent_type: "autonomous".into(),
+                persona: None,
+                connected_toolkits: Vec::new(),
+                disabled_toolkits: Vec::new(),
+                tenant_custom_mcp_servers: Vec::new(),
+                active_agents: None,
+            })
+        });
+        let cell = room.then(|| Arc::new(parking_lot::Mutex::new(Vec::new())));
+        crate::agent::tenant::TENANT_CONTEXT.sync_scope(tenant_ctx, || {
+            crate::agent::tenant::TEAM_ACTIONS.sync_scope(cell, build)
+        })
+    }
+
+    /// ADR-021 regression: the registry is built on a dedicated thread, where
+    /// the turn's task-locals are not set. The room-turn check must happen on
+    /// the caller, or the team tools never reach a room turn.
+    #[test]
+    fn team_tools_reach_a_tenant_room_turn_only() {
+        let names = team_tool_names_built_in(true, true);
+        for expected in [
+            "team_message",
+            "team_ask",
+            "team_delegate",
+            "team_handoff",
+            "team_remind",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "{expected} missing: {names:?}"
+            );
+        }
+        assert!(team_tool_names_built_in(false, true).is_empty());
+        assert!(team_tool_names_built_in(true, false).is_empty());
     }
 
     fn test_config(tmp: &TempDir) -> Config {
