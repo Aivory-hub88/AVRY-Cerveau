@@ -13,6 +13,7 @@ use crate::tools::deliver_file::DeliverFileTool;
 use crate::tools::file_read::FileReadTool;
 use crate::tools::model_switch::ModelSwitchTool;
 use crate::tools::read_skill::ReadSkillTool;
+use crate::tools::run_outcome::RunOutcomeTool;
 use crate::tools::schedule::ScheduleTool;
 use crate::tools::security_ops::SecurityOpsTool;
 use crate::tools::send_message_to_peer::SendMessageToPeerTool;
@@ -56,6 +57,7 @@ tool_attribution!(SopListTool, ToolKind::SopList);
 tool_attribution!(SopStatusTool, ToolKind::SopStatus);
 tool_attribution!(SpawnSubagentTool, ToolKind::SpawnSubagent);
 tool_attribution!(TeamCommsTool, ToolKind::Plugin);
+tool_attribution!(RunOutcomeTool, ToolKind::Plugin);
 tool_attribution!(VerifiableIntentTool, ToolKind::Plugin);
 
 impl Attributable for SkillBuiltinTool {
