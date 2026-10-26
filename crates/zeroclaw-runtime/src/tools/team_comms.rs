@@ -213,13 +213,17 @@ impl Tool for TeamCommsTool {
             }
             TeamKind::Ask => {
                 "Ask one teammate in this room a question you need answered to continue. \
-                 It is posted after this turn and starts their turn; when they answer you get a new \
-                 turn with the answer. Tell the user you are checking with them, then stop."
+                 It is posted after this turn and starts their turn (or queues behind their current \
+                 one); when they answer you get a new turn with the answer. Tell the user you are \
+                 checking with them, then stop. Do not ask the same thing twice, and do not reply \
+                 to an answer just to acknowledge it."
             }
             TeamKind::Delegate => {
                 "Assign a piece of work to one teammate in this room, optionally with a due date. \
-                 It becomes a tracked task on the board and starts their turn; you are told when it \
-                 is done. Describe the task fully: they cannot see your private context."
+                 It becomes a tracked task on the board and starts their turn; you get their report \
+                 (Status: done | partial | blocked, Result, Evidence, Unblock) in a new turn. Describe \
+                 the task fully: they cannot see your private context. Never send a task back to the \
+                 teammate who gave it to you."
             }
             TeamKind::Handoff => {
                 "Hand this conversation over to one teammate in this room who is better placed to \
