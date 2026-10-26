@@ -155,6 +155,7 @@ pub(crate) fn check_open(ctx: &TurnCtx<'_>, tool_name: &str) -> Option<ToolExecu
         duration: Duration::ZERO,
         receipt: None,
         output_data: None,
+        attachments: Vec::new(),
     })
 }
 

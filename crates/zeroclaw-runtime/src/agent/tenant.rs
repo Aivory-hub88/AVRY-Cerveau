@@ -441,6 +441,79 @@ pub fn take_pending_approval() -> Option<PendingApprovalSummary> {
         .flatten()
 }
 
+/// ADR-021: one speech act an agent made towards its teammates during a turn
+/// (`team_message`, `team_ask`, `team_delegate`, `team_handoff`,
+/// `team_remind`). The engine only records it; the room the turn came from
+/// carries it out after the turn (posts the message, starts the teammate's
+/// turn, routes the answer back, schedules the reminder), so every exchange
+/// is a visible message the human can read and stop.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TeamAction {
+    /// `message` | `ask` | `delegate` | `handoff` | `remind`.
+    pub kind: String,
+    /// The teammate (agent type or display name, as the model wrote it), or
+    /// `self` for a reminder to the calling agent. The room resolves and
+    /// validates it against the agents actually in the room.
+    pub to: String,
+    pub text: String,
+    /// `delegate`: optional due date as the model wrote it (ISO 8601).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub due: Option<String>,
+    /// `remind`: when, as ISO 8601 or a relative `in 2h` / `in 3d`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
+}
+
+/// At most this many team actions per turn; the rest are refused to the model.
+pub const MAX_TEAM_ACTIONS_PER_TURN: usize = 3;
+
+tokio::task_local! {
+    /// ADR-021: the room-turn cell team tools write into. Scoped by the
+    /// gateway only for a turn that came from a Team Space room
+    /// (`X-Room-Channel: discussion`), so on every other channel the team
+    /// tools are simply not offered (see `team_actions_available`).
+    pub static TEAM_ACTIONS: Option<Arc<parking_lot::Mutex<Vec<TeamAction>>>>;
+}
+
+/// Whether this turn can carry team actions back to a room.
+pub fn team_actions_available() -> bool {
+    TEAM_ACTIONS
+        .try_with(|cell| cell.is_some())
+        .unwrap_or(false)
+}
+
+/// Record a team action for the room. `Err` (a message for the model) when the
+/// turn is not a room turn or the per-turn cap is reached.
+pub fn record_team_action(action: TeamAction) -> Result<usize, String> {
+    let recorded = TEAM_ACTIONS.try_with(|cell| {
+        let Some(cell) = cell else {
+            return Err("team messaging is only available in a Team Space room".to_string());
+        };
+        let mut actions = cell.lock();
+        if actions.len() >= MAX_TEAM_ACTIONS_PER_TURN {
+            return Err(format!(
+                "at most {MAX_TEAM_ACTIONS_PER_TURN} team messages per turn; send the rest next turn"
+            ));
+        }
+        actions.push(action);
+        Ok(actions.len())
+    });
+    recorded.unwrap_or_else(|_| {
+        Err("team messaging is only available in a Team Space room".to_string())
+    })
+}
+
+/// Take this turn's recorded team actions (empty outside a room turn).
+pub fn take_team_actions() -> Vec<TeamAction> {
+    TEAM_ACTIONS
+        .try_with(|cell| {
+            cell.as_ref()
+                .map(|cell| std::mem::take(&mut *cell.lock()))
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+
 /// ADR-009 Phase 1: fire-time tenant resolution for non-HTTP entry points
 /// (today: `cron::scheduler::run_agent_job`; any future non-webhook
 /// caller — a channel, a delegated sub-turn — can reuse the same
