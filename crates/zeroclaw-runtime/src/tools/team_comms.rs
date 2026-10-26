@@ -272,7 +272,9 @@ impl Tool for TeamCommsTool {
                 "Park the request you are working on because you are blocked on something outside \
                  this turn (a teammate's delegated task, a build, a reply from a customer). The room \
                  keeps the request and your note, and gives you a new turn that repeats both when the \
-                 wait wakes: at 'until', when a task you delegated finishes, or when a webhook wakes it."
+                 wait wakes: at 'until', when a task you delegated finishes, or when a webhook wakes it. \
+                 Whenever the request names a time or a delay ('in 2 minutes', 'tomorrow at 9', \
+                 'after an hour'), pass it as 'until': without 'until' the wait never wakes on a timer."
             }
             TeamKind::WaitClose => {
                 "Close a wait you opened with team_wait, because the thing you were waiting for \
@@ -342,7 +344,7 @@ impl Tool for TeamCommsTool {
                     "note": { "type": "string", "minLength": 1, "maxLength": MAX_TEXT_CHARS,
                               "description": "What you are waiting for and what to do once it arrives." },
                     "until": { "type": "string",
-                               "description": "Optional wake time: ISO 8601, or 'in 30m' / 'in 2h' / 'in 3d' (1 minute to 30 days)." }
+                               "description": "When to wake: ISO 8601, or 'in 30m' / 'in 2h' / 'in 3d' (1 minute to 30 days). Set it whenever the request gives a time or delay; leave it out only when the wait should wake solely on a teammate's result or a webhook." }
                 },
                 "required": ["note"],
                 "additionalProperties": false
@@ -661,6 +663,19 @@ mod tests {
         assert!(err.contains("'until'"), "{err}");
         let (empty, _) = in_room(tool("team_wait").execute(json!({"note": ""}))).await;
         assert!(!empty.unwrap().success);
+    }
+
+    #[test]
+    fn wait_tells_the_model_to_pass_a_requested_time_as_until() {
+        let wait = tool("team_wait");
+        assert!(wait.description().contains("pass it as 'until'"));
+        let until = &wait.parameters_schema()["properties"]["until"]["description"];
+        assert!(
+            until
+                .as_str()
+                .unwrap()
+                .contains("Set it whenever the request gives a time")
+        );
     }
 
     #[tokio::test]
