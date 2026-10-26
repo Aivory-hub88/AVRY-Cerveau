@@ -6,6 +6,7 @@ pub mod context_analyzer;
 pub mod cost;
 pub mod dispatcher;
 pub mod eval;
+pub mod execution_tree_budget;
 pub mod graph_sync;
 pub mod history;
 pub mod history_pruner;
@@ -29,10 +30,15 @@ pub(crate) mod turn;
 
 pub use turn::context::TurnMeta;
 pub use turn::{
+    ContextWindowExceeded, append_safeguard_fallback_notice, context_window_exceeded_from_error,
     is_semantic_empty_terminal_completion,
+    media_degrade::{
+        degrade_media_in_message, degrade_media_in_messages, is_turn_opening_user_message,
+    },
     redact::{is_credential_key, scrub_credentials_value},
     semantic_empty_terminal_completion_message, terminal_completion_error_message,
 };
+pub use turn::{SteeringAdmission, SteeringAdmit, SteeringInput, SteeringPosture};
 
 pub(crate) fn is_runtime_approved_arg_tool(tool_name: &str) -> bool {
     matches!(
@@ -68,10 +74,10 @@ impl ::zeroclaw_api::attribution::Attributable for AgentAttribution<'_> {
     }
 }
 
-#[cfg(test)]
-mod tests;
-
 #[allow(unused_imports)]
 pub use agent::{Agent, AgentBuilder, TurnEvent};
 #[allow(unused_imports)]
-pub use loop_::{process_message, process_message_streamed, run};
+pub use loop_::{process_message, process_message_streamed, process_message_with_live_config, run};
+
+#[cfg(test)]
+mod tests;

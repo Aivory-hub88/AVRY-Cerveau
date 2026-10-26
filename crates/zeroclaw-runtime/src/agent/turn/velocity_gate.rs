@@ -65,6 +65,12 @@ pub(crate) fn check_velocity_park(
     if mgr.risk_tier(tool_name) == zeroclaw_config::schema::ToolRiskTier::Safe {
         return None;
     }
+    // Delegation writes nothing itself: every mutating call the sub-agent makes
+    // passes this gate on its own. Counting the hop too would park a coordinator
+    // that fans work out, while protecting nothing.
+    if tool_name == "delegate" {
+        return None;
+    }
     // Only gate calls that would actually execute. Anything the approval
     // gate would deny, prompt, or park already has its own handling — and
     // must not consume the execution budget.
@@ -81,6 +87,14 @@ pub(crate) fn check_velocity_park(
         .as_ref()
         .map(|t| t.agent_type.clone())
         .unwrap_or_default();
+    // Tests share one process-global registry; give each test thread its own
+    // tenantless bucket so unrelated tests cannot exhaust each other's budget.
+    #[cfg(test)]
+    let tenant_id = if tenant_id.is_empty() {
+        format!("{:?}", std::thread::current().id())
+    } else {
+        tenant_id
+    };
     let key = (tenant_id, agent_type, tool_name.to_string());
 
     let window = Duration::from_secs(ctx.pacing.write_velocity_window_secs.max(1));
@@ -265,6 +279,7 @@ fn park_as_pending(
         duration: StdDuration::ZERO,
         receipt: None,
         output_data: pending_id.map(|id| serde_json::json!({"pending_id": id})),
+        attachments: Vec::new(),
     })
 }
 
@@ -310,6 +325,7 @@ fn deny_unrecorded(
         duration: StdDuration::ZERO,
         receipt: None,
         output_data: None,
+        attachments: Vec::new(),
     })
 }
 
@@ -376,6 +392,9 @@ mod tests {
             turn_id: "velocity-test-turn",
             agent_alias: None,
             parent_agent_alias: None,
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+            serving_provider_name: None,
+            serving_model: None,
         }
     }
 
@@ -388,6 +407,7 @@ mod tests {
             connected_toolkits: Vec::new(),
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: Vec::new(),
+            active_agents: None,
         })
     }
 

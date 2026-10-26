@@ -12,6 +12,7 @@ pub(crate) enum ApprovalGateOutcome {
     Proceed { approved: bool },
     Deny(ToolExecutionOutcome),
     Replace(ToolExecutionOutcome),
+    Cancelled,
 }
 
 /// Run the approval flow for one tool call (upstream loop body, approval
@@ -28,8 +29,9 @@ pub(crate) async fn gate_tool_approval(
     tool_name: &str,
     tool_args: &serde_json::Value,
     iteration: usize,
+    position: zeroclaw_api::channel::ApprovalPosition,
 ) -> ApprovalGateOutcome {
-    let outcome = gate_tool_approval_inner(ctx, tool_name, tool_args, iteration).await;
+    let outcome = gate_tool_approval_inner(ctx, tool_name, tool_args, iteration, position).await;
     observe_gate(ctx, tool_name, tool_args, &outcome);
     outcome
 }
@@ -75,6 +77,7 @@ fn observe_gate(
             pending_id_of(o),
         ),
         ApprovalGateOutcome::Replace(_) => ("replace", None),
+        ApprovalGateOutcome::Cancelled => ("cancelled", None),
     };
     let origin_message = crate::agent::tenant::current_turn_origin()
         .as_ref()
@@ -101,11 +104,55 @@ fn pending_id_of(outcome: &ToolExecutionOutcome) -> Option<&str> {
         .and_then(|v| v.as_str())
 }
 
+/// An identical call approved this many times inside the window is not parked
+/// again. Two allows one legitimate retry after a first approved attempt that
+/// did not finish; a third request means approving it again will not help.
+const REPARK_MAX_APPROVED: usize = 2;
+const REPARK_WINDOW_MINUTES: i64 = 15;
+
+/// `Some(deny outcome)` when this exact call has already been approved
+/// `REPARK_MAX_APPROVED` times within `REPARK_WINDOW_MINUTES`. A store read
+/// error returns `None`: the guard fails open, so a store hiccup can never
+/// block a legitimate approval (the normal gate still applies).
+fn repeated_approval_denial(
+    store: &crate::control_plane::pending_approvals::PendingApprovalsStore,
+    principal: &str,
+    tool_name: &str,
+    arguments: &str,
+) -> Option<ToolExecutionOutcome> {
+    let approved = store
+        .count_recent_approved(
+            principal,
+            tool_name,
+            arguments,
+            chrono::Duration::minutes(REPARK_WINDOW_MINUTES),
+        )
+        .ok()?;
+    if approved < REPARK_MAX_APPROVED {
+        return None;
+    }
+    Some(ToolExecutionOutcome {
+        output: format!(
+            "This exact call to {tool_name} was already approved {approved} times in the last \
+             {REPARK_WINDOW_MINUTES} minutes and still has not completed, so no new approval \
+             was requested. Do not try it again. Tell the user it keeps failing after approval, \
+             and ask them to check the integration or contact an operator."
+        ),
+        success: false,
+        error_reason: Some("repeated approval for an identical call".to_string()),
+        duration: Duration::ZERO,
+        receipt: None,
+        output_data: None,
+        attachments: Vec::new(),
+    })
+}
+
 async fn gate_tool_approval_inner(
     ctx: &TurnCtx<'_>,
     tool_name: &str,
     tool_args: &serde_json::Value,
     iteration: usize,
+    position: zeroclaw_api::channel::ApprovalPosition,
 ) -> ApprovalGateOutcome {
     let mut approval_requirement = ctx
         .approval
@@ -132,6 +179,16 @@ async fn gate_tool_approval_inner(
         // before — out-of-band execution only.
         let pending_id: Option<String> = match ctx.approval.and_then(|mgr| mgr.pending_store()) {
             Some(store) => {
+                // Hard guard against an approve -> not-done -> re-park loop:
+                // the same call already approved REPARK_MAX_APPROVED times in
+                // the last REPARK_WINDOW_MINUTES is not parked again. The
+                // continuation prompt already tells the model not to retry;
+                // this does not rely on it obeying.
+                if let Some(denied) =
+                    repeated_approval_denial(store, &principal, tool_name, &tool_args.to_string())
+                {
+                    return ApprovalGateOutcome::Deny(denied);
+                }
                 let id = match store.insert_with_context(
                     &principal,
                     tool_name,
@@ -175,6 +232,7 @@ async fn gate_tool_approval_inner(
                             duration: Duration::ZERO,
                             receipt: None,
                             output_data: None,
+                            attachments: Vec::new(),
                         });
                     }
                 };
@@ -223,6 +281,7 @@ async fn gate_tool_approval_inner(
                             duration: Duration::ZERO,
                             receipt: None,
                             output_data: None,
+                            attachments: Vec::new(),
                         });
                     }
                 }
@@ -283,6 +342,7 @@ async fn gate_tool_approval_inner(
             duration: Duration::ZERO,
             receipt: None,
             output_data: pending_id.map(|id| serde_json::json!({"pending_id": id})),
+            attachments: Vec::new(),
         });
     }
 
@@ -300,14 +360,55 @@ async fn gate_tool_approval_inner(
         // back to auto-deny.
         let (decision, decided_by, unanswerable) = if mgr.is_non_interactive() {
             let attributed = if let Some(ch) = ctx.channel {
+                let arguments_summary = crate::approval::summarize_args(&request.arguments);
+                let arguments_summary =
+                    match (ctx.channel_name, ctx.agent_alias, ctx.parent_agent_alias) {
+                        ("delegate", Some(target), Some(caller)) => {
+                            let attribution = crate::i18n::get_required_cli_string_with_args(
+                                "channel-approval-independent-delegate",
+                                &[
+                                    ("target", &format!("{target:?}")),
+                                    ("caller", &format!("{caller:?}")),
+                                ],
+                            );
+                            format!("{attribution}\n{arguments_summary}")
+                        }
+                        _ => arguments_summary,
+                    };
                 let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
                     tool_name: request.tool_name.clone(),
-                    arguments_summary: crate::approval::summarize_args(&request.arguments),
+                    arguments_summary,
                     raw_arguments: Some(request.arguments.clone()),
+                    position: Some(position),
                 };
                 let recipient = ctx.channel_reply_target.unwrap_or_default();
-                match ch.request_approval_attributed(recipient, &ch_request).await {
+                // Narration rides the async delta queue to the draft updater,
+                // while this approval call goes to the channel directly and
+                // can overtake it. A flush barrier waits until the updater
+                // consumed (and flushed) the turn's narration, so the user
+                // sees the pre-tool message before the approval prompt.
+                if ch.supports_turn_flush_narration()
+                    && let Some(tx) = ctx.on_delta
+                {
+                    let (barrier, ack) = StreamDelta::flush_barrier();
+                    if tx.send(barrier).await.is_ok() {
+                        let _ = ack.await;
+                    }
+                }
+                let response = if let Some(cancel) = ctx.cancellation_token {
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => return ApprovalGateOutcome::Cancelled,
+                        response = ch.request_approval_attributed(recipient, &ch_request) => response,
+                    }
+                } else {
+                    ch.request_approval_attributed(recipient, &ch_request).await
+                };
+                match response {
                     Ok(Some(a)) => Some(a),
+                    Ok(None) if mgr.unsupported_backchannel_may_fall_back(tool_name) => {
+                        return ApprovalGateOutcome::Proceed { approved: false };
+                    }
                     Ok(None) => None,
                     Err(e) => {
                         ::zeroclaw_log::record!(
@@ -360,7 +461,10 @@ async fn gate_tool_approval_inner(
             };
             (decision, decided_by, unanswerable)
         } else {
-            (mgr.prompt_cli(&request), None, false)
+            match mgr.prompt_cli(&request) {
+                Ok(decision) => (decision, None, false),
+                Err(_) => (ApprovalResponse::No, None, true),
+            }
         };
 
         let decision_channel = decided_by.unwrap_or_else(|| ctx.channel_name.to_string());
@@ -370,10 +474,11 @@ async fn gate_tool_approval_inner(
             // This string is fed back to the MODEL, so it states the outcome and
             // stops there. It deliberately does not name the settings that would
             // permit the call: `auto_approve` bypasses operator approval for that
-            // tool and `level = "full"` removes approval gates for every tool and
-            // drops workspace-only confinement. Putting that remedy in front of the
-            // model invites it to argue for expanding its own privileges, which is a
-            // disproportionate response to an approval channel being unavailable.
+            // tool and `level = "full"` auto-approves uncovered tools (tools in
+            // `always_ask` still prompt or fail closed). Putting that remedy in
+            // front of the model invites it to argue for expanding its own
+            // privileges, which is a disproportionate response to an approval
+            // channel being unavailable.
             // Operators get the actionable advice through the WARN record below and
             // the UI, where changing policy is actually their decision to make.
             let denied = if unanswerable {
@@ -420,10 +525,17 @@ async fn gate_tool_approval_inner(
                         // to lobby for its own privilege expansion.
                         "denied_by_runtime": unanswerable,
                         "operator_hint": if unanswerable {
-                            Some("No operator could be asked. Check that an approval-capable \
-                                  channel is connected and that the agent's approval route names \
-                                  a registered, reachable approver. If this tool should run \
-                                  unattended, review the agent's risk profile deliberately.")
+                            if mgr.is_non_interactive() {
+                                Some("No operator could be asked. Check that an approval-capable \
+                                      channel is connected and that the agent's approval route names \
+                                      a registered, reachable approver. If this tool should run \
+                                      unattended, review the agent's risk profile deliberately.")
+                            } else {
+                                Some("CLI approval input was unavailable. Run with a controlling \
+                                      terminal or readable stdin so an operator can answer. If this \
+                                      tool should run unattended, review the agent's risk profile \
+                                      deliberately.")
+                            }
                         } else {
                             None
                         },
@@ -440,6 +552,7 @@ async fn gate_tool_approval_inner(
             }
             return ApprovalGateOutcome::Deny(ToolExecutionOutcome {
                 output: denied.clone(),
+                attachments: Vec::new(),
                 success: false,
                 error_reason: Some(denied),
                 duration: Duration::ZERO,
@@ -475,6 +588,7 @@ async fn gate_tool_approval_inner(
             );
             return ApprovalGateOutcome::Replace(ToolExecutionOutcome {
                 output: crate::approval::sanitize_tool_replacement(replacement),
+                attachments: Vec::new(),
                 success: true,
                 error_reason: None,
                 duration: Duration::ZERO,
@@ -495,6 +609,453 @@ async fn gate_tool_approval_inner(
 
 #[cfg(test)]
 mod tests {
+    use super::{ApprovalGateOutcome, gate_tool_approval};
+    use crate::agent::turn::context::TurnCtx;
+    use crate::approval::ApprovalManager;
+    use crate::observability::NoopObserver;
+    use crate::rpc::approval_channel::RpcApprovalChannel;
+    use crate::rpc::context::ApprovalPendingMap;
+    use crate::security::AutonomyLevel;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+    use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
+    use zeroclaw_api::channel::{
+        Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    };
+    use zeroclaw_api::jsonrpc::RpcOutbound;
+    use zeroclaw_config::schema::{PacingConfig, RiskProfileConfig, StreamReasoningMode};
+
+    fn full_always_ask_profile() -> RiskProfileConfig {
+        RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            always_ask: vec![" shell ".into()],
+            ..RiskProfileConfig::default()
+        }
+    }
+
+    fn test_ctx<'a>(
+        observer: &'a NoopObserver,
+        pacing: &'a PacingConfig,
+        approval: Option<&'a ApprovalManager>,
+        channel: Option<&'a dyn Channel>,
+    ) -> TurnCtx<'a> {
+        TurnCtx {
+            parent_agent_alias: None,
+            observer,
+            provider_name: "stub",
+            model: "stub-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+            temperature: None,
+            approval,
+            channel_name: "test",
+            channel_reply_target: Some("operator"),
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing,
+            strict_tool_parsing: false,
+            channel,
+            agent_alias: None,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+            turn_id: "trace-approval-gate",
+            serving_provider_name: None,
+            serving_model: None,
+        }
+    }
+
+    // Re-execute this test in a new session so /dev/tty is genuinely unavailable.
+    // Only the child owns stdin and the process-global log subscriber.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cli_approval_input_provenance_regression_11335() {
+        use std::io::Write;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        const CHILD_MODE: &str = "ZEROCLAW_TEST_11335_APPROVAL_CHILD";
+        const TEST_NAME: &str =
+            "agent::turn::approval_gate::tests::cli_approval_input_provenance_regression_11335";
+
+        let Ok(mode) = std::env::var(CHILD_MODE) else {
+            let mut failures = Vec::new();
+            for (mode, input) in [
+                ("no", Some("n\n")),
+                ("blank", Some("\n")),
+                ("unknown", Some("maybe\n")),
+                ("yes", Some("y\n")),
+                ("always", Some("always\n")),
+                ("eof", None),
+                ("read_error", None),
+            ] {
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+                    .env(CHILD_MODE, mode)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                // SAFETY: setsid is async-signal-safe; no Rust locks or allocations
+                // are used in the post-fork hook before exec.
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::setsid() == -1 {
+                            Err(std::io::Error::last_os_error())
+                        } else {
+                            Ok(())
+                        }
+                    });
+                }
+                if mode == "read_error" {
+                    // Reading a directory as stdin produces a real I/O error.
+                    command.stdin(Stdio::from(std::fs::File::open("/").unwrap()));
+                } else if input.is_some() {
+                    command.stdin(Stdio::piped());
+                } else {
+                    command.stdin(Stdio::null());
+                }
+                let mut child = command.spawn().unwrap();
+                if let Some(input) = input {
+                    child
+                        .stdin
+                        .take()
+                        .unwrap()
+                        .write_all(input.as_bytes())
+                        .unwrap();
+                }
+                let output = child.wait_with_output().unwrap();
+                if !output.status.success() {
+                    failures.push(format!(
+                        "{mode}: {}\n{}\n{}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                } else {
+                    print!("{}", String::from_utf8_lossy(&output.stdout));
+                    println!("CLI approval control {mode}: passed");
+                }
+            }
+            assert!(failures.is_empty(), "{}", failures.join("\n"));
+            return;
+        };
+
+        assert!(std::fs::File::open("/dev/tty").is_err());
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut log_events = zeroclaw_log::subscribe_or_install();
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let profile = RiskProfileConfig {
+            level: AutonomyLevel::Supervised,
+            auto_approve: Vec::new(),
+            always_ask: Vec::new(),
+            ..RiskProfileConfig::default()
+        };
+        let approval = ApprovalManager::from_risk_profile(&profile);
+        assert!(approval.needs_approval("shell"));
+        let ctx = TurnCtx {
+            channel_name: "cli",
+            ..test_ctx(&observer, &pacing, Some(&approval), None)
+        };
+        let outcome = gate_tool_approval(
+            &ctx,
+            "shell",
+            &serde_json::json!({"command": "true"}),
+            0,
+            zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+        )
+        .await;
+        let unavailable = mode == "eof" || mode == "read_error";
+        if mode == "yes" || mode == "always" {
+            assert!(matches!(
+                outcome,
+                ApprovalGateOutcome::Proceed { approved: true }
+            ));
+        } else {
+            let ApprovalGateOutcome::Deny(outcome) = outcome else {
+                panic!("{mode} must remain fail-closed");
+            };
+            assert!(!outcome.success);
+            if unavailable {
+                assert!(
+                    outcome
+                        .output
+                        .contains("no operator decision was available"),
+                    "{mode} was incorrectly attributed: {}",
+                    outcome.output
+                );
+                assert!(outcome.output.contains("This was not a user's decision."));
+                assert!(!outcome.output.contains("Denied by user"));
+            } else {
+                assert!(outcome.output.starts_with("Denied by user."));
+            }
+            let mut rejection = None;
+            while let Ok(event) = log_events.try_recv() {
+                if event["attributes"]["tool"] == "shell"
+                    && event["attributes"].get("denied_by_runtime").is_some()
+                {
+                    rejection = Some(event);
+                }
+            }
+            let rejection = rejection.expect("real approval rejection audit event");
+            assert_eq!(rejection["attributes"]["denied_by_runtime"], unavailable);
+            assert_eq!(
+                rejection["attributes"]["operator_hint"].is_string(),
+                unavailable
+            );
+            assert_eq!(rejection["attributes"]["result"], outcome.output);
+            println!("CLI approval observed {mode}: {}", rejection["attributes"]);
+        }
+        let expected_decision = match mode.as_str() {
+            "yes" => crate::approval::ApprovalResponse::Yes,
+            "always" => crate::approval::ApprovalResponse::Always,
+            _ => crate::approval::ApprovalResponse::No,
+        };
+        let decisions = approval.audit_log();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].decision, expected_decision);
+        assert_eq!(
+            approval.session_allowlist().contains("shell"),
+            mode == "always"
+        );
+    }
+
+    struct ApprovingChannel {
+        approval_requests: Arc<AtomicUsize>,
+    }
+
+    impl Attributable for ApprovingChannel {
+        fn role(&self) -> Role {
+            Role::Channel(ChannelKind::AcpChannel)
+        }
+        fn alias(&self) -> &str {
+            "approving-test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for ApprovingChannel {
+        fn name(&self) -> &str {
+            "approving-test"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn request_approval(
+            &self,
+            _recipient: &str,
+            _request: &ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+            self.approval_requests.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(ChannelApprovalResponse::Approve))
+        }
+    }
+
+    #[tokio::test]
+    async fn full_always_ask_fail_closed_without_channel_does_not_execute() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let profile = full_always_ask_profile();
+        let approval = ApprovalManager::for_non_interactive(&profile);
+        let ctx = test_ctx(&observer, &pacing, Some(&approval), None);
+
+        match gate_tool_approval(
+            &ctx,
+            "shell",
+            &serde_json::json!({"command": "ls"}),
+            0,
+            zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+        )
+        .await
+        {
+            ApprovalGateOutcome::Deny(outcome) => {
+                assert!(!outcome.success);
+                assert!(
+                    outcome.output.contains("requires approval"),
+                    "plain non-interactive Full+always_ask must fail closed, got {}",
+                    outcome.output
+                );
+            }
+            ApprovalGateOutcome::Proceed { approved } => {
+                panic!("listed Full tool must not silently execute (approved={approved})")
+            }
+            ApprovalGateOutcome::Replace(_) => panic!("listed Full tool must not be replaced"),
+            ApprovalGateOutcome::Cancelled => panic!("unexpected cancellation"),
+        }
+
+        match gate_tool_approval(
+            &ctx,
+            "file_write",
+            &serde_json::json!({"path": "x"}),
+            0,
+            zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+        )
+        .await
+        {
+            ApprovalGateOutcome::Proceed { approved: true } => {}
+            ApprovalGateOutcome::Proceed { approved: false } => {
+                panic!("uncovered Full tool must still auto-approve")
+            }
+            ApprovalGateOutcome::Deny(_)
+            | ApprovalGateOutcome::Replace(_)
+            | ApprovalGateOutcome::Cancelled => {
+                panic!("uncovered Full tool must still auto-approve")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn full_always_ask_backchannel_requests_approval_and_uncovered_still_executes() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let profile = full_always_ask_profile();
+        let approval = ApprovalManager::for_non_interactive_backchannel(&profile);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let channel = ApprovingChannel {
+            approval_requests: Arc::clone(&requests),
+        };
+        let ctx = test_ctx(&observer, &pacing, Some(&approval), Some(&channel));
+
+        match gate_tool_approval(
+            &ctx,
+            "shell",
+            &serde_json::json!({"command": "ls"}),
+            0,
+            zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+        )
+        .await
+        {
+            ApprovalGateOutcome::Proceed { approved: true } => {}
+            ApprovalGateOutcome::Proceed { approved: false } => {
+                panic!("back-channel approval must mark the listed tool approved")
+            }
+            ApprovalGateOutcome::Deny(outcome) => {
+                panic!(
+                    "back-channel approval must permit the listed tool, got {}",
+                    outcome.output
+                )
+            }
+            ApprovalGateOutcome::Replace(_) => panic!("unexpected replace"),
+            ApprovalGateOutcome::Cancelled => panic!("unexpected cancellation"),
+        }
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "listed Full tool must go through the real back-channel request path"
+        );
+
+        match gate_tool_approval(
+            &ctx,
+            "file_write",
+            &serde_json::json!({"path": "x"}),
+            0,
+            zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+        )
+        .await
+        {
+            ApprovalGateOutcome::Proceed { approved: true } => {}
+            ApprovalGateOutcome::Proceed { approved: false }
+            | ApprovalGateOutcome::Deny(_)
+            | ApprovalGateOutcome::Replace(_)
+            | ApprovalGateOutcome::Cancelled => {
+                panic!("uncovered Full tool must still auto-approve")
+            }
+        }
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "uncovered Full tool must not prompt the back-channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_turn_drops_pending_channel_approval() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(4);
+        let rpc = Arc::new(RpcOutbound::new(writer_tx));
+        let pending = Arc::new(ApprovalPendingMap::default());
+        let channel = RpcApprovalChannel::new(
+            "rpc",
+            "session-approval",
+            rpc,
+            Arc::clone(&pending),
+            Default::default(),
+        );
+        let approval =
+            ApprovalManager::for_non_interactive_backchannel(&RiskProfileConfig::default());
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cancel = CancellationToken::new();
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test",
+            model: "test-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+            temperature: None,
+            approval: Some(&approval),
+            channel_name: "rpc",
+            channel_reply_target: Some("operator"),
+            cancellation_token: Some(&cancel),
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: Some(&channel),
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "turn-approval",
+            agent_alias: Some("default"),
+            parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
+        };
+
+        let arguments = serde_json::json!({"command": "sleep 60"});
+        let approval_wait = gate_tool_approval(
+            &ctx,
+            "shell",
+            &arguments,
+            0,
+            zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+        );
+        tokio::pin!(approval_wait);
+        let line = tokio::select! {
+            outcome = &mut approval_wait => panic!("approval completed before cancellation: {}", matches!(outcome, ApprovalGateOutcome::Cancelled)),
+            line = writer_rx.recv() => line.expect("approval request notification"),
+        };
+        let frame: serde_json::Value = serde_json::from_str(&line).expect("valid notification");
+        let request_id = frame["params"]["request_id"]
+            .as_str()
+            .expect("approval request id")
+            .to_string();
+        assert!(pending.contains(&request_id));
+
+        cancel.cancel();
+        assert!(matches!(
+            approval_wait.await,
+            ApprovalGateOutcome::Cancelled
+        ));
+        assert!(
+            !pending.contains(&request_id),
+            "cancelling the turn must drop the stale approval responder"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cerveau_tests {
     use super::*;
     use crate::agent::tenant::{
         LAST_PENDING_APPROVAL, TENANT_CONTEXT, TURN_ORIGIN_CONTEXT, TenantContext,
@@ -543,6 +1104,7 @@ mod tests {
             connected_toolkits: Vec::new(),
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: Vec::new(),
+            active_agents: None,
         });
         let turn_origin = Arc::new(TurnOriginContext {
             session_id: Some("sess-1".to_string()),
@@ -574,6 +1136,9 @@ mod tests {
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+            serving_provider_name: None,
+            serving_model: None,
         };
 
         let tool_args = serde_json::json!({"invoice_id": "inv_123"});
@@ -588,6 +1153,7 @@ mod tests {
                             "finalize_invoice",
                             &tool_args,
                             0,
+                            zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
                         )
                         .await
                         {
@@ -607,6 +1173,7 @@ mod tests {
                                     ApprovalGateOutcome::Proceed { .. } => "Proceed",
                                     ApprovalGateOutcome::Deny(_) => "Deny",
                                     ApprovalGateOutcome::Replace(_) => "Replace",
+                                    ApprovalGateOutcome::Cancelled => "Cancelled",
                                 }
                             ),
                         };
@@ -629,5 +1196,43 @@ mod tests {
         assert_eq!(row.tool_name, "finalize_invoice");
         assert_eq!(row.tenant_id.as_deref(), Some("u1.leads_qualifier"));
         assert_eq!(row.agent_type.as_deref(), Some("leads_qualifier"));
+    }
+
+    fn approve_once(store: &PendingApprovalsStore, principal: &str, tool: &str, args: &str) {
+        let id = store.insert(principal, tool, args, "irreversible").unwrap();
+        assert!(store.resolve(&id, "approved", "tenant-webhook").unwrap());
+    }
+
+    #[test]
+    fn repeated_approval_guard_allows_a_retry_then_refuses_the_next_park() {
+        let store = PendingApprovalsStore::new_in_memory().unwrap();
+        let (tool, args) = ("composio-x__DO_THING", r#"{"a":1}"#);
+
+        assert!(repeated_approval_denial(&store, "u1", tool, args).is_none());
+        approve_once(&store, "u1", tool, args);
+        // One approval: a legitimate retry is still allowed.
+        assert!(repeated_approval_denial(&store, "u1", tool, args).is_none());
+        approve_once(&store, "u1", tool, args);
+        // Two approvals of the identical call and it is back again: refuse.
+        let denied = repeated_approval_denial(&store, "u1", tool, args)
+            .expect("third request for an identical, twice-approved call is refused");
+        assert!(!denied.success);
+        assert!(denied.output.contains("approved 2 times"));
+        assert!(denied.output.contains("Do not try it again"));
+        assert_eq!(
+            denied.error_reason.as_deref(),
+            Some("repeated approval for an identical call")
+        );
+    }
+
+    #[test]
+    fn repeated_approval_guard_ignores_other_calls_and_other_tenants() {
+        let store = PendingApprovalsStore::new_in_memory().unwrap();
+        let (tool, args) = ("composio-x__DO_THING", r#"{"a":1}"#);
+        approve_once(&store, "u1", tool, args);
+        approve_once(&store, "u1", tool, args);
+        assert!(repeated_approval_denial(&store, "u1", tool, r#"{"a":2}"#).is_none());
+        assert!(repeated_approval_denial(&store, "u1", "composio-x__OTHER", args).is_none());
+        assert!(repeated_approval_denial(&store, "u2", tool, args).is_none());
     }
 }

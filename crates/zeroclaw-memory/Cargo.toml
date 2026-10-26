@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 description = "Memory backends, embeddings, consolidation, and retrieval for ZeroClaw."
 repository.workspace = true
+homepage.workspace = true
 publish = true
 
 [dependencies]
@@ -19,7 +20,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 parking_lot = "0.12"
 regex = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 sha2 = "0.10"
@@ -41,6 +42,9 @@ r2d2_postgres = { version = "0.18", optional = true }
 # Agent Task Ledger: gzip-compress archived (done) tasks before storing them
 # as bytea — see task_ledger.rs's archive-on-done path.
 flate2 = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [features]
 memory-postgres = ["dep:postgres", "dep:pgvector", "dep:r2d2", "dep:r2d2_postgres", "zeroclaw-config/memory-postgres", "tokio/rt"]

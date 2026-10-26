@@ -24,7 +24,7 @@ use axum::response::IntoResponse;
 use serde::Deserialize;
 
 use crate::{AdminReloadGate, AppState, admin_reload_gate};
-use zeroclaw_config::schema::apply_tenant_entity_scoping;
+use zeroclaw_config::schema::{apply_composio_auth_header, apply_tenant_entity_scoping};
 
 type JsonErr = (StatusCode, Json<serde_json::Value>);
 
@@ -329,6 +329,20 @@ pub(crate) async fn execute_approved_tool(
             "success": false,
             "error": "server is tenant-gated but this row has no principal, or its url \
                       failed to parse — refusing to connect unscoped",
+        });
+    };
+
+    // The live turn path injects the operator's Composio key into every
+    // `requires_composio_toolkit` server (`apply_composio_auth_header`); this
+    // out-of-band executor connects on its own, so without the same step it
+    // reaches Composio with no credentials (HTTP 401) and `connect_all`'s
+    // non-fatal skip then surfaces as a misleading "unknown MCP tool".
+    // Same fail-closed rule: no key in the environment, no connection.
+    let Some(scoped_server) = apply_composio_auth_header(scoped_server) else {
+        return serde_json::json!({
+            "success": false,
+            "error": "composio-backed server but no Composio API key is configured \
+                      (CERVEAU_COMPOSIO_API_KEY / COMPOSIO_API_KEY) — refusing to connect unauthenticated",
         });
     };
 

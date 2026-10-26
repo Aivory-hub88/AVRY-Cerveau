@@ -1,12 +1,12 @@
-//! Built-in `tool_search` tool for on-demand MCP tool schema loading.
+//! `tool_search` discovery for built-in and MCP tool schemas.
 
 use std::fmt::Write;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet};
-use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use crate::mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet, deferred_search_score};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, ToolSpec};
 
 /// Default maximum number of search results.
 const DEFAULT_MAX_RESULTS: usize = 5;
@@ -82,8 +82,11 @@ type CapabilityGraphHandle = (
 );
 
 /// Built-in tool that fetches full schemas for deferred MCP tools.
+/// Fetches full schemas for admitted deferred built-ins and MCP tools.
 pub struct ToolSearchTool {
-    deferred: DeferredMcpToolSet,
+    // This is the executable deferred registry, not a cached grants record.
+    // Session admission may only remove entries from it.
+    deferred: Mutex<Option<DeferredMcpToolSet>>,
     activated: Arc<Mutex<ActivatedToolSet>>,
     access_policy: Option<ToolAccessPolicy>,
     activation_hook: Option<ActivationHook>,
@@ -92,9 +95,24 @@ pub struct ToolSearchTool {
 }
 
 impl ToolSearchTool {
+    /// The native creator's callable name; ownership is claimed on creation.
+    pub const NAME: &'static str = "tool_search";
+
     pub fn new(deferred: DeferredMcpToolSet, activated: Arc<Mutex<ActivatedToolSet>>) -> Self {
         Self {
-            deferred,
+            deferred: Mutex::new(Some(deferred)),
+            activated,
+            access_policy: None,
+            activation_hook: None,
+            #[cfg(feature = "memory-postgres")]
+            capability_graph: None,
+        }
+    }
+
+    /// Built-in schema discovery requires no MCP registry or executable wrapper.
+    pub fn for_builtin_schemas(activated: Arc<Mutex<ActivatedToolSet>>) -> Self {
+        Self {
+            deferred: Mutex::new(None),
             activated,
             access_policy: None,
             activation_hook: None,
@@ -130,6 +148,50 @@ impl ToolSearchTool {
         self
     }
 
+    /// Remove revoked schemas and activated tools together. Recovering a
+    /// poisoned guard is safe here because every surviving entry is checked
+    /// against the current ceiling before execution can resume.
+    pub fn narrow_to_caller(&self, allowed: &[String]) {
+        let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(deferred) = deferred.as_mut() {
+            deferred
+                .stubs
+                .retain(|stub| allowed.contains(&stub.prefixed_name));
+        }
+        self.activated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain_allowed(allowed);
+    }
+
+    /// Advertise only still-loadable, not-yet-activated tools, from the same
+    /// registry used by both keyword search and exact selection.
+    pub fn deferred_prompt_section(&self) -> String {
+        let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        let activated = self.activated.lock().unwrap_or_else(|e| e.into_inner());
+        let names = activated
+            .tool_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let mut section = match self.access_policy.as_ref() {
+            Some(policy) => {
+                crate::mcp_deferred::build_deferred_builtin_tools_section(&activated, Some(policy))
+            }
+            None => activated.deferred_builtin_prompt_section(),
+        };
+        if let Some(deferred) = deferred.as_ref() {
+            section.push_str(
+                &crate::mcp_deferred::build_deferred_tools_section_excluding(
+                    deferred,
+                    self.access_policy.as_ref(),
+                    &names,
+                ),
+            );
+        }
+        section
+    }
+
     fn is_allowed(&self, tool_name: &str) -> bool {
         self.access_policy
             .as_ref()
@@ -148,11 +210,11 @@ impl ToolSearchTool {
 #[async_trait]
 impl Tool for ToolSearchTool {
     fn name(&self) -> &str {
-        "tool_search"
+        Self::NAME
     }
 
     fn description(&self) -> &str {
-        "Fetch full schema definitions for deferred MCP tools so they can be called. \
+        "Fetch full schema definitions for deferred built-in and MCP tools. \
          Use \"select:name1,name2\" for exact match or keywords to search."
     }
 
@@ -202,84 +264,71 @@ impl Tool for ToolSearchTool {
             return self.select_tools(&names).await;
         }
 
-        // Keyword search mode.
-        // When a policy is active, fetch all matches so denied tools don't
-        // consume result slots. Same reasoning extends to Phase 4.2's
-        // capability-graph rerank: it can only promote a lower-keyword-rank
-        // candidate above max_results's cutoff if it's actually in the pool
-        // reranking sees — truncating to max_results before reranking would
-        // make the rerank step unable to change anything it doesn't already
-        // agree with. The max_results cap is applied after filtering/reranking.
-        #[cfg(feature = "memory-postgres")]
-        let widen_for_rerank = self.capability_graph.is_some();
-        #[cfg(not(feature = "memory-postgres"))]
-        let widen_for_rerank = false;
-        let search_limit = if self.access_policy.is_some() || widen_for_rerank {
-            usize::MAX
-        } else {
-            max_results
-        };
-        let results = self.deferred.search(query, search_limit);
-        if results.is_empty() {
-            return Ok(ToolResult {
-                success: true,
-                output: "No matching deferred tools found.".into(),
-                error: None,
-            });
+        self.search_tools(query, max_results).await
+    }
+}
+
+impl ToolSearchTool {
+    /// Select built-in metadata or activate an MCP wrapper. Only MCP tools
+    /// enter the executable set and the activation hook's notification list.
+    fn load_schema(
+        deferred: Option<&DeferredMcpToolSet>,
+        activated: &mut ActivatedToolSet,
+        name: &str,
+        newly_activated: &mut Vec<Arc<dyn Tool>>,
+    ) -> Option<ToolSpec> {
+        if let Some(spec) = activated.select_builtin_schema(name) {
+            activated.mark_loaded_on_demand(name);
+            return Some(spec);
         }
+        let deferred = deferred?;
+        let spec = deferred.tool_spec(name)?;
+        if !activated.is_activated(name)
+            && let Some(tool) = deferred.activate(name)
+        {
+            let tool: Arc<dyn Tool> = Arc::from(tool);
+            activated.activate_on_demand(name.to_string(), Arc::clone(&tool));
+            newly_activated.push(tool);
+        } else {
+            activated.mark_loaded_on_demand(name);
+        }
+        Some(spec)
+    }
 
-        // Cerveau (Phase 4.2): rerank by learned per-tenant "commonly used
-        // together" affinity to whatever's already activated this session.
-        // A no-op (order unchanged) when no ranker is attached, or when
-        // nothing is activated yet to rank against — see
-        // `zeroclaw_memory::capability_graph`'s module docs for scope.
-        #[cfg(feature = "memory-postgres")]
-        let results: Vec<_> = match &self.capability_graph {
-            Some((tenant_id, ranker)) => {
-                let recent: Vec<String> = {
-                    let guard = self
-                        .activated
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    guard.tool_specs().iter().map(|s| s.name.clone()).collect()
-                };
-                if recent.is_empty() {
-                    results
-                } else {
-                    let candidates: Vec<String> =
-                        results.iter().map(|s| s.prefixed_name.clone()).collect();
-                    let ranked_names = ranker.rerank(tenant_id, &candidates, &recent).await;
-                    let by_name: std::collections::HashMap<&str, _> = results
-                        .iter()
-                        .map(|s| (s.prefixed_name.as_str(), *s))
-                        .collect();
-                    ranked_names
-                        .iter()
-                        .filter_map(|n| by_name.get(n.as_str()).copied())
-                        .collect()
-                }
-            }
-            None => results,
-        };
+    /// Cerveau: keep the loaded schemas inside their bounds after a call
+    /// loaded `returned`, and tell the model what was unloaded so it can
+    /// load it again instead of calling a tool that is gone.
+    fn enforce_limits(
+        activated: &mut ActivatedToolSet,
+        returned: &std::collections::HashSet<String>,
+        output: &mut String,
+    ) {
+        let unloaded = activated.enforce_on_demand_limits(returned);
+        if unloaded.is_empty() {
+            return;
+        }
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
+                .with_attrs(::serde_json::json!({ "unloaded": unloaded })),
+            "tool_search unloaded least recently used schemas to stay inside the context budget"
+        );
+        let _ = write!(
+            output,
+            "\nUnloaded to stay inside the context budget (least recently used): {}. \
+             To use one again, call tool_search with \"select:<name>\" first.",
+            unloaded.join(", ")
+        );
+    }
 
-        // Activate and return full specs (policy-filtered, then capped)
-        let mut output = String::from("<functions>\n");
-        let mut activated_count = 0;
-        // Tools surfaced together in this call — the capability-graph
-        // "used together" proxy signal (Phase 4.2). Collected unconditionally
-        // (cheap: `String` pushes) so the lock-scope block below stays
-        // identical regardless of the `memory-postgres` feature; only its
-        // *consumer* after the block is feature-gated.
-        let mut surfaced_names: Vec<String> = Vec::new();
-        // Explicit block, not a bare `drop(guard)`: guarantees the
-        // non-`Send` `MutexGuard` is lexically out of scope before the
-        // `record_co_activation(...).await` below, regardless of how the
-        // `#[async_trait]`-generated future's drop-tracking treats an
-        // explicit `drop()` call on a match-bound bindings.
-        let newly_activated = {
-            let mut newly_activated = Vec::new();
-            let mut returned_count = 0;
-            let mut guard = match self.activated.lock() {
+    async fn search_tools(&self, query: &str, max_results: usize) -> anyhow::Result<ToolResult> {
+        // Ranking holds both locks; the capability-graph rerank below awaits, so
+        // the std `MutexGuard`s must be out of scope first (they are not `Send`).
+        #[cfg_attr(not(feature = "memory-postgres"), allow(unused_mut))]
+        let (mut results, recently_activated) = {
+            let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = match self.activated.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => {
                     ::zeroclaw_log::record!(
@@ -295,47 +344,99 @@ impl Tool for ToolSearchTool {
                     poisoned.into_inner()
                 }
             };
-
-            for stub in &results {
-                if returned_count >= max_results {
-                    break;
-                }
-                if !self.is_allowed(&stub.prefixed_name) {
-                    ::zeroclaw_log::record!(
-                        DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                        &format!(
-                            "tool_search: '{}' matched query but denied by access policy",
-                            stub.prefixed_name
-                        )
-                    );
-                    continue;
-                }
-                if let Some(spec) = self.deferred.tool_spec(&stub.prefixed_name) {
-                    if !guard.is_activated(&stub.prefixed_name)
-                        && let Some(tool) = self.deferred.activate(&stub.prefixed_name)
-                    {
-                        let tool: Arc<dyn Tool> = Arc::from(tool);
-                        guard.activate(stub.prefixed_name.clone(), Arc::clone(&tool));
-                        newly_activated.push(tool);
-                        activated_count += 1;
+            let terms: Vec<_> = query
+                .split_whitespace()
+                .map(str::to_ascii_lowercase)
+                .collect();
+            // Rank the combined catalog before capping. Denied names never occupy
+            // a result slot. MCP ties preserve the registry's existing order.
+            let mut results = Vec::new();
+            if let Some(deferred) = deferred.as_ref() {
+                for stub in &deferred.stubs {
+                    let hits =
+                        deferred_search_score(&stub.prefixed_name, &stub.description, &terms);
+                    if hits > 0 && self.is_allowed(&stub.prefixed_name) {
+                        results.push((stub.prefixed_name.clone(), hits));
                     }
-                    let _ = writeln!(
-                        output,
-                        "<function>{{\"name\": \"{}\", \"description\": \"{}\", \"parameters\": {}}}</function>",
-                        spec.name,
-                        spec.description.replace('"', "\\\""),
-                        spec.parameters
-                    );
-                    surfaced_names.push(stub.prefixed_name.clone());
-                    returned_count += 1;
                 }
             }
-
-            newly_activated
+            let mut builtin_specs: Vec<_> = guard.deferred_builtin_specs().collect();
+            builtin_specs.sort_by(|a, b| a.name.cmp(&b.name));
+            for spec in builtin_specs {
+                let hits = deferred_search_score(&spec.name, &spec.description, &terms);
+                if hits > 0 && self.is_allowed(&spec.name) {
+                    results.push((spec.name.clone(), hits));
+                }
+            }
+            results.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+            let recently_activated: Vec<String> = guard
+                .tool_specs()
+                .iter()
+                .map(|spec| spec.name.clone())
+                .collect();
+            (results, recently_activated)
         };
+        #[cfg(not(feature = "memory-postgres"))]
+        let _ = recently_activated;
 
-        output.push_str("</functions>\n");
+        // Cerveau (Phase 4.2): rerank by learned per-tenant "commonly used
+        // together" affinity to whatever's already activated this session.
+        // A no-op (order unchanged) when no ranker is attached, or when
+        // nothing is activated yet to rank against — see
+        // `zeroclaw_memory::capability_graph`'s module docs for scope.
+        #[cfg(feature = "memory-postgres")]
+        if let Some((tenant_id, ranker)) = &self.capability_graph
+            && !recently_activated.is_empty()
+            && !results.is_empty()
+        {
+            let candidates: Vec<String> = results.iter().map(|(name, _)| name.clone()).collect();
+            let ranked = ranker
+                .rerank(tenant_id, &candidates, &recently_activated)
+                .await;
+            let mut by_name: std::collections::HashMap<String, usize> = results.drain(..).collect();
+            results = ranked
+                .into_iter()
+                .filter_map(|name| by_name.remove(&name).map(|hits| (name, hits)))
+                .collect();
+        }
+        if results.is_empty() {
+            return Ok(ToolResult {
+                success: true,
+                output: "No matching deferred tools found.".into(),
+                error: None,
+            });
+        }
+        // Block-scoped so the non-`Send` guards are out of scope before the
+        // capability-graph `.await` below.
+        #[cfg_attr(not(feature = "memory-postgres"), allow(unused_variables))]
+        let (output, newly_activated, returned_names) = {
+            let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = self
+                .activated
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut output = String::from("<functions>\n");
+            let mut newly_activated = Vec::new();
+            let mut returned_names = std::collections::HashSet::new();
+            for (name, _) in &results {
+                if returned_names.len() >= max_results {
+                    break;
+                }
+                if returned_names.contains(name) {
+                    continue;
+                }
+                if let Some(spec) =
+                    Self::load_schema(deferred.as_ref(), &mut guard, name, &mut newly_activated)
+                {
+                    write_schema(&mut output, &spec)?;
+                    returned_names.insert(name.clone());
+                }
+            }
+            output.push_str("</functions>\n");
+            Self::enforce_limits(&mut guard, &returned_names, &mut output);
+            (output, newly_activated, returned_names)
+        };
+        let activated_count = newly_activated.len();
         self.notify_activated(newly_activated);
 
         // Cerveau (Phase 4.2): the tools surfaced together by one keyword
@@ -345,9 +446,8 @@ impl Tool for ToolSearchTool {
         // `record_co_activation` itself, never propagated to this call.
         #[cfg(feature = "memory-postgres")]
         if let Some((tenant_id, ranker)) = &self.capability_graph {
-            ranker
-                .record_co_activation(tenant_id, &surfaced_names)
-                .await;
+            let surfaced: Vec<String> = returned_names.iter().cloned().collect();
+            ranker.record_co_activation(tenant_id, &surfaced).await;
         }
 
         ::zeroclaw_log::record!(
@@ -365,21 +465,17 @@ impl Tool for ToolSearchTool {
             error: None,
         })
     }
-}
 
-impl ToolSearchTool {
     async fn select_tools(&self, names: &[&str]) -> anyhow::Result<ToolResult> {
-        let mut output = String::from("<functions>\n");
-        let mut not_found = Vec::new();
-        let mut activated_count = 0;
-        // Same rationale as `execute`'s keyword-search branch: collected
-        // unconditionally, consumed only behind the feature gate below.
-        let mut found_names: Vec<String> = Vec::new();
-        // Explicit block (not a bare `drop(guard)`) so the non-`Send`
-        // `MutexGuard` is lexically out of scope before the
-        // `record_co_activation(...).await` below.
-        let newly_activated = {
+        // Block-scoped so the non-`Send` guards are out of scope before the
+        // capability-graph `.await` below.
+        #[cfg_attr(not(feature = "memory-postgres"), allow(unused_variables))]
+        let (mut output, not_found, newly_activated, returned_names) = {
+            let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+            let mut output = String::from("<functions>\n");
+            let mut not_found = Vec::new();
             let mut newly_activated = Vec::new();
+            let mut returned_names = std::collections::HashSet::new();
             let mut guard = match self.activated.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => {
@@ -398,7 +494,7 @@ impl ToolSearchTool {
             };
 
             for name in names {
-                if name.is_empty() {
+                if name.is_empty() || returned_names.contains(*name) {
                     continue;
                 }
                 if !self.is_allowed(name) {
@@ -410,24 +506,10 @@ impl ToolSearchTool {
                     not_found.push(*name);
                     continue;
                 }
-                match self.deferred.tool_spec(name) {
+                match Self::load_schema(deferred.as_ref(), &mut guard, name, &mut newly_activated) {
                     Some(spec) => {
-                        if !guard.is_activated(name)
-                            && let Some(tool) = self.deferred.activate(name)
-                        {
-                            let tool: Arc<dyn Tool> = Arc::from(tool);
-                            guard.activate(String::from(*name), Arc::clone(&tool));
-                            newly_activated.push(tool);
-                            activated_count += 1;
-                        }
-                        let _ = writeln!(
-                            output,
-                            "<function>{{\"name\": \"{}\", \"description\": \"{}\", \"parameters\": {}}}</function>",
-                            spec.name,
-                            spec.description.replace('"', "\\\""),
-                            spec.parameters
-                        );
-                        found_names.push((*name).to_string());
+                        write_schema(&mut output, &spec)?;
+                        returned_names.insert(*name);
                     }
                     None => {
                         not_found.push(*name);
@@ -435,10 +517,15 @@ impl ToolSearchTool {
                 }
             }
 
-            newly_activated
+            output.push_str("</functions>\n");
+            let keep = returned_names
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect();
+            Self::enforce_limits(&mut guard, &keep, &mut output);
+            (output, not_found, newly_activated, returned_names)
         };
-
-        output.push_str("</functions>\n");
+        let activated_count = newly_activated.len();
         self.notify_activated(newly_activated);
 
         // Cerveau (Phase 4.2): a multi-name `select:` call is an even
@@ -447,7 +534,8 @@ impl ToolSearchTool {
         // keyword-search path above.
         #[cfg(feature = "memory-postgres")]
         if let Some((tenant_id, ranker)) = &self.capability_graph {
-            ranker.record_co_activation(tenant_id, &found_names).await;
+            let found: Vec<String> = returned_names.iter().map(|n| (*n).to_string()).collect();
+            ranker.record_co_activation(tenant_id, &found).await;
         }
 
         if !not_found.is_empty() {
@@ -470,6 +558,30 @@ impl ToolSearchTool {
             error: None,
         })
     }
+}
+
+/// Keep the existing function envelope while escaping descriptions as JSON
+/// and retaining any declared structured-output schema and parameter domains.
+fn write_schema(output: &mut String, spec: &ToolSpec) -> serde_json::Result<()> {
+    let _ = write!(
+        output,
+        "<function>{{\"name\": {}, \"description\": {}, \"parameters\": {}",
+        serde_json::to_string(&spec.name)?,
+        serde_json::to_string(&spec.description)?,
+        spec.parameters
+    );
+    if let Some(schema) = &spec.output {
+        let _ = write!(output, ", \"output\": {schema}");
+    }
+    if !spec.param_domains.is_empty() {
+        let _ = write!(
+            output,
+            ", \"param_domains\": {}",
+            serde_json::to_string(&spec.param_domains)?
+        );
+    }
+    output.push_str("}</function>\n");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -507,6 +619,283 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(guard.is_activated(tool_name));
+    }
+
+    fn builtin_spec(name: &str, description: &str) -> ToolSpec {
+        ToolSpec::new(
+            name,
+            description,
+            serde_json::json!({
+                "type": "object",
+                "properties": {"event_date": {"type": "string", "format": "date"}},
+                "required": ["event_date"]
+            }),
+        )
+    }
+
+    fn returned_schemas(result: &ToolResult) -> Vec<serde_json::Value> {
+        result
+            .output
+            .lines()
+            .filter_map(|line| line.strip_prefix("<function>")?.strip_suffix("</function>"))
+            .map(|schema| serde_json::from_str(schema).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn builtin_only_search_returns_full_schema_without_executable_activation() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let mut spec = builtin_spec(
+            "calendar",
+            "Manage events.\nUse the \"calendar\" path C:\\events.",
+        );
+        spec.output = Some(serde_json::json!({
+            "type": "object", "properties": {"event_id": {"type": "string"}}
+        }));
+        activated
+            .lock()
+            .unwrap()
+            .set_deferred_builtin_specs(vec![spec.clone()]);
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_hook = Arc::clone(&seen);
+        let tool = ToolSearchTool::for_builtin_schemas(Arc::clone(&activated))
+            .with_activation_hook(Arc::new(move |tool| {
+                seen_hook.lock().unwrap().push(tool.name().to_string());
+            }));
+        assert!(tool.deferred.lock().unwrap().is_none());
+        let prompt = tool.deferred_prompt_section();
+        assert!(prompt.contains("calendar - Manage events."));
+        assert!(!prompt.contains("event_date"));
+
+        // The full description remains searchable even though the compact
+        // prompt advertises only its first line.
+        let result = tool
+            .execute(serde_json::json!({"query": "C:\\events"}))
+            .await
+            .unwrap();
+        let schemas = returned_schemas(&result);
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0], serde_json::to_value(&spec).unwrap());
+        let guard = activated.lock().unwrap();
+        assert!(guard.is_builtin_schema_exposed("calendar"));
+        assert!(!guard.is_activated("calendar"));
+        assert!(guard.get("calendar").is_none());
+        assert!(guard.get_resolved("calendar").is_none());
+        assert!(guard.tool_names().is_empty());
+        assert!(guard.tool_specs().is_empty());
+        drop(guard);
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(tool.deferred_prompt_section().is_empty());
+    }
+
+    #[tokio::test]
+    async fn builtin_exact_selection_preserves_explicit_names_and_recovers_poisoned_lock() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        activated.lock().unwrap().set_deferred_builtin_specs(vec![
+            builtin_spec("calendar", "Calendar events"),
+            builtin_spec("weather", "Weather forecast"),
+        ]);
+        let poison = Arc::clone(&activated);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poison.lock().unwrap();
+                panic!("test poison");
+            })
+            .join()
+            .is_err()
+        );
+        let tool = ToolSearchTool::for_builtin_schemas(Arc::clone(&activated));
+        let result = tool
+            .execute(serde_json::json!({
+                "query": "select:calendar,calendar,weather", "max_results": 1
+            }))
+            .await
+            .unwrap();
+        assert_eq!(returned_schemas(&result).len(), 2);
+        {
+            let guard = activated.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(guard.is_builtin_schema_exposed("calendar"));
+            assert!(guard.is_builtin_schema_exposed("weather"));
+            assert!(guard.tool_specs().is_empty());
+        }
+        assert!(tool.deferred_prompt_section().is_empty());
+        let result = tool
+            .execute(serde_json::json!({"query": "select:weather"}))
+            .await
+            .unwrap();
+        assert_eq!(returned_schemas(&result)[0]["name"], "weather");
+        assert!(tool.deferred_prompt_section().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mixed_search_and_selection_share_result_limit_and_only_activate_mcp() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        activated.lock().unwrap().set_deferred_builtin_specs(vec![
+            builtin_spec("calendar", "Calendar events search"),
+            builtin_spec("weather", "Weather search"),
+        ]);
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_hook = Arc::clone(&seen);
+        let tool = ToolSearchTool::new(
+            make_deferred_set(vec![make_stub("remote__calendar", "Calendar search")]).await,
+            Arc::clone(&activated),
+        )
+        .with_activation_hook(Arc::new(move |tool| {
+            seen_hook.lock().unwrap().push(tool.name().to_string());
+        }));
+        let prompt = tool.deferred_prompt_section();
+        assert!(prompt.contains("calendar - Calendar events search"));
+        assert!(prompt.contains("remote__calendar - Calendar search"));
+        let result = tool
+            .execute(serde_json::json!({"query": "calendar events search", "max_results": 2}))
+            .await
+            .unwrap();
+        let schemas = returned_schemas(&result);
+        assert_eq!(schemas.len(), 2);
+        assert_eq!(schemas[0]["name"], "calendar");
+        assert_eq!(schemas[1]["name"], "remote__calendar");
+        {
+            let guard = activated.lock().unwrap();
+            assert!(guard.is_builtin_schema_exposed("calendar"));
+            assert!(!guard.is_builtin_schema_exposed("weather"));
+            assert!(guard.is_activated("remote__calendar"));
+            assert_eq!(guard.tool_names(), vec!["remote__calendar"]);
+        }
+        assert_eq!(seen.lock().unwrap().as_slice(), ["remote__calendar"]);
+
+        let result = tool
+            .execute(serde_json::json!({
+                "query": "select:weather,remote__calendar,calendar", "max_results": 1
+            }))
+            .await
+            .unwrap();
+        assert_eq!(returned_schemas(&result).len(), 3);
+        assert_eq!(returned_schemas(&result)[0]["name"], "weather");
+        assert_eq!(seen.lock().unwrap().as_slice(), ["remote__calendar"]);
+        assert!(tool.deferred_prompt_section().is_empty());
+    }
+
+    #[tokio::test]
+    async fn builtin_policy_and_principal_narrowing_remove_discovery_and_selection() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        activated.lock().unwrap().set_deferred_builtin_specs(vec![
+            builtin_spec("calendar", "Calendar tool"),
+            builtin_spec("weather", "Weather tool"),
+            builtin_spec("blocked", "Blocked tool"),
+            builtin_spec("outside", "Outside caller tool"),
+            builtin_spec("risk_blocked", "Outside risk tool"),
+        ]);
+        let policy = ToolAccessPolicy {
+            allowed: Some(vec![
+                "calendar".into(),
+                "weather".into(),
+                "blocked".into(),
+                "outside".into(),
+            ]),
+            caller_allowed: Some(vec![
+                "calendar".into(),
+                "weather".into(),
+                "blocked".into(),
+                "risk_blocked".into(),
+            ]),
+            denied: Some(vec!["blocked".into()]),
+        };
+        let tool =
+            ToolSearchTool::for_builtin_schemas(Arc::clone(&activated)).with_access_policy(policy);
+        let prompt = tool.deferred_prompt_section();
+        assert!(prompt.contains("calendar"));
+        for denied in ["blocked", "outside", "risk_blocked"] {
+            assert!(!prompt.contains(denied));
+        }
+        let result = tool
+            .execute(serde_json::json!({"query": "tool", "max_results": 1}))
+            .await
+            .unwrap();
+        assert_eq!(returned_schemas(&result).len(), 1);
+        assert_eq!(returned_schemas(&result)[0]["name"], "calendar");
+        let denied = tool
+            .execute(serde_json::json!({"query": "select:blocked,outside,risk_blocked"}))
+            .await
+            .unwrap();
+        assert!(returned_schemas(&denied).is_empty());
+        assert!(
+            !activated
+                .lock()
+                .unwrap()
+                .is_builtin_schema_exposed("blocked")
+        );
+
+        tool.narrow_to_caller(&["weather".to_string()]);
+        let prompt = tool.deferred_prompt_section();
+        assert!(prompt.contains("weather"));
+        assert!(!prompt.contains("calendar"));
+        for query in ["calendar", "select:calendar"] {
+            let result = tool
+                .execute(serde_json::json!({"query": query}))
+                .await
+                .unwrap();
+            assert!(returned_schemas(&result).is_empty());
+        }
+        let guard = activated.lock().unwrap();
+        assert_eq!(
+            guard.hidden_builtin_names(),
+            std::collections::HashSet::from(["weather".to_string()])
+        );
+        assert!(guard.tool_specs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn principal_narrowing_keeps_positive_prompt_and_blocks_reactivation() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let tool = ToolSearchTool::new(
+            make_deferred_set(vec![
+                make_stub("mcp__keep", "retained tool"),
+                make_stub("mcp__revoke", "revoked tool"),
+            ])
+            .await,
+            Arc::clone(&activated),
+        );
+        assert!(tool.deferred_prompt_section().contains("mcp__revoke"));
+        tool.execute(serde_json::json!({"query":"select:mcp__revoke"}))
+            .await
+            .unwrap();
+        assert!(activated.lock().unwrap().is_activated("mcp__revoke"));
+        let poison = Arc::clone(&activated);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poison.lock().unwrap();
+                panic!("test poison");
+            })
+            .join()
+            .is_err()
+        );
+        tool.narrow_to_caller(&["mcp__keep".into()]);
+        let prompt = tool.deferred_prompt_section();
+        assert!(prompt.contains("mcp__keep") && prompt.contains("tool_search"));
+        assert!(!prompt.contains("mcp__revoke"));
+        for query in ["select:mcp__revoke", "revoked"] {
+            let result = tool
+                .execute(serde_json::json!({"query":query}))
+                .await
+                .unwrap();
+            assert!(!result.output.contains("<function>{"));
+            assert!(
+                !activated
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_activated("mcp__revoke")
+            );
+        }
+        tool.execute(serde_json::json!({"query":"select:mcp__keep"}))
+            .await
+            .unwrap();
+        assert!(
+            activated
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_activated("mcp__keep")
+        );
+        assert!(tool.deferred_prompt_section().is_empty());
     }
 
     #[tokio::test]
@@ -986,6 +1375,21 @@ mod tests {
     }
 
     #[test]
+    fn empty_caller_allowlist_denies_every_mcp_tool() {
+        // The principal tool narrowing flows in as `caller_allowed`. An
+        // empty principal list must yield a tool-less session even in the
+        // presence of MCP `<server>__<tool>` names, which the risk-profile
+        // gate would otherwise auto-admit. No `__` escape at the caller layer.
+        let policy = ToolAccessPolicy::from_security(None, None, Some(&[]))
+            .expect("an empty caller allowlist still produces a policy");
+        assert!(!policy.is_tool_allowed("shell"));
+        assert!(
+            !policy.is_tool_allowed("filesystem__write_file"),
+            "empty caller allowlist must deny MCP tools despite the __ auto-admit"
+        );
+    }
+
+    #[test]
     fn caller_allowed_per_run_gate_still_honors_denylist() {
         let policy = ToolAccessPolicy::from_security(
             Some(&["shell".to_string()]),
@@ -1204,5 +1608,35 @@ mod tests {
             assert!(result.success);
             assert!(result.output.contains("srv__a"));
         }
+    }
+
+    #[tokio::test]
+    async fn select_past_the_bound_unloads_the_oldest_schema_and_says_so() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::with_limits(2, usize::MAX)));
+        activated.lock().unwrap().set_deferred_builtin_specs(vec![
+            builtin_spec("alpha", "first"),
+            builtin_spec("beta", "second"),
+            builtin_spec("gamma", "third"),
+        ]);
+        let tool = ToolSearchTool::for_builtin_schemas(Arc::clone(&activated));
+        let first = tool
+            .execute(serde_json::json!({"query": "select:alpha,beta"}))
+            .await
+            .unwrap();
+        assert!(!first.output.to_string().contains("Unloaded"));
+        let second = tool
+            .execute(serde_json::json!({"query": "select:gamma"}))
+            .await
+            .unwrap();
+        let text = second.output.to_string();
+        assert!(
+            text.contains("Unloaded to stay inside the context budget"),
+            "{text}"
+        );
+        assert!(text.contains("alpha"), "{text}");
+        let guard = activated.lock().unwrap();
+        assert!(!guard.is_builtin_schema_exposed("alpha"));
+        assert!(guard.is_builtin_schema_exposed("beta"));
+        assert!(guard.is_builtin_schema_exposed("gamma"));
     }
 }
