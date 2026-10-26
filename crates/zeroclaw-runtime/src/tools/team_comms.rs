@@ -1,8 +1,8 @@
 //! ADR-021: agent-to-agent communication in a Team Space room.
 //!
-//! Five tools — `team_message`, `team_ask`, `team_delegate`, `team_handoff`,
-//! `team_remind` — let an agent talk to its teammates the way people in a room
-//! do. A call validates its arguments and records a [`TeamAction`] for the
+//! Seven tools — `team_message`, `team_ask`, `team_delegate`, `team_handoff`,
+//! `team_remind`, `team_wait`, `team_wait_close` — let an agent talk to its
+//! teammates the way people in a room do, and park work it is blocked on. A call validates its arguments and records a [`TeamAction`] for the
 //! room; it has no side effect of its own. After the turn the room carries it
 //! out: it posts the message from this agent, starts the teammate's turn, sends
 //! the answer back to the asker, and fires reminders when they are due. So the
@@ -17,13 +17,15 @@ use async_trait::async_trait;
 use serde_json::json;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
-/// The five tool names, for registration and the risk-tier safe list.
-pub const TEAM_TOOL_NAMES: [&str; 5] = [
+/// The seven tool names, for registration and the risk-tier safe list.
+pub const TEAM_TOOL_NAMES: [&str; 7] = [
     "team_message",
     "team_ask",
     "team_delegate",
     "team_handoff",
     "team_remind",
+    "team_wait",
+    "team_wait_close",
 ];
 
 const MAX_TEXT_CHARS: usize = 2000;
@@ -45,6 +47,8 @@ enum TeamKind {
     Delegate,
     Handoff,
     Remind,
+    Wait,
+    WaitClose,
 }
 
 impl TeamKind {
@@ -55,6 +59,8 @@ impl TeamKind {
             Self::Delegate => "team_delegate",
             Self::Handoff => "team_handoff",
             Self::Remind => "team_remind",
+            Self::Wait => "team_wait",
+            Self::WaitClose => "team_wait_close",
         }
     }
 
@@ -65,17 +71,19 @@ impl TeamKind {
             Self::Delegate => "delegate",
             Self::Handoff => "handoff",
             Self::Remind => "remind",
+            Self::Wait => "wait",
+            Self::WaitClose => "wait_close",
         }
     }
 }
 
-/// One of the five team communication tools.
+/// One of the seven team communication tools.
 pub struct TeamCommsTool {
     kind: TeamKind,
 }
 
 impl TeamCommsTool {
-    /// All five tools, in [`TEAM_TOOL_NAMES`] order.
+    /// All seven tools, in [`TEAM_TOOL_NAMES`] order.
     pub fn all() -> Vec<Self> {
         [
             TeamKind::Message,
@@ -83,6 +91,8 @@ impl TeamCommsTool {
             TeamKind::Delegate,
             TeamKind::Handoff,
             TeamKind::Remind,
+            TeamKind::Wait,
+            TeamKind::WaitClose,
         ]
         .into_iter()
         .map(|kind| Self { kind })
@@ -187,6 +197,30 @@ pub(crate) fn reminder_delay_minutes(
     Some((at.with_timezone(&chrono::Utc) - now).num_minutes())
 }
 
+/// `if_missed` for a reminder: `run_once` | `skip`, or the room's default.
+fn validate_missed(missed: &str) -> Result<Option<String>, String> {
+    match missed.to_ascii_lowercase().replace('-', "_").as_str() {
+        "" => Ok(None),
+        p @ ("run_once" | "skip") => Ok(Some(p.to_string())),
+        _ => Err("'if_missed' must be 'run_once' or 'skip'".into()),
+    }
+}
+
+/// A wait id as the room hands it out (`[Wait w_…]` in a woken turn).
+fn validate_wait_id(id: &str) -> Result<Option<String>, String> {
+    if id.is_empty() {
+        return Ok(None);
+    }
+    if id.len() > MAX_NAME_CHARS
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+    {
+        return Err(format!("'{id}' is not a wait id"));
+    }
+    Ok(Some(id.to_string()))
+}
+
 fn validate_when(when: &str) -> Result<String, String> {
     if when.is_empty() {
         return Err("'when' is required: an ISO 8601 time or 'in 30m' / 'in 2h' / 'in 3d'".into());
@@ -231,7 +265,18 @@ impl Tool for TeamCommsTool {
             }
             TeamKind::Remind => {
                 "Set a reminder for yourself (who='self') or a teammate in this room. When it is due \
-                 the room posts it and starts their turn, e.g. to follow up on an unpaid invoice."
+                 the room posts it and starts their turn, e.g. to follow up on an unpaid invoice. \
+                 It fires even when nobody has the room open."
+            }
+            TeamKind::Wait => {
+                "Park the request you are working on because you are blocked on something outside \
+                 this turn (a teammate's delegated task, a build, a reply from a customer). The room \
+                 keeps the request and your note, and gives you a new turn that repeats both when the \
+                 wait wakes: at 'until', when a task you delegated finishes, or when a webhook wakes it."
+            }
+            TeamKind::WaitClose => {
+                "Close a wait you opened with team_wait, because the thing you were waiting for \
+                 happened or no longer matters. Without wait_id it closes all your open waits here."
             }
         }
     }
@@ -284,9 +329,32 @@ impl Tool for TeamCommsTool {
                     "when": { "type": "string",
                               "description": "ISO 8601 time, or relative: 'in 30m', 'in 2h', 'in 3d' (1 minute to 30 days)." },
                     "text": { "type": "string", "minLength": 1, "maxLength": MAX_TEXT_CHARS,
-                              "description": "What to be reminded of." }
+                              "description": "What to be reminded of." },
+                    "if_missed": { "type": "string", "enum": ["run_once", "skip"],
+                                   "description": "If it could not fire on time: fire once late (default) or skip it." }
                 },
                 "required": ["when", "text"],
+                "additionalProperties": false
+            }),
+            TeamKind::Wait => json!({
+                "type": "object",
+                "properties": {
+                    "note": { "type": "string", "minLength": 1, "maxLength": MAX_TEXT_CHARS,
+                              "description": "What you are waiting for and what to do once it arrives." },
+                    "until": { "type": "string",
+                               "description": "Optional wake time: ISO 8601, or 'in 30m' / 'in 2h' / 'in 3d' (1 minute to 30 days)." }
+                },
+                "required": ["note"],
+                "additionalProperties": false
+            }),
+            TeamKind::WaitClose => json!({
+                "type": "object",
+                "properties": {
+                    "wait_id": { "type": "string", "maxLength": MAX_NAME_CHARS,
+                                 "description": "The wait to close (from the woken turn). Omit to close all of yours here." },
+                    "note": { "type": "string", "maxLength": MAX_TEXT_CHARS,
+                              "description": "Optional: how it ended." }
+                },
                 "additionalProperties": false
             }),
         }
@@ -313,12 +381,63 @@ impl Tool for TeamCommsTool {
                     Ok(t) => t,
                     Err(e) => return Self::refuse(e),
                 };
+                let missed_policy = match validate_missed(str_arg(&args, "if_missed")) {
+                    Ok(p) => p,
+                    Err(e) => return Self::refuse(e),
+                };
                 TeamAction {
                     kind: self.kind.action_kind().into(),
                     to,
                     text,
                     due: None,
                     when: Some(when),
+                    missed_policy,
+                    wait_id: None,
+                }
+            }
+            TeamKind::Wait => {
+                let text = match validate_text(str_arg(&args, "note"), "note") {
+                    Ok(t) => t,
+                    Err(e) => return Self::refuse(e),
+                };
+                let until = str_arg(&args, "until");
+                let when = if until.is_empty() {
+                    None
+                } else {
+                    match validate_when(until) {
+                        Ok(w) => Some(w),
+                        Err(e) => return Self::refuse(e.replace("'when'", "'until'")),
+                    }
+                };
+                TeamAction {
+                    kind: self.kind.action_kind().into(),
+                    to: "self".into(),
+                    text,
+                    due: None,
+                    when,
+                    missed_policy: None,
+                    wait_id: None,
+                }
+            }
+            TeamKind::WaitClose => {
+                let wait_id = match validate_wait_id(str_arg(&args, "wait_id")) {
+                    Ok(id) => id,
+                    Err(e) => return Self::refuse(e),
+                };
+                let note = str_arg(&args, "note");
+                if note.chars().count() > MAX_TEXT_CHARS {
+                    return Self::refuse(format!(
+                        "'note' is longer than {MAX_TEXT_CHARS} characters"
+                    ));
+                }
+                TeamAction {
+                    kind: self.kind.action_kind().into(),
+                    to: "self".into(),
+                    text: note.to_string(),
+                    due: None,
+                    when: None,
+                    missed_policy: None,
+                    wait_id,
                 }
             }
             kind => {
@@ -349,6 +468,8 @@ impl Tool for TeamCommsTool {
                     text,
                     due,
                     when: None,
+                    missed_policy: None,
+                    wait_id: None,
                 }
             }
         };
@@ -376,6 +497,11 @@ impl Tool for TeamCommsTool {
             TeamKind::Remind => {
                 format!("Queued: the reminder for {to} is scheduled after this turn.")
             }
+            TeamKind::Wait => "Queued: the room keeps this request and your note after this turn \
+                 and gives you a new turn when the wait wakes. Tell the user what you are waiting \
+                 for and end this turn."
+                .to_string(),
+            TeamKind::WaitClose => "Queued: the wait is closed after this turn.".to_string(),
         };
         Ok(ToolResult {
             success: true,
@@ -423,6 +549,8 @@ mod tests {
                 text: "Is Toko Melati a qualified lead?".into(),
                 due: None,
                 when: None,
+                missed_policy: None,
+                wait_id: None,
             }]
         );
     }
@@ -493,6 +621,83 @@ mod tests {
         assert!(remind.unwrap().success);
         assert_eq!(actions[0].to, "self");
         assert_eq!(actions[0].when.as_deref(), Some("in 2h"));
+    }
+
+    #[tokio::test]
+    async fn remind_takes_an_optional_missed_policy() {
+        let (ok, actions) = in_room(tool("team_remind").execute(json!({
+            "when": "in 1d", "text": "standup digest", "if_missed": "skip"
+        })))
+        .await;
+        assert!(ok.unwrap().success);
+        assert_eq!(actions[0].missed_policy.as_deref(), Some("skip"));
+        let (bad, actions) = in_room(tool("team_remind").execute(json!({
+            "when": "in 1d", "text": "x", "if_missed": "later"
+        })))
+        .await;
+        assert!(!bad.unwrap().success);
+        assert!(actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wait_records_the_note_and_an_optional_until() {
+        let (ok, actions) = in_room(tool("team_wait").execute(json!({
+            "note": "waiting for Lex's quote, then send it to Toko Melati", "until": "in 2h"
+        })))
+        .await;
+        assert!(ok.unwrap().success);
+        assert_eq!(actions[0].kind, "wait");
+        assert_eq!(actions[0].to, "self");
+        assert_eq!(actions[0].when.as_deref(), Some("in 2h"));
+
+        let (no_until, actions) =
+            in_room(tool("team_wait").execute(json!({"note": "the deploy"}))).await;
+        assert!(no_until.unwrap().success);
+        assert_eq!(actions[0].when, None);
+
+        let (bad, _) =
+            in_room(tool("team_wait").execute(json!({"note": "x", "until": "soon"}))).await;
+        let err = bad.unwrap().error.unwrap();
+        assert!(err.contains("'until'"), "{err}");
+        let (empty, _) = in_room(tool("team_wait").execute(json!({"note": ""}))).await;
+        assert!(!empty.unwrap().success);
+    }
+
+    #[tokio::test]
+    async fn wait_close_takes_an_optional_wait_id() {
+        let (ok, actions) = in_room(
+            tool("team_wait_close").execute(json!({"wait_id": "w_abc123", "note": "quote sent"})),
+        )
+        .await;
+        assert!(ok.unwrap().success);
+        assert_eq!(actions[0].kind, "wait_close");
+        assert_eq!(actions[0].wait_id.as_deref(), Some("w_abc123"));
+        assert_eq!(actions[0].text, "quote sent");
+
+        let (all, actions) = in_room(tool("team_wait_close").execute(json!({}))).await;
+        assert!(all.unwrap().success);
+        assert_eq!(actions[0].wait_id, None);
+
+        let (bad, _) =
+            in_room(tool("team_wait_close").execute(json!({"wait_id": "drop table;"}))).await;
+        assert!(!bad.unwrap().success);
+    }
+
+    #[test]
+    fn wait_and_remind_fields_are_omitted_from_the_wire_when_unset() {
+        let action = TeamAction {
+            kind: "ask".into(),
+            to: "Lex".into(),
+            text: "q".into(),
+            due: None,
+            when: None,
+            missed_policy: None,
+            wait_id: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&action).unwrap(),
+            json!({"kind": "ask", "to": "Lex", "text": "q"})
+        );
     }
 
     #[test]

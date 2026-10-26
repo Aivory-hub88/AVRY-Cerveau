@@ -443,13 +443,14 @@ pub fn take_pending_approval() -> Option<PendingApprovalSummary> {
 
 /// ADR-021: one speech act an agent made towards its teammates during a turn
 /// (`team_message`, `team_ask`, `team_delegate`, `team_handoff`,
-/// `team_remind`). The engine only records it; the room the turn came from
+/// `team_remind`, `team_wait`, `team_wait_close`). The engine only records it; the room the turn came from
 /// carries it out after the turn (posts the message, starts the teammate's
 /// turn, routes the answer back, schedules the reminder), so every exchange
 /// is a visible message the human can read and stop.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TeamAction {
-    /// `message` | `ask` | `delegate` | `handoff` | `remind`.
+    /// `message` | `ask` | `delegate` | `handoff` | `remind` | `wait` |
+    /// `wait_close`.
     pub kind: String,
     /// The teammate (agent type or display name, as the model wrote it), or
     /// `self` for a reminder to the calling agent. The room resolves and
@@ -460,8 +461,17 @@ pub struct TeamAction {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub due: Option<String>,
     /// `remind`: when, as ISO 8601 or a relative `in 2h` / `in 3d`.
+    /// `wait`: the optional `until` that wakes the wait.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub when: Option<String>,
+    /// `remind`: what the room does when the reminder could not fire on
+    /// time (`run_once` | `skip`). `None` = the room's default (`run_once`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missed_policy: Option<String>,
+    /// `wait_close`: the wait to close. `None` = all of the agent's open
+    /// waits in the thread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_id: Option<String>,
 }
 
 /// At most this many team actions per turn; the rest are refused to the model.
@@ -512,6 +522,78 @@ pub fn take_team_actions() -> Vec<TeamAction> {
                 .unwrap_or_default()
         })
         .unwrap_or_default()
+}
+
+/// ADR-021 §4.3: how an unattended run (a cron job, a fired reminder, a woken
+/// wait) ended, as the agent reported it with `run_no_update` or
+/// `run_report_failure`. A run that reports nothing is a normal run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// Nothing to report: the run sends no notification.
+    Quiet,
+    /// The run could not do its job; it is recorded as failed.
+    Failed { reason: String },
+}
+
+impl RunOutcome {
+    /// The wire value next to `team_actions`: `quiet` | `failed`.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Quiet => "quiet",
+            Self::Failed { .. } => "failed",
+        }
+    }
+
+    /// The failure reason, for `failed`.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Quiet => None,
+            Self::Failed { reason } => Some(reason),
+        }
+    }
+}
+
+tokio::task_local! {
+    /// ADR-021 §4.3: the unattended-run cell `run_no_update` /
+    /// `run_report_failure` write into. Scoped by the cron scheduler for
+    /// every agent job and by the gateway for a webhook turn marked
+    /// `X-Turn-Origin: cron | reminder | wake`; a human chat turn has no cell,
+    /// so the two tools are not offered there.
+    pub static RUN_OUTCOME: Option<Arc<parking_lot::Mutex<Option<RunOutcome>>>>;
+}
+
+/// Whether this turn is an unattended run that can report its outcome.
+pub fn run_outcome_available() -> bool {
+    RUN_OUTCOME.try_with(|cell| cell.is_some()).unwrap_or(false)
+}
+
+/// Record how this run ended. A later call replaces an earlier one, so a run
+/// that first said "nothing new" and then hit a failure ends as failed.
+/// `Err` (a message for the model) outside an unattended run.
+pub fn record_run_outcome(outcome: RunOutcome) -> Result<(), String> {
+    RUN_OUTCOME
+        .try_with(|cell| match cell {
+            Some(cell) => {
+                *cell.lock() = Some(outcome);
+                Ok(())
+            }
+            None => Err(NOT_UNATTENDED.to_string()),
+        })
+        .unwrap_or_else(|_| Err(NOT_UNATTENDED.to_string()))
+}
+
+const NOT_UNATTENDED: &str =
+    "this is only available on a scheduled or unattended run, not in a conversation";
+
+/// Take this run's recorded outcome (`None` outside an unattended run, or
+/// when the agent reported nothing).
+pub fn take_run_outcome() -> Option<RunOutcome> {
+    RUN_OUTCOME
+        .try_with(|cell| cell.as_ref().and_then(|cell| cell.lock().take()))
+        .ok()
+        .flatten()
 }
 
 /// ADR-009 Phase 1: fire-time tenant resolution for non-HTTP entry points

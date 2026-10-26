@@ -3895,6 +3895,10 @@ struct WebhookPrelude {
     /// ADR-021: the turn came from a Team Space room (`X-Room-Channel:
     /// discussion`), so team tools are offered and their actions returned.
     room_turn: bool,
+    /// ADR-021 §4.3: nobody is waiting on this turn (`X-Turn-Origin: cron |
+    /// reminder | wake`), so the quiet / failed run tools are offered and the
+    /// outcome returned as `run_outcome`.
+    unattended: bool,
     /// Upstream SSE opt-in (`stream: true`); honoured only for untenanted
     /// requests, because the upstream streaming path has no tenant overlay.
     stream: bool,
@@ -4331,9 +4335,37 @@ async fn webhook_prelude(
             .get("x-room-channel")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.trim().eq_ignore_ascii_case("discussion")),
+        unattended: headers
+            .get("x-turn-origin")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(is_unattended_turn_origin),
         stream: webhook_body.stream,
         _admission_permit,
     })
+}
+
+/// ADR-021 §4.3: `X-Turn-Origin` values that mark a turn nobody is waiting
+/// on. Anything else (absent, `human`, unknown) is a conversation turn.
+fn is_unattended_turn_origin(origin: &str) -> bool {
+    matches!(
+        origin.trim().to_ascii_lowercase().as_str(),
+        "cron" | "reminder" | "wake"
+    )
+}
+
+#[cfg(test)]
+mod turn_origin_tests {
+    use super::is_unattended_turn_origin;
+
+    #[test]
+    fn only_cron_reminder_and_wake_are_unattended() {
+        for origin in ["cron", "reminder", "wake", " Reminder ", "WAKE"] {
+            assert!(is_unattended_turn_origin(origin), "{origin:?}");
+        }
+        for origin in ["", "human", "team", "discussion", "cronjob"] {
+            assert!(!is_unattended_turn_origin(origin), "{origin:?}");
+        }
+    }
 }
 
 async fn handle_webhook(
@@ -4354,6 +4386,7 @@ async fn handle_webhook(
         tenant_ctx,
         model_label,
         room_turn,
+        unattended,
         stream,
         _admission_permit,
     } = prelude;
@@ -4379,6 +4412,9 @@ async fn handle_webhook(
     // tools record into it and the room carries the actions out.
     let team_cell = (room_turn && tenant_ctx.is_some())
         .then(|| std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())));
+    // ADR-021 §4.3: an unattended tenant turn can end quietly or as failed.
+    let run_cell = (unattended && tenant_ctx.is_some())
+        .then(|| std::sync::Arc::new(parking_lot::Mutex::new(None)));
     let chat = Box::pin(run_gateway_chat_with_tools(
         &state,
         &message,
@@ -4387,11 +4423,15 @@ async fn handle_webhook(
         tenant_ctx,
     ));
     let outcome = zeroclaw_runtime::agent::tenant::TEAM_ACTIONS
-        .scope(team_cell.clone(), chat)
+        .scope(
+            team_cell.clone(),
+            zeroclaw_runtime::agent::tenant::RUN_OUTCOME.scope(run_cell.clone(), chat),
+        )
         .await;
     let team_actions = team_cell
         .map(|cell| std::mem::take(&mut *cell.lock()))
         .unwrap_or_default();
+    let run_outcome = run_cell.and_then(|cell| cell.lock().take());
 
     match outcome {
         // `input_tokens`/`output_tokens`/`cost_usd` are still populated on the
@@ -4425,6 +4465,10 @@ async fn handle_webhook(
                 "pending_approval": pending_approval,
                 // ADR-021: additive, `[]` outside a room turn.
                 "team_actions": team_actions,
+                // ADR-021 §4.3: additive, `null` unless an unattended turn
+                // called `run_no_update` / `run_report_failure`.
+                "run_outcome": run_outcome.as_ref().map(|o| o.as_str()),
+                "run_failure_reason": run_outcome.as_ref().and_then(|o| o.reason()),
             });
             (StatusCode::OK, Json(body)).into_response()
         }
@@ -4497,6 +4541,7 @@ async fn handle_webhook_stream(
         tenant_ctx,
         model_label,
         room_turn: _,
+        unattended: _,
         stream: _,
         _admission_permit,
     } = prelude;
