@@ -904,13 +904,24 @@ pub struct McpRegistry {
 
 impl McpRegistry {
     /// Connect to all configured servers. Non-fatal: failures are logged and skipped.
+    ///
+    /// Servers connect concurrently, so a turn waits for the slowest server
+    /// instead of the sum of all of them (a 13-server profile spent ~16 s here
+    /// on every webhook turn when this was a serial loop). Results are folded
+    /// in config order, so server indexes and tool names stay deterministic.
     pub async fn connect_all(configs: &[McpServerConfig]) -> Result<Self> {
         let mut servers = Vec::new();
         let mut tool_index = HashMap::new();
         let mut server_index = HashMap::new();
 
-        for config in configs {
-            match McpServer::connect(config.clone()).await {
+        let connected = futures_util::future::join_all(
+            configs
+                .iter()
+                .map(|config| async move { (config, McpServer::connect(config.clone()).await) }),
+        )
+        .await;
+        for (config, connected) in connected {
+            match connected {
                 Ok(server) => {
                     let server_idx = servers.len();
                     server_index.insert(config.name.clone(), server_idx);
@@ -1669,6 +1680,84 @@ mod tests {
         let all = registry.list_all_prompts().await;
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].1.name, "remote__summarize");
+    }
+
+    #[tokio::test]
+    async fn connect_all_connects_servers_concurrently_in_config_order() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Long enough that client setup on a loaded test machine (~1 s observed)
+        // stays inside the margin between concurrent and serial.
+        const DELAY: Duration = Duration::from_millis(1500);
+        async fn slow_server(tool: &str) -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({"method": "initialize"})))
+                .respond_with(
+                    ResponseTemplate::new(200).set_delay(DELAY).set_body_json(
+                        json!({"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}),
+                    ),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_partial_json(
+                    json!({"method":"notifications/initialized"}),
+                ))
+                .respond_with(ResponseTemplate::new(202))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({"method":"tools/list"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc":"2.0","id":2,"result":{"tools":[
+                        {"name": tool, "description": "t", "inputSchema": {}}
+                    ]}
+                })))
+                .mount(&server)
+                .await;
+            server
+        }
+
+        let servers = [
+            slow_server("a").await,
+            slow_server("b").await,
+            slow_server("c").await,
+        ];
+        let configs: Vec<McpServerConfig> = servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| McpServerConfig {
+                name: format!("srv{i}"),
+                ..http_server_config(s.uri())
+            })
+            .collect();
+
+        let started = Instant::now();
+        let registry = McpRegistry::connect_all(&configs)
+            .await
+            .expect("connect_all");
+        let elapsed = started.elapsed();
+
+        assert_eq!(registry.server_count(), 3);
+        // Every initialize answers after DELAY, so connecting the three servers one
+        // after another cannot finish under 3 x DELAY (concurrent runs land near
+        // 2 x DELAY here: the handshake can send initialize twice).
+        assert!(
+            elapsed < DELAY * 3,
+            "three servers took {elapsed:?}: connected one after another"
+        );
+        // Config order is kept: server i owns its own tool.
+        for (i, tool) in ["a", "b", "c"].iter().enumerate() {
+            let name = format!("srv{i}__{tool}");
+            assert_eq!(
+                registry.tool_index.get(&name).map(|(idx, _)| *idx),
+                Some(i),
+                "{name}"
+            );
+            assert_eq!(registry.server_index.get(&format!("srv{i}")), Some(&i));
+        }
     }
 
     #[tokio::test]
