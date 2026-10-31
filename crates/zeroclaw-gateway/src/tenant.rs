@@ -726,6 +726,38 @@ enum CustomMcpCacheEntry {
 #[derive(Debug, serde::Deserialize)]
 struct InternalCustomMcpServersResponse {
     servers: Vec<zeroclaw_runtime::agent::tenant::TenantCustomMcpServer>,
+    /// Registered servers avry-backend will not hand out (`verification_failed`
+    /// rows): name and coarse reason only, no url or credentials. Older
+    /// backends omit the key.
+    #[serde(default)]
+    unavailable: Vec<InternalUnavailableCustomMcpServer>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct InternalUnavailableCustomMcpServer {
+    name: String,
+    reason: String,
+}
+
+impl InternalCustomMcpServersResponse {
+    /// The verified servers, then one credential-less placeholder per
+    /// unavailable server (see `TenantCustomMcpServer::unavailable_reason`).
+    fn into_servers(self) -> Vec<zeroclaw_runtime::agent::tenant::TenantCustomMcpServer> {
+        let mut servers = self.servers;
+        servers.extend(self.unavailable.into_iter().map(|u| {
+            zeroclaw_runtime::agent::tenant::TenantCustomMcpServer {
+                name: u.name,
+                url: String::new(),
+                transport: String::new(),
+                auth_header_name: None,
+                auth_header_value: None,
+                risk_tier: "irreversible".to_string(),
+                disabled_tools: Vec::new(),
+                unavailable_reason: Some(u.reason),
+            }
+        }));
+        servers
+    }
 }
 
 impl TenantCustomMcpResolver {
@@ -807,7 +839,7 @@ impl TenantCustomMcpResolver {
         {
             Ok(resp) if resp.status().is_success() => {
                 match resp.json::<InternalCustomMcpServersResponse>().await {
-                    Ok(body) => body.servers,
+                    Ok(body) => body.into_servers(),
                     Err(e) => {
                         ::zeroclaw_log::record!(
                             WARN,
@@ -855,6 +887,45 @@ impl TenantCustomMcpResolver {
             );
         }
         servers
+    }
+
+    /// Tell avry-backend that `server` rejected this tenant's credentials with
+    /// HTTP `status`, so its row flips to `verification_failed` and the
+    /// dashboard shows it. Drops this tenant's cache entry first, so the next
+    /// turn re-reads the list (and stops retrying a server the backend has
+    /// just withdrawn). Best effort: a failed report is logged, never retried;
+    /// the runtime side already deduplicates per (tenant, server).
+    pub async fn report_auth_failure(&self, sel: &TenantSelector, server: &str, status: u16) {
+        self.cache.lock().pop(&sel.tenant_id());
+        let (Some(backend_url), Some(internal_token)) = (&self.backend_url, &self.internal_token)
+        else {
+            return;
+        };
+        let url = format!(
+            "{backend_url}/api/v1/tenant-mcp-servers/internal/{}/{}/auth-failure",
+            sel.user_id, sel.agent_type
+        );
+        let result = self
+            .client
+            .post(&url)
+            .header("X-Internal-Token", internal_token)
+            .json(&serde_json::json!({ "name": server, "status": status }))
+            .send()
+            .await;
+        let failure = match result {
+            Ok(resp) if resp.status().is_success() => None,
+            Ok(resp) => Some(serde_json::json!({ "status": resp.status().as_u16() })),
+            Err(e) => Some(serde_json::json!({ "error": format!("{e}") })),
+        };
+        if let Some(attrs) = failure {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(attrs),
+                "tenant custom MCP auth-failure report to avry-backend failed"
+            );
+        }
     }
 }
 
@@ -1133,6 +1204,77 @@ mod tests {
             user_id: "user_d09".to_string(),
             agent_type: "customer_service".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn custom_mcp_resolver_keeps_unavailable_servers_without_credentials() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/tenant-mcp-servers/internal/user_d09/customer_service",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "servers": [],
+                "unavailable": [{"name": "aivory-mail", "reason": "auth_rejected"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let servers = resolver_for(&server.uri(), "tok").resolve(&sel()).await;
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "aivory-mail");
+        assert_eq!(
+            servers[0].unavailable_reason.as_deref(),
+            Some("auth_rejected")
+        );
+        assert!(servers[0].url.is_empty() && servers[0].auth_header_value.is_none());
+        assert!(
+            zeroclaw_runtime::agent::tenant::tenant_custom_mcp_server_configs(&servers).is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_mcp_auth_failure_report_posts_and_drops_the_cached_list() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "servers": [{
+                    "name": "aivory-mail", "url": "https://mail.aivory.uk/mcp",
+                    "transport": "streamable-http", "auth_header_name": "Authorization",
+                    "auth_header_value": "Bearer expired", "risk_tier": "safe"
+                }]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/api/v1/tenant-mcp-servers/internal/user_d09/customer_service/auth-failure",
+            ))
+            .and(header("X-Internal-Token", "tok"))
+            .and(body_json(
+                serde_json::json!({"name": "aivory-mail", "status": 401}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"flipped": true})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let resolver = resolver_for(&server.uri(), "tok");
+        assert_eq!(resolver.resolve(&sel()).await.len(), 1);
+        resolver
+            .report_auth_failure(&sel(), "aivory-mail", 401)
+            .await;
+        // The cached list was dropped, so this resolve goes back to the backend.
+        assert_eq!(resolver.resolve(&sel()).await.len(), 1);
     }
 
     #[tokio::test]

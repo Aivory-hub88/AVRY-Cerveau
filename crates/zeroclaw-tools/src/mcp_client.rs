@@ -1023,6 +1023,48 @@ pub mod connection_pool {
     }
 }
 
+/// Why a configured MCP server could not be connected. Deliberately coarse:
+/// it is rendered into the model's prompt, so it never carries the raw error
+/// text (which can echo URLs, query strings or response bodies).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpConnectFailureKind {
+    /// The server answered HTTP 401 or 403: its credentials were rejected.
+    AuthRejected { status: u16 },
+    /// The connect or handshake timed out.
+    Timeout,
+    /// Anything else (DNS, TLS, refused connection, bad handshake, 5xx).
+    Unreachable,
+}
+
+impl McpConnectFailureKind {
+    /// Classify a connect error by walking its context chain. The transports
+    /// report non-success statuses as `MCP server returned HTTP <code> ...`.
+    pub fn classify(err: &anyhow::Error) -> Self {
+        for cause in err.chain() {
+            let text = cause.to_string();
+            for status in [401u16, 403] {
+                if text.contains(&format!("returned HTTP {status}")) {
+                    return Self::AuthRejected { status };
+                }
+            }
+        }
+        let full = format!("{err:#}").to_ascii_lowercase();
+        if full.contains("timed out") || full.contains("timeout") {
+            Self::Timeout
+        } else {
+            Self::Unreachable
+        }
+    }
+}
+
+/// One configured server that `connect_all` skipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpConnectFailure {
+    /// The server's config name (tenant custom servers keep their `tenant_` prefix).
+    pub server: String,
+    pub kind: McpConnectFailureKind,
+}
+
 /// Registry of all connected MCP servers, with a flat tool index.
 pub struct McpRegistry {
     servers: Vec<McpServer>,
@@ -1030,6 +1072,8 @@ pub struct McpRegistry {
     tool_index: HashMap<String, (usize, String)>,
     /// server name → index in `servers`.
     server_index: HashMap<String, usize>,
+    /// Servers that were configured but failed to connect, in config order.
+    failures: Vec<McpConnectFailure>,
 }
 
 impl McpRegistry {
@@ -1059,6 +1103,7 @@ impl McpRegistry {
         let mut servers = Vec::new();
         let mut tool_index = HashMap::new();
         let mut server_index = HashMap::new();
+        let mut failures = Vec::new();
 
         let connected = futures_util::future::join_all(configs.iter().map(|config| async move {
             let connected =
@@ -1097,6 +1142,10 @@ impl McpRegistry {
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                         &format!("Failed to connect to MCP server `{}`: {:#}", config.name, e)
                     );
+                    failures.push(McpConnectFailure {
+                        server: config.name.clone(),
+                        kind: McpConnectFailureKind::classify(&e),
+                    });
                 }
             }
         }
@@ -1105,6 +1154,7 @@ impl McpRegistry {
             servers,
             tool_index,
             server_index,
+            failures,
         })
     }
 
@@ -1187,6 +1237,7 @@ impl McpRegistry {
             servers,
             tool_index,
             server_index,
+            failures: Vec::new(),
         }
     }
 
@@ -1239,6 +1290,7 @@ impl McpRegistry {
             servers,
             tool_index,
             server_index,
+            failures: Vec::new(),
         }
     }
 
@@ -1267,6 +1319,7 @@ impl McpRegistry {
             servers,
             tool_index,
             server_index,
+            failures: Vec::new(),
         }
     }
 
@@ -1396,7 +1449,13 @@ impl McpRegistry {
             servers: vec![server],
             tool_index,
             server_index,
+            failures: Vec::new(),
         }
+    }
+
+    /// Configured servers that failed to connect when this registry was built.
+    pub fn connect_failures(&self) -> &[McpConnectFailure] {
+        &self.failures
     }
 
     /// All prefixed tool names across all connected servers.
@@ -2186,6 +2245,53 @@ mod tests {
         assert_eq!(registry.tool_count(), 0);
     }
 
+    #[tokio::test]
+    async fn connect_all_records_auth_rejection_per_server() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let mut config = http_server_config(server.uri());
+        config.name = "tenant_aivory-mail".to_string();
+        let registry = McpRegistry::connect_all(&[config])
+            .await
+            .expect("connect_all stays non-fatal");
+
+        assert!(registry.is_empty());
+        assert_eq!(
+            registry.connect_failures(),
+            &[McpConnectFailure {
+                server: "tenant_aivory-mail".to_string(),
+                kind: McpConnectFailureKind::AuthRejected { status: 401 },
+            }]
+        );
+    }
+
+    #[test]
+    fn connect_failure_kind_classifies_without_keeping_the_error_text() {
+        let auth =
+            anyhow::anyhow!("MCP server returned HTTP 403 Forbidden").context("initialize failed");
+        assert_eq!(
+            McpConnectFailureKind::classify(&auth),
+            McpConnectFailureKind::AuthRejected { status: 403 }
+        );
+        let timeout = anyhow::anyhow!("operation timed out").context("connect");
+        assert_eq!(
+            McpConnectFailureKind::classify(&timeout),
+            McpConnectFailureKind::Timeout
+        );
+        let other = anyhow::anyhow!("MCP server returned HTTP 502 Bad Gateway");
+        assert_eq!(
+            McpConnectFailureKind::classify(&other),
+            McpConnectFailureKind::Unreachable
+        );
+    }
+
     #[test]
     fn http_transport_requires_url() {
         let config = McpServerConfig {
@@ -2867,6 +2973,7 @@ mod tests {
             servers: vec![server],
             tool_index,
             server_index,
+            failures: Vec::new(),
         });
 
         let security = Arc::new(zeroclaw_config::policy::SecurityPolicy {

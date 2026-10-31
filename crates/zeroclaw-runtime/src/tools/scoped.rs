@@ -13,6 +13,7 @@ use std::sync::Arc;
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
+use zeroclaw_tools::mcp_client::{McpConnectFailure, McpConnectFailureKind};
 
 use crate::agent::loop_::{
     append_pinned_mcp_section, eager_mcp_tool_allowed, load_peripheral_tools,
@@ -490,6 +491,12 @@ pub struct ScopedAssembled {
     /// resources are granted. Private for the same reason as [`Self::deferred_section`]
     /// above - access via the same two accessor patterns.
     pinned_section: String,
+    /// `## Unavailable MCP Servers`: granted servers the model cannot use this turn
+    /// (failed to connect, or flagged unusable by avry-backend) and why. Empty when
+    /// every granted server connected. Kept apart from [`Self::deferred_section`],
+    /// which is cleared whenever `tool_search` is withheld, because this note matters
+    /// most exactly when no MCP tool is left at all.
+    unavailable_section: String,
     /// The same pinned resources as attributed blocks (`<server>__<uri>` key plus the
     /// rendered text), for holders that must be able to withdraw a block when the
     /// caller's tool selector later narrows past its key. Always renders to exactly
@@ -516,7 +523,14 @@ impl ScopedAssembled {
     pub fn combined_mcp_prompt_section(&self) -> String {
         let mut combined = self.deferred_section.clone();
         append_pinned_mcp_section(&mut combined, &self.pinned_section);
+        append_mcp_note(&mut combined, &self.unavailable_section);
         combined
+    }
+
+    /// The unavailable-MCP-servers note on its own, for the two-slot callers. See
+    /// [`Self::unavailable_section`]'s field doc.
+    pub fn unavailable_mcp_section(&self) -> &str {
+        &self.unavailable_section
     }
 
     /// The deferred-MCP tool-search listing on its own, for callers with two distinct
@@ -734,6 +748,8 @@ impl ScopedToolRegistry {
         // MCP-origin ground truth for the tool_filter_groups gates; see
         // the `ScopedAssembled::mcp_tool_names` field doc for the contract.
         let mut mcp_tool_names: HashSet<String> = HashSet::new();
+        let mut mcp_connect_failures: Vec<McpConnectFailure> = Vec::new();
+        let mcp_granted = connect_mcp && config.mcp.enabled;
 
         #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
         tools::late_tool_search_observer::record("phase", "mcp", 3, 0);
@@ -838,6 +854,7 @@ impl ScopedToolRegistry {
                     tools::late_tool_search_observer::arc_id(&registry),
                     registry.server_count(),
                 );
+                mcp_connect_failures = registry.connect_failures().to_vec();
                 // Origin set: every `<server>__<tool>` name the registry knows.
                 // Deferred stubs derive from the same `tool_names()` call, so
                 // one extension covers eager, deferred, and later activations.
@@ -1338,6 +1355,31 @@ impl ScopedToolRegistry {
             }
         }
 
+        let unavailable_section = if mcp_granted {
+            let tenant = crate::agent::tenant::current_tenant();
+            if let Some(tenant) = tenant.as_deref() {
+                for failure in &mcp_connect_failures {
+                    if let (Some(name), McpConnectFailureKind::AuthRejected { status }) = (
+                        failure
+                            .server
+                            .strip_prefix(crate::agent::tenant::TENANT_CUSTOM_MCP_NAME_PREFIX),
+                        failure.kind,
+                    ) {
+                        crate::agent::tenant::report_custom_mcp_auth_failure(tenant, name, status);
+                    }
+                }
+            }
+            render_unavailable_mcp_section(
+                &mcp_connect_failures,
+                &tenant
+                    .as_deref()
+                    .map(|t| t.unavailable_custom_mcp_servers())
+                    .unwrap_or_default(),
+            )
+        } else {
+            String::new()
+        };
+
         #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
         tools::late_tool_search_observer::record("phase", "seal", 7, 0);
         ScopedAssembled {
@@ -1350,12 +1392,84 @@ impl ScopedToolRegistry {
             channel_room_handle,
             deferred_section,
             pinned_section,
+            unavailable_section,
             pinned_blocks,
             activated_handle,
             tool_search_handle,
             mcp_tool_names,
         }
     }
+}
+
+/// Append `note` as its own block, without a leading separator when `section`
+/// is still empty.
+pub fn append_mcp_note(section: &mut String, note: &str) {
+    if note.is_empty() {
+        return;
+    }
+    if !section.is_empty() {
+        section.push_str("\n\n");
+    }
+    section.push_str(note);
+}
+
+/// Render the `## Unavailable MCP Servers` note: one line per granted server the
+/// model cannot use this turn, so it tells the user what is wrong instead of
+/// claiming it has no such capability (Lex, 2026-10-31: an expired Aivory Mail
+/// token surfaced as "I have no way to send email"). Only coarse reasons go in,
+/// never the raw connect error, so no URL, header or response body can leak into
+/// the prompt. Empty when nothing failed.
+fn render_unavailable_mcp_section(
+    failures: &[McpConnectFailure],
+    backend_unavailable: &[(&str, &str)],
+) -> String {
+    const RECONNECT: &str = "Ask the user to reconnect it in Customise agent → MCP.";
+    let mut lines = Vec::new();
+    for failure in failures {
+        let (name, tenant_custom) = match failure
+            .server
+            .strip_prefix(crate::agent::tenant::TENANT_CUSTOM_MCP_NAME_PREFIX)
+        {
+            Some(name) => (name, true),
+            None => (failure.server.as_str(), false),
+        };
+        let reason = match (failure.kind, tenant_custom) {
+            (McpConnectFailureKind::AuthRejected { status }, true) => {
+                format!("its credentials were rejected (HTTP {status}). {RECONNECT}")
+            }
+            (McpConnectFailureKind::AuthRejected { status }, false) => format!(
+                "its credentials were rejected (HTTP {status}). Tell the user this integration needs to be reconnected."
+            ),
+            (McpConnectFailureKind::Timeout, _) => {
+                "it did not respond in time. Tell the user it is temporarily unreachable.".into()
+            }
+            (McpConnectFailureKind::Unreachable, true) => {
+                format!("the connection to it failed. {RECONNECT}")
+            }
+            (McpConnectFailureKind::Unreachable, false) => {
+                "the connection to it failed. Tell the user it is temporarily unreachable.".into()
+            }
+        };
+        lines.push(format!("- `{name}` is unavailable: {reason}"));
+    }
+    for (name, code) in backend_unavailable {
+        let reason = if *code == "auth_rejected" {
+            format!("its credentials were rejected. {RECONNECT}")
+        } else {
+            "its last verification failed. Ask the user to reverify or reconnect it in Customise agent → MCP.".to_string()
+        };
+        lines.push(format!("- `{name}` is unavailable: {reason}"));
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "## Unavailable MCP Servers\n\n\
+         These MCP servers are granted to you but cannot be used this turn, so their \
+         tools are missing. If the user asks for something one of them covers, say \
+         which server is unavailable and why; do not say you lack the capability.\n{}",
+        lines.join("\n")
+    )
 }
 
 #[cfg(test)]
@@ -2631,6 +2745,171 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unavailable_mcp_section_is_empty_when_nothing_failed() {
+        assert_eq!(render_unavailable_mcp_section(&[], &[]), "");
+    }
+
+    #[test]
+    fn unavailable_mcp_section_names_each_server_and_reason() {
+        let section = render_unavailable_mcp_section(
+            &[
+                McpConnectFailure {
+                    server: "tenant_aivory-mail".into(),
+                    kind: McpConnectFailureKind::AuthRejected { status: 401 },
+                },
+                McpConnectFailure {
+                    server: "composio-gmail".into(),
+                    kind: McpConnectFailureKind::Timeout,
+                },
+            ],
+            &[("orders", "verification_failed")],
+        );
+        assert!(
+            section.starts_with("## Unavailable MCP Servers\n\n"),
+            "{section}"
+        );
+        assert!(
+            section.contains(
+                "- `aivory-mail` is unavailable: its credentials were rejected (HTTP 401). \
+                 Ask the user to reconnect it in Customise agent → MCP."
+            ),
+            "{section}"
+        );
+        assert!(
+            section.contains("- `composio-gmail` is unavailable: it did not respond in time."),
+            "{section}"
+        );
+        assert!(
+            section.contains("- `orders` is unavailable: its last verification failed."),
+            "{section}"
+        );
+        assert!(!section.contains("tenant_"), "{section}");
+    }
+
+    /// Lex, 2026-10-31: Aivory Mail's capability token expired, every turn's
+    /// connect got HTTP 401, and the model only saw the mail tools missing. The
+    /// failure must reach the model's MCP prompt section and be reported to
+    /// avry-backend exactly once.
+    #[tokio::test]
+    async fn rejected_tenant_mcp_server_reaches_prompt_and_is_reported_once() {
+        use crate::agent::tenant::{TENANT_CONTEXT, TenantContext, TenantCustomMcpServer};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, McpServerConfig, McpTransport, RiskProfileConfig,
+        };
+
+        let mail = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mail)
+            .await;
+
+        let mut config = Config::default();
+        config.mcp.enabled = true;
+        config.mcp.deferred_loading = true;
+        config
+            .risk_profiles
+            .insert("test-profile".into(), RiskProfileConfig::default());
+        config.agents.insert(
+            "leads_qualifier".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+        let custom = |name: &str, unavailable: Option<&str>| TenantCustomMcpServer {
+            name: name.into(),
+            url: "https://tenant.example/mcp".into(),
+            transport: "streamable-http".into(),
+            auth_header_name: None,
+            auth_header_value: None,
+            risk_tier: "safe".into(),
+            disabled_tools: Vec::new(),
+            unavailable_reason: unavailable.map(str::to_string),
+        };
+        let tenant = Arc::new(TenantContext {
+            tenant_id: "u_lex_401:leads_qualifier".into(),
+            platform_user_id: "u_lex_401".into(),
+            agent_type: "leads_qualifier".into(),
+            persona: None,
+            connected_toolkits: Vec::new(),
+            disabled_toolkits: Vec::new(),
+            tenant_custom_mcp_servers: vec![
+                custom("aivory-mail", None),
+                custom("orders", Some("auth_rejected")),
+            ],
+            active_agents: None,
+        });
+
+        // The real tenant server is behind the SSRF-guarded transport, which
+        // refuses a loopback mock, so connect the same name unguarded and hand
+        // that registry to `assemble` (the shared-registry path).
+        let registry = Arc::new(
+            tools::McpRegistry::connect_all(&[McpServerConfig {
+                name: "tenant_aivory-mail".into(),
+                transport: McpTransport::Http,
+                url: Some(mail.uri()),
+                ..Default::default()
+            }])
+            .await
+            .expect("connect_all is non-fatal"),
+        );
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+
+        let out = TENANT_CONTEXT
+            .scope(Some(Arc::clone(&tenant)), async {
+                ScopedToolRegistry::assemble(ScopedAssembly {
+                    config: &config,
+                    agent_alias: "leads_qualifier",
+                    security: &security,
+                    built: built_with(Vec::new()),
+                    skills: &[],
+                    runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                    caller_allowed: None,
+                    connect_mcp: true,
+                    connect_peripherals: false,
+                    exclude_memory: false,
+                    acp_delivery: false,
+                    list_deferred_mcp_specs: false,
+                    emit_assembly_logs: false,
+                    mcp_registry: Some(Arc::clone(&registry)),
+                })
+                .await
+            })
+            .await;
+
+        let prompt = out.combined_mcp_prompt_section();
+        assert!(
+            prompt.contains(
+                "- `aivory-mail` is unavailable: its credentials were rejected (HTTP 401)."
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("- `orders` is unavailable: its credentials were rejected."),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains(&mail.uri()),
+            "no server URL in the prompt: {prompt}"
+        );
+        assert_eq!(out.unavailable_mcp_section().lines().count(), 5, "{prompt}");
+        // `assemble` already reported this (tenant, server); a second report
+        // within the window is deduplicated.
+        assert!(!crate::agent::tenant::report_custom_mcp_auth_failure(
+            &tenant,
+            "aivory-mail",
+            401
+        ));
+    }
+
     fn assembled_with_sections(deferred: &str, pinned: &str) -> ScopedAssembled {
         ScopedAssembled {
             registry: ScopedToolRegistry(Vec::new(), None),
@@ -2642,6 +2921,7 @@ mod tests {
             channel_room_handle: None,
             deferred_section: deferred.to_string(),
             pinned_section: pinned.to_string(),
+            unavailable_section: String::new(),
             pinned_blocks: Vec::new(),
             activated_handle: None,
             tool_search_handle: None,

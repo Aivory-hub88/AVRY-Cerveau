@@ -169,6 +169,13 @@ pub struct TenantCustomMcpServer {
     /// this feature existed.
     #[serde(default)]
     pub disabled_tools: Vec<String>,
+    /// Set when avry-backend lists this server as registered but unusable
+    /// (its row is `verification_failed`), to a coarse reason code:
+    /// `"auth_rejected"` or `"verification_failed"`. Such an entry carries no
+    /// url or credentials, is never connected, and only exists so the turn
+    /// can tell the model the server is down instead of silently missing.
+    #[serde(default)]
+    pub unavailable_reason: Option<String>,
 }
 
 /// Tool-name prefix a tenant custom MCP server's tools carry, distinct from
@@ -242,6 +249,7 @@ pub fn tenant_custom_mcp_server_configs(
 
     servers
         .iter()
+        .filter(|server| server.unavailable_reason.is_none())
         .map(|server| {
             let mut headers = std::collections::HashMap::new();
             if let (Some(name), Some(value)) = (&server.auth_header_name, &server.auth_header_value)
@@ -276,6 +284,21 @@ impl TenantContext {
     /// See [`tenant_custom_mcp_server_configs`].
     pub fn custom_mcp_server_configs(&self) -> Vec<zeroclaw_config::schema::McpServerConfig> {
         tenant_custom_mcp_server_configs(&self.tenant_custom_mcp_servers)
+    }
+
+    /// `(name, reason code)` for each of this tenant's custom servers that
+    /// avry-backend reports as unusable. See
+    /// [`TenantCustomMcpServer::unavailable_reason`].
+    pub fn unavailable_custom_mcp_servers(&self) -> Vec<(&str, &str)> {
+        self.tenant_custom_mcp_servers
+            .iter()
+            .filter_map(|server| {
+                server
+                    .unavailable_reason
+                    .as_deref()
+                    .map(|reason| (server.name.as_str(), reason))
+            })
+            .collect()
     }
 
     /// True if `tool_name` originates from one of this tenant's own custom
@@ -660,6 +683,66 @@ pub async fn resolve_tenant_context(
     }
 }
 
+/// Tells avry-backend that a tenant custom MCP server rejected Cerveau's
+/// credentials (HTTP 401/403), so its row flips to `verification_failed`
+/// and the dashboard stops showing "Verified". Arguments: platform user id,
+/// agent type, server name (without [`TENANT_CUSTOM_MCP_NAME_PREFIX`]), HTTP
+/// status. Registered once at startup by the binary crate, same seam as
+/// [`register_tenant_resolve_fn`]; the closure must not block (it spawns).
+pub type CustomMcpAuthFailureFn = Box<dyn Fn(String, String, String, u16) + Send + Sync>;
+
+static CUSTOM_MCP_AUTH_FAILURE_FN: std::sync::OnceLock<CustomMcpAuthFailureFn> =
+    std::sync::OnceLock::new();
+
+/// A busy agent hits the same rejected server on every turn until the
+/// resolver cache drops it; report each (tenant, server) at most once per
+/// this window.
+const CUSTOM_MCP_AUTH_FAILURE_REPORT_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
+
+/// Register the auth-failure reporter. First writer wins.
+pub fn register_custom_mcp_auth_failure_fn(f: CustomMcpAuthFailureFn) {
+    let _ = CUSTOM_MCP_AUTH_FAILURE_FN.set(f);
+}
+
+/// Report that `server` (without the `tenant_` prefix) rejected this
+/// tenant's credentials with `status`. Deduplicated per (tenant, server)
+/// within [`CUSTOM_MCP_AUTH_FAILURE_REPORT_WINDOW`]; returns whether this
+/// call was the one that reported.
+pub fn report_custom_mcp_auth_failure(tenant: &TenantContext, server: &str, status: u16) -> bool {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    static LAST_REPORTED: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> =
+        std::sync::OnceLock::new();
+    let key = format!(
+        "{}\u{1f}{}\u{1f}{}",
+        tenant.platform_user_id, tenant.agent_type, server
+    );
+    let now = Instant::now();
+    {
+        let mut last = LAST_REPORTED
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        last.retain(|_, at| now.duration_since(*at) < CUSTOM_MCP_AUTH_FAILURE_REPORT_WINDOW);
+        if last.contains_key(&key) {
+            return false;
+        }
+        last.insert(key, now);
+    }
+    if let Some(f) = CUSTOM_MCP_AUTH_FAILURE_FN.get() {
+        f(
+            tenant.platform_user_id.clone(),
+            tenant.agent_type.clone(),
+            server.to_string(),
+            status,
+        );
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -773,6 +856,7 @@ mod tests {
             auth_header_value: Some("secret123".to_string()),
             risk_tier: "irreversible".to_string(),
             disabled_tools: Vec::new(),
+            unavailable_reason: None,
         }
     }
 
@@ -886,6 +970,7 @@ mod tests {
             auth_header_value: Some("Bearer avry_mcp_x".to_string()),
             risk_tier: "irreversible".to_string(),
             disabled_tools: Vec::new(),
+            unavailable_reason: None,
         };
         let ctx = TenantContext {
             tenant_id: "u1:cs".to_string(),
@@ -911,6 +996,7 @@ mod tests {
             auth_header_value: None,
             risk_tier: "irreversible".to_string(),
             disabled_tools: Vec::new(),
+            unavailable_reason: None,
         };
         let ctx = TenantContext {
             tenant_id: "u1:cs".to_string(),
@@ -935,6 +1021,7 @@ mod tests {
             auth_header_value: None,
             risk_tier: "irreversible".to_string(),
             disabled_tools: Vec::new(),
+            unavailable_reason: None,
         };
         let ctx_with = |server: TenantCustomMcpServer| TenantContext {
             tenant_id: "u1.leads_qualifier".to_string(),
@@ -1089,5 +1176,90 @@ mod tests {
                 assert_eq!(seen.id, "pa_2");
             })
             .await;
+    }
+
+    fn tenant_with(user: &str, servers: Vec<TenantCustomMcpServer>) -> TenantContext {
+        TenantContext {
+            tenant_id: format!("{user}:leads_qualifier"),
+            platform_user_id: user.to_string(),
+            agent_type: "leads_qualifier".to_string(),
+            persona: None,
+            connected_toolkits: Vec::new(),
+            disabled_toolkits: Vec::new(),
+            tenant_custom_mcp_servers: servers,
+            active_agents: None,
+        }
+    }
+
+    #[test]
+    fn unavailable_custom_servers_are_listed_but_never_connected() {
+        let mut down = sample_custom_server();
+        down.name = "aivory-mail".to_string();
+        down.url = String::new();
+        down.auth_header_name = None;
+        down.auth_header_value = None;
+        down.unavailable_reason = Some("auth_rejected".to_string());
+        let ctx = tenant_with("u_unavail", vec![sample_custom_server(), down]);
+
+        let names: Vec<String> = ctx
+            .custom_mcp_server_configs()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, vec!["tenant_orders".to_string()]);
+        assert_eq!(
+            ctx.unavailable_custom_mcp_servers(),
+            vec![("aivory-mail", "auth_rejected")]
+        );
+    }
+
+    #[test]
+    fn custom_mcp_auth_failure_is_reported_once_per_tenant_and_server() {
+        static CALLS: std::sync::Mutex<Vec<(String, String, String, u16)>> =
+            std::sync::Mutex::new(Vec::new());
+        register_custom_mcp_auth_failure_fn(Box::new(|user, agent_type, server, status| {
+            CALLS
+                .lock()
+                .unwrap()
+                .push((user, agent_type, server, status));
+        }));
+        let ctx = tenant_with("u_report_once", Vec::new());
+        let other = tenant_with("u_report_other", Vec::new());
+
+        assert!(report_custom_mcp_auth_failure(&ctx, "aivory-mail", 401));
+        assert!(!report_custom_mcp_auth_failure(&ctx, "aivory-mail", 401));
+        assert!(report_custom_mcp_auth_failure(&ctx, "orders", 403));
+        assert!(report_custom_mcp_auth_failure(&other, "aivory-mail", 401));
+
+        let calls: Vec<_> = CALLS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(user, ..)| user.starts_with("u_report_"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "u_report_once".to_string(),
+                    "leads_qualifier".to_string(),
+                    "aivory-mail".to_string(),
+                    401
+                ),
+                (
+                    "u_report_once".to_string(),
+                    "leads_qualifier".to_string(),
+                    "orders".to_string(),
+                    403
+                ),
+                (
+                    "u_report_other".to_string(),
+                    "leads_qualifier".to_string(),
+                    "aivory-mail".to_string(),
+                    401
+                ),
+            ]
+        );
     }
 }
