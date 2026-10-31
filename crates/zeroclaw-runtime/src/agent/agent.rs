@@ -578,6 +578,9 @@ pub struct Agent {
     /// were pruned.
     mcp_pinned: Vec<zeroclaw_tools::mcp_context::PinnedResourceBlock>,
     mcp_deferred_section: String,
+    /// `## Unavailable MCP Servers` from assembly; injected even when no
+    /// `tool_search` survives (see `ScopedAssembled::unavailable_mcp_section`).
+    mcp_unavailable_section: String,
     /// Hook runner for tool-call auditing and lifecycle side effects.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     /// Approval manager for direct Agent execution paths such as ACP.
@@ -788,6 +791,7 @@ pub struct AgentBuilder {
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     mcp_pinned: Vec<zeroclaw_tools::mcp_context::PinnedResourceBlock>,
     mcp_deferred_section: Option<String>,
+    mcp_unavailable_section: Option<String>,
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     approval_manager: Option<Arc<ApprovalManager>>,
     agent_alias: Option<String>,
@@ -853,6 +857,7 @@ impl AgentBuilder {
             activated_tools: None,
             mcp_pinned: Vec::new(),
             mcp_deferred_section: None,
+            mcp_unavailable_section: None,
             hook_runner: None,
             approval_manager: None,
             agent_alias: None,
@@ -1144,6 +1149,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn mcp_unavailable_section(mut self, section: Option<String>) -> Self {
+        self.mcp_unavailable_section = section;
+        self
+    }
+
     pub fn hook_runner(mut self, runner: Option<Arc<crate::hooks::HookRunner>>) -> Self {
         self.hook_runner = runner;
         self
@@ -1359,6 +1369,7 @@ impl AgentBuilder {
             memory_principal: None,
             mcp_pinned: self.mcp_pinned,
             mcp_deferred_section: self.mcp_deferred_section.unwrap_or_default(),
+            mcp_unavailable_section: self.mcp_unavailable_section.unwrap_or_default(),
             hook_runner: self.hook_runner,
             approval_manager: self.approval_manager,
             agent_alias: self.agent_alias.unwrap_or_default(),
@@ -3021,6 +3032,7 @@ impl Agent {
         // own slot below - no duplication, and the deferred advertisement the
         // regression suite asserts is preserved.
         let deferred_section = assembled.deferred_section().to_string();
+        let unavailable_section = assembled.unavailable_mcp_section().to_string();
         let pinned_blocks = assembled.pinned_blocks().to_vec();
         let crate::tools::scoped::ScopedAssembled {
             mut registry,
@@ -3199,6 +3211,7 @@ impl Agent {
             .approval_route(risk_profile.approval_route.clone())
             .activated_tools(activated_handle)
             .mcp_deferred_section(Some(deferred_section))
+            .mcp_unavailable_section(Some(unavailable_section))
             .mcp_pinned_blocks(pinned_blocks)
             .hook_runner(if config.hooks.enabled {
                 Some(Arc::new(crate::hooks::HookRunner::from_root_config(config)))
@@ -3511,6 +3524,10 @@ impl Agent {
         if !pinned_section.is_empty() {
             prompt.push_str("\n\n");
             prompt.push_str(&pinned_section);
+        }
+        if !self.mcp_unavailable_section.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&self.mcp_unavailable_section);
         }
         // Keep the runtime orientation at the end of the complete prompt so
         // truncation cannot retain an earlier copy and append a second one.

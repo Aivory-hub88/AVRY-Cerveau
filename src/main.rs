@@ -10015,6 +10015,23 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         // `zeroclaw_runtime::agent::tenant::resolve_tenant_context`
         // whenever a tenant-scoped cron job fires, with no scheduler code
         // needing to know these resolvers exist.
+        // A tenant custom MCP server that answers 401/403 is reported to
+        // avry-backend, which flips its row to `verification_failed` so the
+        // dashboard stops showing it as verified.
+        zeroclaw_runtime::agent::tenant::register_custom_mcp_auth_failure_fn(Box::new(
+            |user_id, agent_type, server, status| {
+                tokio::spawn(async move {
+                    let sel = zeroclaw_gateway::tenant::TenantSelector {
+                        user_id,
+                        agent_type,
+                    };
+                    zeroclaw_gateway::tenant::TenantCustomMcpResolver::global()
+                        .report_auth_failure(&sel, &server, status)
+                        .await;
+                });
+            },
+        ));
+
         zeroclaw_runtime::agent::tenant::register_tenant_resolve_fn(Box::new(
             |tenant_id, agent_type| {
                 Box::pin(async move {
