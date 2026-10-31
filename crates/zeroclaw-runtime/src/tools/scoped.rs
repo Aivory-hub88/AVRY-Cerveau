@@ -779,48 +779,57 @@ impl ScopedToolRegistry {
             // tick so stdio MCP children live for the daemon lifetime.
             // Falling back to per-call `connect_all` keeps the legacy
             // CLI / one-shot / process_message path intact.
-            let shared_registry: Option<Arc<tools::McpRegistry>> =
-                if let Some(shared) = overrides_mcp_registry.as_ref() {
-                    #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-                    tools::late_tool_search_observer::record(
-                        "mcp-registry",
-                        "override",
-                        tools::late_tool_search_observer::arc_id(shared),
-                        0,
-                    );
-                    Some(Arc::clone(shared))
-                } else {
-                    #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-                    tools::late_tool_search_observer::record(
-                        "mcp-connect",
-                        "actual",
-                        agent_mcp_servers.len(),
-                        0,
-                    );
-                    match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
-                        Ok(registry) => Some(Arc::new(registry)),
-                        Err(err) => {
-                            // Non-fatal (the assembly proceeds without MCP), but an ERROR
-                            // with structured attrs - parity with the run/process_message
-                            // connect-failure logging.
-                            ::zeroclaw_log::record!(
-                                ERROR,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Fail
-                                )
-                                .with_category(::zeroclaw_log::EventCategory::Tool)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({
-                                    "agent_alias": agent_alias,
-                                    "error": format!("{err}"),
-                                })),
-                                "MCP registry failed to initialize (assembly proceeds without MCP)"
-                            );
-                            None
-                        }
+            let shared_registry: Option<Arc<tools::McpRegistry>> = if let Some(shared) =
+                overrides_mcp_registry.as_ref()
+            {
+                #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                tools::late_tool_search_observer::record(
+                    "mcp-registry",
+                    "override",
+                    tools::late_tool_search_observer::arc_id(shared),
+                    0,
+                );
+                Some(Arc::clone(shared))
+            } else {
+                #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                tools::late_tool_search_observer::record(
+                    "mcp-connect",
+                    "actual",
+                    agent_mcp_servers.len(),
+                    0,
+                );
+                // Pooled: warm turns reuse live HTTP/SSE connections
+                // (see `mcp_client::connection_pool`). Tests connect fresh:
+                // their mock servers reuse names and ports with different
+                // tool lists, which a process-wide pool would mix up.
+                #[cfg(not(test))]
+                let connected = tools::McpRegistry::connect_all_pooled(&agent_mcp_servers).await;
+                #[cfg(test)]
+                let connected = tools::McpRegistry::connect_all(&agent_mcp_servers).await;
+                match connected {
+                    Ok(registry) => Some(Arc::new(registry)),
+                    Err(err) => {
+                        // Non-fatal (the assembly proceeds without MCP), but an ERROR
+                        // with structured attrs - parity with the run/process_message
+                        // connect-failure logging.
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "agent_alias": agent_alias,
+                                "error": format!("{err}"),
+                            })),
+                            "MCP registry failed to initialize (assembly proceeds without MCP)"
+                        );
+                        None
                     }
-                };
+                }
+            };
             if let Some(registry) = shared_registry {
                 #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
                 tools::late_tool_search_observer::record(
