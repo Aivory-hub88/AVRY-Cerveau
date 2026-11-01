@@ -616,6 +616,13 @@ fn recall_time_filter(since: bool, until: bool, first_placeholder: usize) -> Str
     }
 }
 
+/// Session-scoped recall also sees durable global knowledge: a `core`/`daily`
+/// row with no session binding. Same rule as SQLite's
+/// `DURABLE_GLOBAL_CATEGORIES`; without it, a recall scoped to a chat session
+/// never returns long-term memories, which are stored session-less.
+const DURABLE_GLOBAL_SESSION_ROWS: &str =
+    "(m.session_id IS NULL AND m.category IN ('core', 'daily'))";
+
 #[async_trait]
 impl Memory for PostgresMemory {
     fn name(&self) -> &str {
@@ -709,7 +716,7 @@ impl Memory for PostgresMemory {
                              FROM unnest(tsvector_to_array(to_tsvector('simple', $1))) AS lex))
                       END AS tsq
                     ) q
-                    WHERE ($2::TEXT IS NULL OR m.session_id = $2)
+                    WHERE ($2::TEXT IS NULL OR m.session_id = $2 OR {DURABLE_GLOBAL_SESSION_ROWS})
                       AND m.superseded_by IS NULL
                       AND ($1 = '' OR
                            (q.tsq IS NOT NULL AND to_tsvector('simple', m.key || ' ' || m.content) @@ q.tsq) OR
@@ -745,7 +752,7 @@ impl Memory for PostgresMemory {
                              FROM unnest(tsvector_to_array(to_tsvector('simple', $1))) AS lex))
                       END AS tsq
                     ) q
-                    WHERE ($2::TEXT IS NULL OR m.session_id = $2)
+                    WHERE ($2::TEXT IS NULL OR m.session_id = $2 OR {DURABLE_GLOBAL_SESSION_ROWS})
                       AND m.superseded_by IS NULL
                       AND ($1 = '' OR (q.tsq IS NOT NULL
                            AND to_tsvector('simple', m.key || ' ' || m.content) @@ q.tsq))
@@ -1326,7 +1333,7 @@ impl Memory for PostgresMemory {
                              FROM unnest(tsvector_to_array(to_tsvector('simple', $1))) AS lex))
                       END AS tsq
                     ) q
-                    WHERE ($2::TEXT IS NULL OR m.session_id = $2)
+                    WHERE ($2::TEXT IS NULL OR m.session_id = $2 OR {DURABLE_GLOBAL_SESSION_ROWS})
                       AND m.superseded_by IS NULL
                       AND ($1 = '' OR
                            (q.tsq IS NOT NULL AND to_tsvector('simple', m.key || ' ' || m.content) @@ q.tsq) OR
@@ -1363,7 +1370,7 @@ impl Memory for PostgresMemory {
                              FROM unnest(tsvector_to_array(to_tsvector('simple', $1))) AS lex))
                       END AS tsq
                     ) q
-                    WHERE ($2::TEXT IS NULL OR m.session_id = $2)
+                    WHERE ($2::TEXT IS NULL OR m.session_id = $2 OR {DURABLE_GLOBAL_SESSION_ROWS})
                       AND m.superseded_by IS NULL
                       AND ($1 = '' OR (q.tsq IS NOT NULL
                            AND to_tsvector('simple', m.key || ' ' || m.content) @@ q.tsq))
