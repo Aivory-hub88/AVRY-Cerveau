@@ -4576,20 +4576,18 @@ async fn handle_webhook_stream(
         // must run together, not sequentially.
         let forward_fut = async {
             while let Some(event) = event_rx.recv().await {
-                if let zeroclaw_api::agent::TurnEvent::Chunk { delta } = event {
-                    let frame = serde_json::json!({ "type": "chunk", "content": delta });
-                    if frame_tx.send(frame).await.is_err() {
-                        // Client disconnected — stop forwarding, but let the
-                        // turn itself run to completion (same as `/ws/chat`,
-                        // which doesn't cancel on a dropped sink either).
-                        break;
-                    }
+                if let Some(frame) = webhook_stream_frame(&event)
+                    && frame_tx.send(frame).await.is_err()
+                {
+                    // Client disconnected — stop forwarding, but let the
+                    // turn itself run to completion (same as `/ws/chat`,
+                    // which doesn't cancel on a dropped sink either).
+                    break;
                 }
-                // Other `TurnEvent` variants (tool calls, thinking, usage,
-                // approval requests, plan): not surfaced to Console today —
-                // kept to a minimal superset of the blocking `/webhook`
-                // contract (`response` + `pending_approval`) rather than
-                // guessing at a richer wire format nothing consumes yet.
+                // Other `TurnEvent` variants (thinking, usage, approval
+                // requests, plan): not surfaced to Console — kept to a
+                // minimal superset of the blocking `/webhook` contract
+                // (`response` + `pending_approval`).
             }
         };
 
@@ -4634,6 +4632,26 @@ async fn handle_webhook_stream(
     axum::response::sse::Sse::new(sse_stream)
         .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response()
+}
+
+/// Wire frame for one `TurnEvent` on `/webhook/stream`, or `None` when the event
+/// is not surfaced. `tool` frames carry only the tool name and a coarse status
+/// (`running` / `done`) so Console can show progress during a long tool loop;
+/// arguments and results never leave the runtime.
+fn webhook_stream_frame(event: &zeroclaw_api::agent::TurnEvent) -> Option<serde_json::Value> {
+    use zeroclaw_api::agent::TurnEvent;
+    match event {
+        TurnEvent::Chunk { delta } => {
+            Some(serde_json::json!({ "type": "chunk", "content": delta }))
+        }
+        TurnEvent::ToolCall { id, name, .. } => {
+            Some(serde_json::json!({ "type": "tool", "id": id, "name": name, "status": "running" }))
+        }
+        TurnEvent::ToolResult { id, name, .. } => {
+            Some(serde_json::json!({ "type": "tool", "id": id, "name": name, "status": "done" }))
+        }
+        _ => None,
+    }
 }
 
 /// True when the request's `Accept` header negotiates Server-Sent Events.
@@ -15304,5 +15322,55 @@ mod gmail_bearer_tests {
     #[test]
     fn missing_bearer_never_matches_a_configured_secret() {
         assert!(!gmail_bearer_matches("", "s3cret-token"));
+    }
+}
+
+#[cfg(test)]
+mod webhook_stream_frame_tests {
+    use super::webhook_stream_frame;
+    use zeroclaw_api::agent::TurnEvent;
+
+    #[test]
+    fn chunk_keeps_its_wire_shape() {
+        let frame = webhook_stream_frame(&TurnEvent::Chunk {
+            delta: "Hal".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            frame,
+            serde_json::json!({ "type": "chunk", "content": "Hal" })
+        );
+    }
+
+    #[test]
+    fn tool_events_carry_name_and_status_only() {
+        let call = webhook_stream_frame(&TurnEvent::ToolCall {
+            id: "t1".into(),
+            name: "crm_update_lead".into(),
+            args: serde_json::json!({ "email": "secret@example.com" }),
+        })
+        .unwrap();
+        assert_eq!(
+            call,
+            serde_json::json!({ "type": "tool", "id": "t1", "name": "crm_update_lead", "status": "running" })
+        );
+        let result = webhook_stream_frame(&TurnEvent::ToolResult {
+            id: "t1".into(),
+            name: "crm_update_lead".into(),
+            output: "token=abc123".into(),
+            artifact: None,
+        })
+        .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({ "type": "tool", "id": "t1", "name": "crm_update_lead", "status": "done" })
+        );
+        assert!(!call.to_string().contains("secret@example.com"));
+        assert!(!result.to_string().contains("abc123"));
+    }
+
+    #[test]
+    fn other_events_are_not_surfaced() {
+        assert!(webhook_stream_frame(&TurnEvent::Thinking { delta: "hm".into() }).is_none());
     }
 }
