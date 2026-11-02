@@ -24,7 +24,7 @@ expect_err() { if run "$@"; then echo "FAIL $NAME: accepted"; fail=1; else echo 
 
 NAME="valid request";            expect_ok  "$WS" "$S" 60 256 100 128 "$PY"
 grep -q 'PrivateNetwork=yes' "$T/out" && grep -q 'CapabilityBoundingSet=' "$T/out" \
-  && grep -q "BindPaths=$WS" "$T/out" || { echo "FAIL command is missing fixed properties"; fail=1; }
+  && grep -q "ProtectHome=tmpfs" "$T/out" && grep -q "BindPaths=$WS" "$T/out" || { echo "FAIL command is missing fixed properties"; fail=1; }
 NAME="workspace outside roots";  expect_err "$T/other" "$S" 60 256 100 128 "$PY"
 NAME="symlinked workspace";      expect_err "$T/link" "$S" 60 256 100 128 "$PY"
 NAME="relative workspace";       expect_err "ws/tenant1" "$S" 60 256 100 128 "$PY"

@@ -84,7 +84,7 @@ fi
 CMD=(systemd-run --quiet --wait --pipe --collect
   -p "User=$SANDBOX_USER"
   -p PrivateNetwork=yes -p PrivateTmp=yes -p PrivateDevices=yes
-  -p ProtectSystem=strict -p ProtectHome=yes -p ProtectProc=invisible -p ProcSubset=pid
+  -p ProtectSystem=strict -p ProtectHome=tmpfs -p ProtectProc=invisible -p ProcSubset=pid
   -p ProtectKernelTunables=yes -p ProtectKernelModules=yes -p ProtectControlGroups=yes
   -p NoNewPrivileges=yes -p CapabilityBoundingSet= -p RestrictNamespaces=yes
   -p RestrictSUIDSGID=yes -p LockPersonality=yes
@@ -104,10 +104,13 @@ if [[ $DRY -eq 1 ]]; then
   exit 0
 fi
 
+# Existing files only need to be readable by the sandbox user. This pass also
+# touches the workspace directory itself, so it must run BEFORE the rwx grant
+# below, which would otherwise be overwritten with r-x.
+timeout 10 setfacl -R -P -m "u:$SANDBOX_USER:rX" -- "$REAL" || true
 # Let the sandbox user write new files in the workspace, and keep the daemon
-# able to read and remove them. Existing files only need to be readable.
+# able to read and remove them.
 setfacl -m "u:$SANDBOX_USER:rwx,m::rwx" -- "$REAL"
 setfacl -d -m "u:$SANDBOX_USER:rwx,u:$DAEMON_USER:rwx,m::rwx" -- "$REAL"
-timeout 10 setfacl -R -P -m "u:$SANDBOX_USER:rX" -- "$REAL" || true
 
 exec "${CMD[@]}"
