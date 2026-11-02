@@ -363,6 +363,29 @@ impl Tool for ShellTool {
         cmd.stderr(std::process::Stdio::piped());
         cmd.stdin(std::process::Stdio::null());
 
+        // Docker runs queue behind the process-wide sandbox gate so a burst
+        // cannot exhaust the host. Held until this call returns.
+        let _sandbox_permit = if self.runtime.name() == "docker" {
+            match zeroclaw_config::platform::sandbox_gate::global() {
+                Some(gate) => match gate
+                    .acquire(&self.security.workspace_dir.to_string_lossy())
+                    .await
+                {
+                    Ok(permit) => Some(permit),
+                    Err(e) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(e.to_string()),
+                        });
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
