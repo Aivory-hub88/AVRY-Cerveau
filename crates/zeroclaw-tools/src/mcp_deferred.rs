@@ -189,24 +189,56 @@ pub(crate) fn deferred_search_score(name: &str, description: &str, terms: &[Stri
 
 // ── ActivatedToolSet ─────────────────────────────────────────────────────
 
+/// Default number of schemas `tool_search` may keep loaded at once.
+pub const DEFAULT_MAX_ON_DEMAND_SCHEMAS: usize = 8;
+/// Default combined size of those schemas (name, description and parameter
+/// JSON, in chars; about 6k tokens). Whichever bound is hit first applies.
+pub const DEFAULT_MAX_ON_DEMAND_SCHEMA_CHARS: usize = 24_000;
+
 /// Per-conversation MCP activation and built-in schema selection.
 ///
 /// Built-in specs are a metadata projection of the scoped registry. The
 /// registry remains their executable owner and refreshes this catalog when
 /// admitted tools change. Selecting a built-in schema grants no capability.
+///
+/// Cerveau: schemas loaded on demand by `tool_search` are bounded. Every
+/// loaded schema rides on every later provider request of the turn, so an
+/// agent that searched widely used to grow its request until the context
+/// budget hard-failed the turn (ADR-021 rollout). Past
+/// [`DEFAULT_MAX_ON_DEMAND_SCHEMAS`] or [`DEFAULT_MAX_ON_DEMAND_SCHEMA_CHARS`]
+/// the least recently loaded or called one is unloaded; `tool_search` says
+/// which, and a `select:` loads it again. Tools installed with
+/// [`Self::activate`] (the `always` filter groups) are pinned and never count.
 pub struct ActivatedToolSet {
     // Executable activation remains MCP-only.
     tools: HashMap<String, Arc<dyn Tool>>,
     deferred_builtin_specs: HashMap<String, ToolSpec>,
     selected_builtin_names: HashSet<String>,
+    /// Names loaded on demand, with the tick of their last load or call.
+    on_demand: HashMap<String, u64>,
+    tick: u64,
+    max_on_demand: usize,
+    max_on_demand_chars: usize,
 }
 
 impl ActivatedToolSet {
     pub fn new() -> Self {
+        Self::with_limits(
+            DEFAULT_MAX_ON_DEMAND_SCHEMAS,
+            DEFAULT_MAX_ON_DEMAND_SCHEMA_CHARS,
+        )
+    }
+
+    /// A set whose on-demand schemas are bounded by count and combined size.
+    pub fn with_limits(max_on_demand: usize, max_on_demand_chars: usize) -> Self {
         Self {
             tools: HashMap::new(),
             deferred_builtin_specs: HashMap::new(),
             selected_builtin_names: HashSet::new(),
+            on_demand: HashMap::new(),
+            tick: 0,
+            max_on_demand: max_on_demand.max(1),
+            max_on_demand_chars,
         }
     }
 
@@ -217,6 +249,8 @@ impl ActivatedToolSet {
             .map(|spec| (spec.name.clone(), spec))
             .collect();
         self.selected_builtin_names.clear();
+        self.on_demand
+            .retain(|name, _| self.tools.contains_key(name));
     }
 
     /// Refresh previously deferred names from the canonical scoped registry.
@@ -229,6 +263,7 @@ impl ActivatedToolSet {
             .collect();
         self.selected_builtin_names
             .retain(|name| self.deferred_builtin_specs.contains_key(name));
+        self.retain_on_demand();
     }
 
     pub fn hidden_builtin_names(&self) -> HashSet<String> {
@@ -272,8 +307,90 @@ impl ActivatedToolSet {
         Some(spec)
     }
 
+    /// Install an executable that stays loaded (pinned): it never counts
+    /// against, nor is unloaded by, the on-demand bounds.
     pub fn activate(&mut self, name: String, tool: Arc<dyn Tool>) {
         self.tools.insert(name, tool);
+    }
+
+    /// Install an executable that `tool_search` loaded on demand: it counts
+    /// against the bounds and may be unloaded again.
+    pub fn activate_on_demand(&mut self, name: String, tool: Arc<dyn Tool>) {
+        self.tick += 1;
+        self.on_demand.insert(name.clone(), self.tick);
+        self.tools.insert(name, tool);
+    }
+
+    /// Record that `tool_search` loaded (or loaded again) `name`: a selected
+    /// built-in or an on-demand tool. A pinned tool stays pinned.
+    pub fn mark_loaded_on_demand(&mut self, name: &str) {
+        let pinned = self.tools.contains_key(name) && !self.on_demand.contains_key(name);
+        if pinned {
+            return;
+        }
+        self.tick += 1;
+        self.on_demand.insert(name.to_string(), self.tick);
+    }
+
+    /// Record a call, so a tool in use is the last to be unloaded.
+    pub fn note_used(&mut self, name: &str) {
+        if let Some(last) = self.on_demand.get_mut(name) {
+            self.tick += 1;
+            *last = self.tick;
+        }
+    }
+
+    /// Unload the least recently used on-demand schemas until both bounds
+    /// hold, never one named in `keep` (what the current `tool_search` call
+    /// returned). Returns the unloaded names, oldest first. An unloaded MCP
+    /// tool leaves the executable set; an unloaded built-in only goes back to
+    /// being hidden, since the registry still owns it.
+    pub fn enforce_on_demand_limits(&mut self, keep: &HashSet<String>) -> Vec<String> {
+        let mut unloaded = Vec::new();
+        while self.on_demand.len() > self.max_on_demand
+            || self.on_demand_chars() > self.max_on_demand_chars
+        {
+            let Some(oldest) = self
+                .on_demand
+                .iter()
+                .filter(|(name, _)| !keep.contains(*name))
+                .min_by_key(|(_, tick)| **tick)
+                .map(|(name, _)| name.clone())
+            else {
+                break;
+            };
+            self.on_demand.remove(&oldest);
+            self.tools.remove(&oldest);
+            self.selected_builtin_names.remove(&oldest);
+            unloaded.push(oldest);
+        }
+        unloaded
+    }
+
+    /// Names currently loaded on demand (not pinned).
+    pub fn on_demand_names(&self) -> Vec<&str> {
+        self.on_demand.keys().map(String::as_str).collect()
+    }
+
+    fn on_demand_chars(&self) -> usize {
+        self.on_demand
+            .keys()
+            .filter_map(|name| {
+                self.tools
+                    .get(name)
+                    .map(|tool| tool.spec())
+                    .or_else(|| self.deferred_builtin_specs.get(name).cloned())
+            })
+            .map(|spec| {
+                spec.name.len() + spec.description.len() + spec.parameters.to_string().len()
+            })
+            .sum()
+    }
+
+    fn retain_on_demand(&mut self) {
+        let (tools, selected) = (&self.tools, &self.selected_builtin_names);
+        self.on_demand
+            .retain(|name, _| tools.contains_key(name) || selected.contains(name));
     }
 
     pub fn is_activated(&self, name: &str) -> bool {
@@ -328,6 +445,7 @@ impl ActivatedToolSet {
             .retain(|name, _| allowed.contains(name));
         self.selected_builtin_names
             .retain(|name| self.deferred_builtin_specs.contains_key(name));
+        self.retain_on_demand();
     }
 }
 
@@ -1057,5 +1175,100 @@ mod tests {
             .unwrap()
             .block_on(McpRegistry::connect_all(&[]))
             .unwrap()
+    }
+
+    // ── Cerveau: bounded on-demand schemas ──
+
+    struct NamedTool(String, usize);
+    impl ::zeroclaw_api::attribution::Attributable for NamedTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            <Self as Tool>::name(self)
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            &self.0
+        }
+        fn description(&self) -> &str {
+            "named tool"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            // `self.1` pads the schema, to exercise the size bound.
+            serde_json::json!({"type": "object", "description": "x".repeat(self.1)})
+        }
+        async fn execute(
+            &self,
+            _: serde_json::Value,
+        ) -> anyhow::Result<zeroclaw_api::tool::ToolResult> {
+            unreachable!("not called in these tests")
+        }
+    }
+
+    fn named(name: &str, pad: usize) -> Arc<dyn Tool> {
+        Arc::new(NamedTool(name.to_string(), pad))
+    }
+
+    #[test]
+    fn on_demand_schemas_past_the_count_bound_unload_least_recently_used() {
+        let mut set = ActivatedToolSet::with_limits(2, usize::MAX);
+        set.activate("pinned__always".into(), named("pinned__always", 0));
+        set.activate_on_demand("srv__a".into(), named("srv__a", 0));
+        set.activate_on_demand("srv__b".into(), named("srv__b", 0));
+        // A call on `a` makes `b` the least recently used.
+        set.note_used("srv__a");
+        set.activate_on_demand("srv__c".into(), named("srv__c", 0));
+        let unloaded = set.enforce_on_demand_limits(&HashSet::from(["srv__c".to_string()]));
+        assert_eq!(unloaded, vec!["srv__b".to_string()]);
+        assert!(set.get("srv__b").is_none());
+        assert!(set.get("srv__a").is_some() && set.get("srv__c").is_some());
+        // Pinned tools neither count nor unload.
+        assert!(set.get("pinned__always").is_some());
+        assert_eq!(set.tool_specs().len(), 3);
+    }
+
+    #[test]
+    fn on_demand_schemas_past_the_size_bound_unload_but_never_the_current_call() {
+        let mut set = ActivatedToolSet::with_limits(10, 1_000);
+        set.activate_on_demand("srv__big".into(), named("srv__big", 700));
+        set.activate_on_demand("srv__next".into(), named("srv__next", 700));
+        let keep = HashSet::from(["srv__next".to_string()]);
+        assert_eq!(
+            set.enforce_on_demand_limits(&keep),
+            vec!["srv__big".to_string()]
+        );
+        // Only kept names left: over the bound, but what was just asked for stays.
+        set.activate_on_demand("srv__more".into(), named("srv__more", 700));
+        let keep = HashSet::from(["srv__next".to_string(), "srv__more".to_string()]);
+        assert!(set.enforce_on_demand_limits(&keep).is_empty());
+        assert_eq!(set.on_demand_names().len(), 2);
+    }
+
+    #[test]
+    fn an_unloaded_builtin_schema_is_hidden_again_and_can_be_selected_again() {
+        let spec =
+            |name: &str| ToolSpec::new(name, "builtin", serde_json::json!({"type": "object"}));
+        let mut set = ActivatedToolSet::with_limits(1, usize::MAX);
+        set.set_deferred_builtin_specs(vec![spec("cal"), spec("mail")]);
+        set.select_builtin_schema("cal").unwrap();
+        set.mark_loaded_on_demand("cal");
+        set.select_builtin_schema("mail").unwrap();
+        set.mark_loaded_on_demand("mail");
+        let unloaded = set.enforce_on_demand_limits(&HashSet::from(["mail".to_string()]));
+        assert_eq!(unloaded, vec!["cal".to_string()]);
+        assert!(!set.is_builtin_schema_exposed("cal"));
+        assert!(set.is_builtin_schema_exposed("mail"));
+        assert!(set.select_builtin_schema("cal").is_some());
+    }
+
+    #[test]
+    fn reloading_a_pinned_tool_keeps_it_pinned() {
+        let mut set = ActivatedToolSet::with_limits(1, usize::MAX);
+        set.activate("srv__pinned".into(), named("srv__pinned", 0));
+        set.mark_loaded_on_demand("srv__pinned");
+        assert!(set.on_demand_names().is_empty());
     }
 }

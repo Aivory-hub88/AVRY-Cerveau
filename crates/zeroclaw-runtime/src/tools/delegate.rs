@@ -3226,6 +3226,9 @@ impl DelegateTool {
         // ADR-021: a delegated sub-turn is not a room turn of its own; its
         // team actions would be posted as the caller's, so it gets none.
         let inner = crate::agent::tenant::TEAM_ACTIONS.scope(None, inner);
+        // ADR-021 §4.3: nor is it the unattended run; only the caller reports
+        // how the run ended.
+        let inner = crate::agent::tenant::RUN_OUTCOME.scope(None, inner);
         match crate::agent::tenant::current_tenant() {
             Some(parent) => {
                 let overlay = delegate_tenant_overlay(parent, agent_name.trim());

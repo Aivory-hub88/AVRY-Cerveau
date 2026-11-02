@@ -278,6 +278,7 @@ impl ToolSearchTool {
         newly_activated: &mut Vec<Arc<dyn Tool>>,
     ) -> Option<ToolSpec> {
         if let Some(spec) = activated.select_builtin_schema(name) {
+            activated.mark_loaded_on_demand(name);
             return Some(spec);
         }
         let deferred = deferred?;
@@ -286,10 +287,39 @@ impl ToolSearchTool {
             && let Some(tool) = deferred.activate(name)
         {
             let tool: Arc<dyn Tool> = Arc::from(tool);
-            activated.activate(name.to_string(), Arc::clone(&tool));
+            activated.activate_on_demand(name.to_string(), Arc::clone(&tool));
             newly_activated.push(tool);
+        } else {
+            activated.mark_loaded_on_demand(name);
         }
         Some(spec)
+    }
+
+    /// Cerveau: keep the loaded schemas inside their bounds after a call
+    /// loaded `returned`, and tell the model what was unloaded so it can
+    /// load it again instead of calling a tool that is gone.
+    fn enforce_limits(
+        activated: &mut ActivatedToolSet,
+        returned: &std::collections::HashSet<String>,
+        output: &mut String,
+    ) {
+        let unloaded = activated.enforce_on_demand_limits(returned);
+        if unloaded.is_empty() {
+            return;
+        }
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
+                .with_attrs(::serde_json::json!({ "unloaded": unloaded })),
+            "tool_search unloaded least recently used schemas to stay inside the context budget"
+        );
+        let _ = write!(
+            output,
+            "\nUnloaded to stay inside the context budget (least recently used): {}. \
+             To use one again, call tool_search with \"select:<name>\" first.",
+            unloaded.join(", ")
+        );
     }
 
     async fn search_tools(&self, query: &str, max_results: usize) -> anyhow::Result<ToolResult> {
@@ -403,6 +433,7 @@ impl ToolSearchTool {
                 }
             }
             output.push_str("</functions>\n");
+            Self::enforce_limits(&mut guard, &returned_names, &mut output);
             (output, newly_activated, returned_names)
         };
         let activated_count = newly_activated.len();
@@ -487,6 +518,11 @@ impl ToolSearchTool {
             }
 
             output.push_str("</functions>\n");
+            let keep = returned_names
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect();
+            Self::enforce_limits(&mut guard, &keep, &mut output);
             (output, not_found, newly_activated, returned_names)
         };
         let activated_count = newly_activated.len();
@@ -1572,5 +1608,35 @@ mod tests {
             assert!(result.success);
             assert!(result.output.contains("srv__a"));
         }
+    }
+
+    #[tokio::test]
+    async fn select_past_the_bound_unloads_the_oldest_schema_and_says_so() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::with_limits(2, usize::MAX)));
+        activated.lock().unwrap().set_deferred_builtin_specs(vec![
+            builtin_spec("alpha", "first"),
+            builtin_spec("beta", "second"),
+            builtin_spec("gamma", "third"),
+        ]);
+        let tool = ToolSearchTool::for_builtin_schemas(Arc::clone(&activated));
+        let first = tool
+            .execute(serde_json::json!({"query": "select:alpha,beta"}))
+            .await
+            .unwrap();
+        assert!(!first.output.to_string().contains("Unloaded"));
+        let second = tool
+            .execute(serde_json::json!({"query": "select:gamma"}))
+            .await
+            .unwrap();
+        let text = second.output.to_string();
+        assert!(
+            text.contains("Unloaded to stay inside the context budget"),
+            "{text}"
+        );
+        assert!(text.contains("alpha"), "{text}");
+        let guard = activated.lock().unwrap();
+        assert!(!guard.is_builtin_schema_exposed("alpha"));
+        assert!(guard.is_builtin_schema_exposed("beta"));
+        assert!(guard.is_builtin_schema_exposed("gamma"));
     }
 }

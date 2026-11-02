@@ -437,6 +437,14 @@ impl McpServer {
         self.transport.health_check()
     }
 
+    /// Whether a pooled connection may be handed to another turn: the
+    /// transport is alive and no failed recovery has poisoned it. HTTP
+    /// transports always report alive, so the poison flag is what retires a
+    /// connection whose session could not be re-established.
+    fn reusable(&self) -> bool {
+        self.health_check() && !self.recovery.is_poisoned()
+    }
+
     /// Identity comparison on the underlying transport handle. Two
     /// `McpServer` values share the same connection iff `ptr_eq`
     /// returns `true` — i.e. their inner `Arc<Mutex<McpServerInner>>`
@@ -893,6 +901,170 @@ impl McpServer {
 /// contains this separator.
 pub const MCP_TOOL_NAME_SEPARATOR: &str = "__";
 
+/// Process-wide pool of live HTTP/SSE MCP connections, reused across turns.
+///
+/// The key is the whole server config, serialized with object keys sorted, so
+/// two turns share a connection only when every field matches: URL (which
+/// carries the tenant's Composio entity), headers, env, timeouts, TLS. Tenant
+/// scoping is applied to the config before it reaches here
+/// (`mcp_servers_for_agent_and_tenant`), so different tenants never map to
+/// the same entry. Stdio servers are never pooled: their spawn depends on the
+/// tenant sandbox/workspace and they start in ~0.1 s anyway.
+///
+/// An entry idle longer than the TTL, whose transport reports dead, or whose
+/// session recovery failed (poisoned), is dropped and reconnected. A server-side session expiry on a pooled
+/// connection is handled by the existing stale-session recovery in
+/// `call_tool`. `CERVEAU_MCP_POOL_IDLE_SECS=0` turns pooling off.
+pub mod connection_pool {
+    use super::McpServer;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use tokio::time::{Duration, Instant};
+    use zeroclaw_config::schema::{McpServerConfig, McpTransport};
+
+    const DEFAULT_IDLE_TTL_SECS: u64 = 600;
+    const MAX_ENTRIES: usize = 512;
+
+    struct Pooled {
+        server: McpServer,
+        last_used: Instant,
+    }
+
+    fn pool() -> &'static Mutex<HashMap<String, Pooled>> {
+        static POOL: OnceLock<Mutex<HashMap<String, Pooled>>> = OnceLock::new();
+        POOL.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Idle TTL from `CERVEAU_MCP_POOL_IDLE_SECS` (default 600); `None` = off.
+    pub fn idle_ttl() -> Option<Duration> {
+        let secs = std::env::var("CERVEAU_MCP_POOL_IDLE_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_IDLE_TTL_SECS);
+        (secs > 0).then(|| Duration::from_secs(secs))
+    }
+
+    /// Pool key for `config`, or `None` when it must not be pooled.
+    pub fn key(config: &McpServerConfig) -> Option<String> {
+        if config.transport == McpTransport::Stdio {
+            return None;
+        }
+        let value = serde_json::to_value(config).ok()?;
+        // Fields marked `skip_serializing` are absent from `value`; both change
+        // how the connection is made, so they belong in the key too.
+        Some(format!(
+            "{}|guarded_transport={}|tenant_workspace_dir={:?}",
+            canonical(&value),
+            config.guarded_transport,
+            config.tenant_workspace_dir
+        ))
+    }
+
+    fn canonical(value: &serde_json::Value) -> String {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                let body: Vec<String> = keys
+                    .into_iter()
+                    .map(|k| {
+                        format!(
+                            "{}:{}",
+                            serde_json::Value::String(k.clone()),
+                            canonical(&map[k])
+                        )
+                    })
+                    .collect();
+                format!("{{{}}}", body.join(","))
+            }
+            serde_json::Value::Array(items) => {
+                format!(
+                    "[{}]",
+                    items.iter().map(canonical).collect::<Vec<_>>().join(",")
+                )
+            }
+            other => other.to_string(),
+        }
+    }
+
+    /// A live pooled connection for `key`, refreshing its idle clock.
+    pub(super) fn take(key: &str, ttl: Duration) -> Option<McpServer> {
+        let mut pool = pool().lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        pool.retain(|_, p| now.duration_since(p.last_used) < ttl && p.server.reusable());
+        let entry = pool.get_mut(key)?;
+        entry.last_used = now;
+        Some(entry.server.clone())
+    }
+
+    pub(super) fn put(key: String, server: McpServer) {
+        let mut pool = pool().lock().unwrap_or_else(|e| e.into_inner());
+        if pool.len() >= MAX_ENTRIES
+            && !pool.contains_key(&key)
+            && let Some(oldest) = pool
+                .iter()
+                .min_by_key(|(_, p)| p.last_used)
+                .map(|(k, _)| k.clone())
+        {
+            pool.remove(&oldest);
+        }
+        pool.insert(
+            key,
+            Pooled {
+                server,
+                last_used: Instant::now(),
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(super) fn len() -> usize {
+        pool().lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
+/// Why a configured MCP server could not be connected. Deliberately coarse:
+/// it is rendered into the model's prompt, so it never carries the raw error
+/// text (which can echo URLs, query strings or response bodies).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpConnectFailureKind {
+    /// The server answered HTTP 401 or 403: its credentials were rejected.
+    AuthRejected { status: u16 },
+    /// The connect or handshake timed out.
+    Timeout,
+    /// Anything else (DNS, TLS, refused connection, bad handshake, 5xx).
+    Unreachable,
+}
+
+impl McpConnectFailureKind {
+    /// Classify a connect error by walking its context chain. The transports
+    /// report non-success statuses as `MCP server returned HTTP <code> ...`.
+    pub fn classify(err: &anyhow::Error) -> Self {
+        for cause in err.chain() {
+            let text = cause.to_string();
+            for status in [401u16, 403] {
+                if text.contains(&format!("returned HTTP {status}")) {
+                    return Self::AuthRejected { status };
+                }
+            }
+        }
+        let full = format!("{err:#}").to_ascii_lowercase();
+        if full.contains("timed out") || full.contains("timeout") {
+            Self::Timeout
+        } else {
+            Self::Unreachable
+        }
+    }
+}
+
+/// One configured server that `connect_all` skipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpConnectFailure {
+    /// The server's config name (tenant custom servers keep their `tenant_` prefix).
+    pub server: String,
+    pub kind: McpConnectFailureKind,
+}
+
 /// Registry of all connected MCP servers, with a flat tool index.
 pub struct McpRegistry {
     servers: Vec<McpServer>,
@@ -900,17 +1072,55 @@ pub struct McpRegistry {
     tool_index: HashMap<String, (usize, String)>,
     /// server name → index in `servers`.
     server_index: HashMap<String, usize>,
+    /// Servers that were configured but failed to connect, in config order.
+    failures: Vec<McpConnectFailure>,
 }
 
 impl McpRegistry {
     /// Connect to all configured servers. Non-fatal: failures are logged and skipped.
+    ///
+    /// Servers connect concurrently, so a turn waits for the slowest server
+    /// instead of the sum of all of them (a 13-server profile spent ~16 s here
+    /// on every webhook turn when this was a serial loop). Results are folded
+    /// in config order, so server indexes and tool names stay deterministic.
     pub async fn connect_all(configs: &[McpServerConfig]) -> Result<Self> {
+        Self::connect_all_with(configs, None).await
+    }
+
+    /// [`Self::connect_all`], but HTTP/SSE servers come from the process-wide
+    /// connection pool when a live connection with the identical config is
+    /// there, so a warm turn skips `initialize` + `tools/list` for them (the
+    /// remote Composio servers cost ~2.5–3.4 s per turn otherwise). Stdio
+    /// servers always connect fresh. See [`connection_pool`].
+    pub async fn connect_all_pooled(configs: &[McpServerConfig]) -> Result<Self> {
+        Self::connect_all_with(configs, connection_pool::idle_ttl()).await
+    }
+
+    async fn connect_all_with(
+        configs: &[McpServerConfig],
+        pool_ttl: Option<Duration>,
+    ) -> Result<Self> {
         let mut servers = Vec::new();
         let mut tool_index = HashMap::new();
         let mut server_index = HashMap::new();
+        let mut failures = Vec::new();
 
-        for config in configs {
-            match McpServer::connect(config.clone()).await {
+        let connected = futures_util::future::join_all(configs.iter().map(|config| async move {
+            let connected =
+                match pool_ttl.and_then(|ttl| Some((ttl, connection_pool::key(config)?))) {
+                    Some((ttl, key)) => match connection_pool::take(&key, ttl) {
+                        Some(server) => Ok(server),
+                        None => McpServer::connect(config.clone()).await.inspect(|server| {
+                            connection_pool::put(key, server.clone());
+                        }),
+                    },
+                    None => McpServer::connect(config.clone()).await,
+                };
+            (config, connected)
+        }))
+        .await;
+        for (config, connected) in connected {
+            match connected {
                 Ok(server) => {
                     let server_idx = servers.len();
                     server_index.insert(config.name.clone(), server_idx);
@@ -932,6 +1142,10 @@ impl McpRegistry {
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                         &format!("Failed to connect to MCP server `{}`: {:#}", config.name, e)
                     );
+                    failures.push(McpConnectFailure {
+                        server: config.name.clone(),
+                        kind: McpConnectFailureKind::classify(&e),
+                    });
                 }
             }
         }
@@ -940,6 +1154,7 @@ impl McpRegistry {
             servers,
             tool_index,
             server_index,
+            failures,
         })
     }
 
@@ -1022,6 +1237,7 @@ impl McpRegistry {
             servers,
             tool_index,
             server_index,
+            failures: Vec::new(),
         }
     }
 
@@ -1074,6 +1290,7 @@ impl McpRegistry {
             servers,
             tool_index,
             server_index,
+            failures: Vec::new(),
         }
     }
 
@@ -1102,6 +1319,7 @@ impl McpRegistry {
             servers,
             tool_index,
             server_index,
+            failures: Vec::new(),
         }
     }
 
@@ -1231,7 +1449,13 @@ impl McpRegistry {
             servers: vec![server],
             tool_index,
             server_index,
+            failures: Vec::new(),
         }
+    }
+
+    /// Configured servers that failed to connect when this registry was built.
+    pub fn connect_failures(&self) -> &[McpConnectFailure] {
+        &self.failures
     }
 
     /// All prefixed tool names across all connected servers.
@@ -1672,6 +1896,268 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_all_connects_servers_concurrently_in_config_order() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Long enough that client setup on a loaded test machine (~1 s observed)
+        // stays inside the margin between concurrent and serial.
+        const DELAY: Duration = Duration::from_millis(1500);
+        async fn slow_server(tool: &str) -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({"method": "initialize"})))
+                .respond_with(
+                    ResponseTemplate::new(200).set_delay(DELAY).set_body_json(
+                        json!({"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}),
+                    ),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_partial_json(
+                    json!({"method":"notifications/initialized"}),
+                ))
+                .respond_with(ResponseTemplate::new(202))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({"method":"tools/list"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc":"2.0","id":2,"result":{"tools":[
+                        {"name": tool, "description": "t", "inputSchema": {}}
+                    ]}
+                })))
+                .mount(&server)
+                .await;
+            server
+        }
+
+        let servers = [
+            slow_server("a").await,
+            slow_server("b").await,
+            slow_server("c").await,
+        ];
+        let configs: Vec<McpServerConfig> = servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| McpServerConfig {
+                name: format!("srv{i}"),
+                ..http_server_config(s.uri())
+            })
+            .collect();
+
+        let started = Instant::now();
+        let registry = McpRegistry::connect_all(&configs)
+            .await
+            .expect("connect_all");
+        let elapsed = started.elapsed();
+
+        assert_eq!(registry.server_count(), 3);
+        // Every initialize answers after DELAY, so connecting the three servers one
+        // after another cannot finish under 3 x DELAY (concurrent runs land near
+        // 2 x DELAY here: the handshake can send initialize twice).
+        assert!(
+            elapsed < DELAY * 3,
+            "three servers took {elapsed:?}: connected one after another"
+        );
+        // Config order is kept: server i owns its own tool.
+        for (i, tool) in ["a", "b", "c"].iter().enumerate() {
+            let name = format!("srv{i}__{tool}");
+            assert_eq!(
+                registry.tool_index.get(&name).map(|(idx, _)| *idx),
+                Some(i),
+                "{name}"
+            );
+            assert_eq!(registry.server_index.get(&format!("srv{i}")), Some(&i));
+        }
+    }
+
+    async fn counting_server() -> wiremock::MockServer {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method":"notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method":"tools/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc":"2.0","id":2,"result":{"tools":[
+                    {"name": "read", "description": "t", "inputSchema": {}}
+                ]}
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn initialize_count(server: &wiremock::MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| {
+                serde_json::from_slice::<serde_json::Value>(&r.body)
+                    .ok()
+                    .and_then(|v| v.get("method").cloned())
+                    == Some(json!("initialize"))
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn pooled_connect_reuses_a_live_http_connection_across_turns() {
+        let server = counting_server().await;
+        // Unique name: the pool is process-wide and other tests run in parallel.
+        let config = McpServerConfig {
+            name: "pool_reuse_composio".into(),
+            ..http_server_config(server.uri())
+        };
+
+        let first = McpRegistry::connect_all_pooled(std::slice::from_ref(&config))
+            .await
+            .expect("first turn");
+        let second = McpRegistry::connect_all_pooled(std::slice::from_ref(&config))
+            .await
+            .expect("second turn");
+
+        assert_eq!(
+            initialize_count(&server).await,
+            1,
+            "second turn must reuse the connection"
+        );
+        assert!(first.servers[0].ptr_eq(&second.servers[0]));
+        assert_eq!(
+            second.tool_names(),
+            vec!["pool_reuse_composio__read".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn pooled_connect_never_shares_across_different_configs() {
+        let server = counting_server().await;
+        let base = McpServerConfig {
+            name: "pool_isolation_composio".into(),
+            ..http_server_config(format!("{}/mcp?user_id=tenant_a", server.uri()))
+        };
+        // Another tenant: same server, different entity in the URL.
+        let other_tenant = McpServerConfig {
+            url: Some(format!("{}/mcp?user_id=tenant_b", server.uri())),
+            ..base.clone()
+        };
+        // Same URL, different credentials (headers are secrets: must not be redacted out of the key).
+        let other_key = McpServerConfig {
+            headers: HashMap::from([("x-api-key".to_string(), "other".to_string())]),
+            ..base.clone()
+        };
+        // Same everything, but the SSRF-guarded transport (a skip_serializing field).
+        let guarded = McpServerConfig {
+            guarded_transport: true,
+            ..base.clone()
+        };
+
+        let keys: Vec<String> = [&base, &other_tenant, &other_key, &guarded]
+            .iter()
+            .map(|c| connection_pool::key(c).expect("http is poolable"))
+            .collect();
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+
+        McpRegistry::connect_all_pooled(std::slice::from_ref(&base))
+            .await
+            .expect("tenant a");
+        McpRegistry::connect_all_pooled(&[other_tenant])
+            .await
+            .expect("tenant b");
+        assert_eq!(
+            initialize_count(&server).await,
+            2,
+            "tenant b must get its own connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn pooled_connect_replaces_a_poisoned_connection() {
+        let server = counting_server().await;
+        let config = McpServerConfig {
+            name: "pool_poisoned".into(),
+            ..http_server_config(server.uri())
+        };
+        let first = McpRegistry::connect_all_pooled(std::slice::from_ref(&config))
+            .await
+            .expect("first turn");
+        // A failed recovery (e.g. the remote was down during re-handshake).
+        first.servers[0].recovery.poison();
+
+        let second = McpRegistry::connect_all_pooled(std::slice::from_ref(&config))
+            .await
+            .expect("second turn");
+        assert_eq!(
+            initialize_count(&server).await,
+            2,
+            "poisoned connection must not be reused"
+        );
+        assert!(!first.servers[0].ptr_eq(&second.servers[0]));
+        assert!(!second.servers[0].recovery.is_poisoned());
+    }
+
+    #[test]
+    fn pool_key_skips_stdio_and_is_stable_across_header_order() {
+        let stdio = McpServerConfig {
+            name: "s".into(),
+            transport: McpTransport::Stdio,
+            command: "x".into(),
+            ..Default::default()
+        };
+        assert!(connection_pool::key(&stdio).is_none());
+
+        let mut a = http_server_config("http://h/mcp".into());
+        let mut b = a.clone();
+        for (k, v) in [("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")] {
+            a.headers.insert(k.into(), v.into());
+        }
+        for (k, v) in [("d", "4"), ("c", "3"), ("b", "2"), ("a", "1")] {
+            b.headers.insert(k.into(), v.into());
+        }
+        assert_eq!(connection_pool::key(&a), connection_pool::key(&b));
+    }
+
+    #[tokio::test]
+    async fn plain_connect_all_does_not_use_the_pool() {
+        let server = counting_server().await;
+        let config = McpServerConfig {
+            name: "pool_bypass".into(),
+            ..http_server_config(server.uri())
+        };
+        McpRegistry::connect_all(std::slice::from_ref(&config))
+            .await
+            .expect("one");
+        McpRegistry::connect_all(std::slice::from_ref(&config))
+            .await
+            .expect("two");
+        assert_eq!(initialize_count(&server).await, 2);
+        let _ = connection_pool::len();
+    }
+
+    #[tokio::test]
     async fn connect_filters_out_disabled_tools() {
         use wiremock::matchers::{body_partial_json, method};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1757,6 +2243,53 @@ mod tests {
             .expect("connect_all should not fail");
         assert!(registry.is_empty());
         assert_eq!(registry.tool_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn connect_all_records_auth_rejection_per_server() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let mut config = http_server_config(server.uri());
+        config.name = "tenant_aivory-mail".to_string();
+        let registry = McpRegistry::connect_all(&[config])
+            .await
+            .expect("connect_all stays non-fatal");
+
+        assert!(registry.is_empty());
+        assert_eq!(
+            registry.connect_failures(),
+            &[McpConnectFailure {
+                server: "tenant_aivory-mail".to_string(),
+                kind: McpConnectFailureKind::AuthRejected { status: 401 },
+            }]
+        );
+    }
+
+    #[test]
+    fn connect_failure_kind_classifies_without_keeping_the_error_text() {
+        let auth =
+            anyhow::anyhow!("MCP server returned HTTP 403 Forbidden").context("initialize failed");
+        assert_eq!(
+            McpConnectFailureKind::classify(&auth),
+            McpConnectFailureKind::AuthRejected { status: 403 }
+        );
+        let timeout = anyhow::anyhow!("operation timed out").context("connect");
+        assert_eq!(
+            McpConnectFailureKind::classify(&timeout),
+            McpConnectFailureKind::Timeout
+        );
+        let other = anyhow::anyhow!("MCP server returned HTTP 502 Bad Gateway");
+        assert_eq!(
+            McpConnectFailureKind::classify(&other),
+            McpConnectFailureKind::Unreachable
+        );
     }
 
     #[test]
@@ -2440,6 +2973,7 @@ mod tests {
             servers: vec![server],
             tool_index,
             server_index,
+            failures: Vec::new(),
         });
 
         let security = Arc::new(zeroclaw_config::policy::SecurityPolicy {

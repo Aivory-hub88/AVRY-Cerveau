@@ -169,6 +169,13 @@ pub struct TenantCustomMcpServer {
     /// this feature existed.
     #[serde(default)]
     pub disabled_tools: Vec<String>,
+    /// Set when avry-backend lists this server as registered but unusable
+    /// (its row is `verification_failed`), to a coarse reason code:
+    /// `"auth_rejected"` or `"verification_failed"`. Such an entry carries no
+    /// url or credentials, is never connected, and only exists so the turn
+    /// can tell the model the server is down instead of silently missing.
+    #[serde(default)]
+    pub unavailable_reason: Option<String>,
 }
 
 /// Tool-name prefix a tenant custom MCP server's tools carry, distinct from
@@ -242,6 +249,7 @@ pub fn tenant_custom_mcp_server_configs(
 
     servers
         .iter()
+        .filter(|server| server.unavailable_reason.is_none())
         .map(|server| {
             let mut headers = std::collections::HashMap::new();
             if let (Some(name), Some(value)) = (&server.auth_header_name, &server.auth_header_value)
@@ -276,6 +284,21 @@ impl TenantContext {
     /// See [`tenant_custom_mcp_server_configs`].
     pub fn custom_mcp_server_configs(&self) -> Vec<zeroclaw_config::schema::McpServerConfig> {
         tenant_custom_mcp_server_configs(&self.tenant_custom_mcp_servers)
+    }
+
+    /// `(name, reason code)` for each of this tenant's custom servers that
+    /// avry-backend reports as unusable. See
+    /// [`TenantCustomMcpServer::unavailable_reason`].
+    pub fn unavailable_custom_mcp_servers(&self) -> Vec<(&str, &str)> {
+        self.tenant_custom_mcp_servers
+            .iter()
+            .filter_map(|server| {
+                server
+                    .unavailable_reason
+                    .as_deref()
+                    .map(|reason| (server.name.as_str(), reason))
+            })
+            .collect()
     }
 
     /// True if `tool_name` originates from one of this tenant's own custom
@@ -443,13 +466,14 @@ pub fn take_pending_approval() -> Option<PendingApprovalSummary> {
 
 /// ADR-021: one speech act an agent made towards its teammates during a turn
 /// (`team_message`, `team_ask`, `team_delegate`, `team_handoff`,
-/// `team_remind`). The engine only records it; the room the turn came from
+/// `team_remind`, `team_wait`, `team_wait_close`). The engine only records it; the room the turn came from
 /// carries it out after the turn (posts the message, starts the teammate's
 /// turn, routes the answer back, schedules the reminder), so every exchange
 /// is a visible message the human can read and stop.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TeamAction {
-    /// `message` | `ask` | `delegate` | `handoff` | `remind`.
+    /// `message` | `ask` | `delegate` | `handoff` | `remind` | `wait` |
+    /// `wait_close`.
     pub kind: String,
     /// The teammate (agent type or display name, as the model wrote it), or
     /// `self` for a reminder to the calling agent. The room resolves and
@@ -460,8 +484,17 @@ pub struct TeamAction {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub due: Option<String>,
     /// `remind`: when, as ISO 8601 or a relative `in 2h` / `in 3d`.
+    /// `wait`: the optional `until` that wakes the wait.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub when: Option<String>,
+    /// `remind`: what the room does when the reminder could not fire on
+    /// time (`run_once` | `skip`). `None` = the room's default (`run_once`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missed_policy: Option<String>,
+    /// `wait_close`: the wait to close. `None` = all of the agent's open
+    /// waits in the thread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_id: Option<String>,
 }
 
 /// At most this many team actions per turn; the rest are refused to the model.
@@ -512,6 +545,78 @@ pub fn take_team_actions() -> Vec<TeamAction> {
                 .unwrap_or_default()
         })
         .unwrap_or_default()
+}
+
+/// ADR-021 §4.3: how an unattended run (a cron job, a fired reminder, a woken
+/// wait) ended, as the agent reported it with `run_no_update` or
+/// `run_report_failure`. A run that reports nothing is a normal run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// Nothing to report: the run sends no notification.
+    Quiet,
+    /// The run could not do its job; it is recorded as failed.
+    Failed { reason: String },
+}
+
+impl RunOutcome {
+    /// The wire value next to `team_actions`: `quiet` | `failed`.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Quiet => "quiet",
+            Self::Failed { .. } => "failed",
+        }
+    }
+
+    /// The failure reason, for `failed`.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Quiet => None,
+            Self::Failed { reason } => Some(reason),
+        }
+    }
+}
+
+tokio::task_local! {
+    /// ADR-021 §4.3: the unattended-run cell `run_no_update` /
+    /// `run_report_failure` write into. Scoped by the cron scheduler for
+    /// every agent job and by the gateway for a webhook turn marked
+    /// `X-Turn-Origin: cron | reminder | wake`; a human chat turn has no cell,
+    /// so the two tools are not offered there.
+    pub static RUN_OUTCOME: Option<Arc<parking_lot::Mutex<Option<RunOutcome>>>>;
+}
+
+/// Whether this turn is an unattended run that can report its outcome.
+pub fn run_outcome_available() -> bool {
+    RUN_OUTCOME.try_with(|cell| cell.is_some()).unwrap_or(false)
+}
+
+/// Record how this run ended. A later call replaces an earlier one, so a run
+/// that first said "nothing new" and then hit a failure ends as failed.
+/// `Err` (a message for the model) outside an unattended run.
+pub fn record_run_outcome(outcome: RunOutcome) -> Result<(), String> {
+    RUN_OUTCOME
+        .try_with(|cell| match cell {
+            Some(cell) => {
+                *cell.lock() = Some(outcome);
+                Ok(())
+            }
+            None => Err(NOT_UNATTENDED.to_string()),
+        })
+        .unwrap_or_else(|_| Err(NOT_UNATTENDED.to_string()))
+}
+
+const NOT_UNATTENDED: &str =
+    "this is only available on a scheduled or unattended run, not in a conversation";
+
+/// Take this run's recorded outcome (`None` outside an unattended run, or
+/// when the agent reported nothing).
+pub fn take_run_outcome() -> Option<RunOutcome> {
+    RUN_OUTCOME
+        .try_with(|cell| cell.as_ref().and_then(|cell| cell.lock().take()))
+        .ok()
+        .flatten()
 }
 
 /// ADR-009 Phase 1: fire-time tenant resolution for non-HTTP entry points
@@ -576,6 +681,66 @@ pub async fn resolve_tenant_context(
         Some(f) => f(tenant_id.to_string(), agent_type.to_string()).await,
         None => None,
     }
+}
+
+/// Tells avry-backend that a tenant custom MCP server rejected Cerveau's
+/// credentials (HTTP 401/403), so its row flips to `verification_failed`
+/// and the dashboard stops showing "Verified". Arguments: platform user id,
+/// agent type, server name (without [`TENANT_CUSTOM_MCP_NAME_PREFIX`]), HTTP
+/// status. Registered once at startup by the binary crate, same seam as
+/// [`register_tenant_resolve_fn`]; the closure must not block (it spawns).
+pub type CustomMcpAuthFailureFn = Box<dyn Fn(String, String, String, u16) + Send + Sync>;
+
+static CUSTOM_MCP_AUTH_FAILURE_FN: std::sync::OnceLock<CustomMcpAuthFailureFn> =
+    std::sync::OnceLock::new();
+
+/// A busy agent hits the same rejected server on every turn until the
+/// resolver cache drops it; report each (tenant, server) at most once per
+/// this window.
+const CUSTOM_MCP_AUTH_FAILURE_REPORT_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
+
+/// Register the auth-failure reporter. First writer wins.
+pub fn register_custom_mcp_auth_failure_fn(f: CustomMcpAuthFailureFn) {
+    let _ = CUSTOM_MCP_AUTH_FAILURE_FN.set(f);
+}
+
+/// Report that `server` (without the `tenant_` prefix) rejected this
+/// tenant's credentials with `status`. Deduplicated per (tenant, server)
+/// within [`CUSTOM_MCP_AUTH_FAILURE_REPORT_WINDOW`]; returns whether this
+/// call was the one that reported.
+pub fn report_custom_mcp_auth_failure(tenant: &TenantContext, server: &str, status: u16) -> bool {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    static LAST_REPORTED: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> =
+        std::sync::OnceLock::new();
+    let key = format!(
+        "{}\u{1f}{}\u{1f}{}",
+        tenant.platform_user_id, tenant.agent_type, server
+    );
+    let now = Instant::now();
+    {
+        let mut last = LAST_REPORTED
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        last.retain(|_, at| now.duration_since(*at) < CUSTOM_MCP_AUTH_FAILURE_REPORT_WINDOW);
+        if last.contains_key(&key) {
+            return false;
+        }
+        last.insert(key, now);
+    }
+    if let Some(f) = CUSTOM_MCP_AUTH_FAILURE_FN.get() {
+        f(
+            tenant.platform_user_id.clone(),
+            tenant.agent_type.clone(),
+            server.to_string(),
+            status,
+        );
+    }
+    true
 }
 
 #[cfg(test)]
@@ -691,6 +856,7 @@ mod tests {
             auth_header_value: Some("secret123".to_string()),
             risk_tier: "irreversible".to_string(),
             disabled_tools: Vec::new(),
+            unavailable_reason: None,
         }
     }
 
@@ -804,6 +970,7 @@ mod tests {
             auth_header_value: Some("Bearer avry_mcp_x".to_string()),
             risk_tier: "irreversible".to_string(),
             disabled_tools: Vec::new(),
+            unavailable_reason: None,
         };
         let ctx = TenantContext {
             tenant_id: "u1:cs".to_string(),
@@ -829,6 +996,7 @@ mod tests {
             auth_header_value: None,
             risk_tier: "irreversible".to_string(),
             disabled_tools: Vec::new(),
+            unavailable_reason: None,
         };
         let ctx = TenantContext {
             tenant_id: "u1:cs".to_string(),
@@ -853,6 +1021,7 @@ mod tests {
             auth_header_value: None,
             risk_tier: "irreversible".to_string(),
             disabled_tools: Vec::new(),
+            unavailable_reason: None,
         };
         let ctx_with = |server: TenantCustomMcpServer| TenantContext {
             tenant_id: "u1.leads_qualifier".to_string(),
@@ -1007,5 +1176,90 @@ mod tests {
                 assert_eq!(seen.id, "pa_2");
             })
             .await;
+    }
+
+    fn tenant_with(user: &str, servers: Vec<TenantCustomMcpServer>) -> TenantContext {
+        TenantContext {
+            tenant_id: format!("{user}:leads_qualifier"),
+            platform_user_id: user.to_string(),
+            agent_type: "leads_qualifier".to_string(),
+            persona: None,
+            connected_toolkits: Vec::new(),
+            disabled_toolkits: Vec::new(),
+            tenant_custom_mcp_servers: servers,
+            active_agents: None,
+        }
+    }
+
+    #[test]
+    fn unavailable_custom_servers_are_listed_but_never_connected() {
+        let mut down = sample_custom_server();
+        down.name = "aivory-mail".to_string();
+        down.url = String::new();
+        down.auth_header_name = None;
+        down.auth_header_value = None;
+        down.unavailable_reason = Some("auth_rejected".to_string());
+        let ctx = tenant_with("u_unavail", vec![sample_custom_server(), down]);
+
+        let names: Vec<String> = ctx
+            .custom_mcp_server_configs()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, vec!["tenant_orders".to_string()]);
+        assert_eq!(
+            ctx.unavailable_custom_mcp_servers(),
+            vec![("aivory-mail", "auth_rejected")]
+        );
+    }
+
+    #[test]
+    fn custom_mcp_auth_failure_is_reported_once_per_tenant_and_server() {
+        static CALLS: std::sync::Mutex<Vec<(String, String, String, u16)>> =
+            std::sync::Mutex::new(Vec::new());
+        register_custom_mcp_auth_failure_fn(Box::new(|user, agent_type, server, status| {
+            CALLS
+                .lock()
+                .unwrap()
+                .push((user, agent_type, server, status));
+        }));
+        let ctx = tenant_with("u_report_once", Vec::new());
+        let other = tenant_with("u_report_other", Vec::new());
+
+        assert!(report_custom_mcp_auth_failure(&ctx, "aivory-mail", 401));
+        assert!(!report_custom_mcp_auth_failure(&ctx, "aivory-mail", 401));
+        assert!(report_custom_mcp_auth_failure(&ctx, "orders", 403));
+        assert!(report_custom_mcp_auth_failure(&other, "aivory-mail", 401));
+
+        let calls: Vec<_> = CALLS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(user, ..)| user.starts_with("u_report_"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "u_report_once".to_string(),
+                    "leads_qualifier".to_string(),
+                    "aivory-mail".to_string(),
+                    401
+                ),
+                (
+                    "u_report_once".to_string(),
+                    "leads_qualifier".to_string(),
+                    "orders".to_string(),
+                    403
+                ),
+                (
+                    "u_report_other".to_string(),
+                    "leads_qualifier".to_string(),
+                    "aivory-mail".to_string(),
+                    401
+                ),
+            ]
+        );
     }
 }

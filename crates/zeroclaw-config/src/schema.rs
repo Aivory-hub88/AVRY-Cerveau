@@ -15746,6 +15746,11 @@ const DEFAULT_SAFE_TOOLS: &[&str] = &[
     "team_delegate",
     "team_handoff",
     "team_remind",
+    "team_wait",
+    "team_wait_close",
+    // ADR-021 §4.3: they only record how an unattended run ended.
+    "run_no_update",
+    "run_report_failure",
 ];
 
 /// Apply a tenant's entity id to one `[[mcp.servers]]` entry, if it's

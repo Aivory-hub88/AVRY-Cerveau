@@ -3895,6 +3895,10 @@ struct WebhookPrelude {
     /// ADR-021: the turn came from a Team Space room (`X-Room-Channel:
     /// discussion`), so team tools are offered and their actions returned.
     room_turn: bool,
+    /// ADR-021 §4.3: nobody is waiting on this turn (`X-Turn-Origin: cron |
+    /// reminder | wake`), so the quiet / failed run tools are offered and the
+    /// outcome returned as `run_outcome`.
+    unattended: bool,
     /// Upstream SSE opt-in (`stream: true`); honoured only for untenanted
     /// requests, because the upstream streaming path has no tenant overlay.
     stream: bool,
@@ -4331,9 +4335,37 @@ async fn webhook_prelude(
             .get("x-room-channel")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.trim().eq_ignore_ascii_case("discussion")),
+        unattended: headers
+            .get("x-turn-origin")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(is_unattended_turn_origin),
         stream: webhook_body.stream,
         _admission_permit,
     })
+}
+
+/// ADR-021 §4.3: `X-Turn-Origin` values that mark a turn nobody is waiting
+/// on. Anything else (absent, `human`, unknown) is a conversation turn.
+fn is_unattended_turn_origin(origin: &str) -> bool {
+    matches!(
+        origin.trim().to_ascii_lowercase().as_str(),
+        "cron" | "reminder" | "wake"
+    )
+}
+
+#[cfg(test)]
+mod turn_origin_tests {
+    use super::is_unattended_turn_origin;
+
+    #[test]
+    fn only_cron_reminder_and_wake_are_unattended() {
+        for origin in ["cron", "reminder", "wake", " Reminder ", "WAKE"] {
+            assert!(is_unattended_turn_origin(origin), "{origin:?}");
+        }
+        for origin in ["", "human", "team", "discussion", "cronjob"] {
+            assert!(!is_unattended_turn_origin(origin), "{origin:?}");
+        }
+    }
 }
 
 async fn handle_webhook(
@@ -4354,6 +4386,7 @@ async fn handle_webhook(
         tenant_ctx,
         model_label,
         room_turn,
+        unattended,
         stream,
         _admission_permit,
     } = prelude;
@@ -4379,6 +4412,9 @@ async fn handle_webhook(
     // tools record into it and the room carries the actions out.
     let team_cell = (room_turn && tenant_ctx.is_some())
         .then(|| std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())));
+    // ADR-021 §4.3: an unattended tenant turn can end quietly or as failed.
+    let run_cell = (unattended && tenant_ctx.is_some())
+        .then(|| std::sync::Arc::new(parking_lot::Mutex::new(None)));
     let chat = Box::pin(run_gateway_chat_with_tools(
         &state,
         &message,
@@ -4387,11 +4423,15 @@ async fn handle_webhook(
         tenant_ctx,
     ));
     let outcome = zeroclaw_runtime::agent::tenant::TEAM_ACTIONS
-        .scope(team_cell.clone(), chat)
+        .scope(
+            team_cell.clone(),
+            zeroclaw_runtime::agent::tenant::RUN_OUTCOME.scope(run_cell.clone(), chat),
+        )
         .await;
     let team_actions = team_cell
         .map(|cell| std::mem::take(&mut *cell.lock()))
         .unwrap_or_default();
+    let run_outcome = run_cell.and_then(|cell| cell.lock().take());
 
     match outcome {
         // `input_tokens`/`output_tokens`/`cost_usd` are still populated on the
@@ -4425,6 +4465,10 @@ async fn handle_webhook(
                 "pending_approval": pending_approval,
                 // ADR-021: additive, `[]` outside a room turn.
                 "team_actions": team_actions,
+                // ADR-021 §4.3: additive, `null` unless an unattended turn
+                // called `run_no_update` / `run_report_failure`.
+                "run_outcome": run_outcome.as_ref().map(|o| o.as_str()),
+                "run_failure_reason": run_outcome.as_ref().and_then(|o| o.reason()),
             });
             (StatusCode::OK, Json(body)).into_response()
         }
@@ -4497,6 +4541,7 @@ async fn handle_webhook_stream(
         tenant_ctx,
         model_label,
         room_turn: _,
+        unattended: _,
         stream: _,
         _admission_permit,
     } = prelude;
@@ -4531,20 +4576,18 @@ async fn handle_webhook_stream(
         // must run together, not sequentially.
         let forward_fut = async {
             while let Some(event) = event_rx.recv().await {
-                if let zeroclaw_api::agent::TurnEvent::Chunk { delta } = event {
-                    let frame = serde_json::json!({ "type": "chunk", "content": delta });
-                    if frame_tx.send(frame).await.is_err() {
-                        // Client disconnected — stop forwarding, but let the
-                        // turn itself run to completion (same as `/ws/chat`,
-                        // which doesn't cancel on a dropped sink either).
-                        break;
-                    }
+                if let Some(frame) = webhook_stream_frame(&event)
+                    && frame_tx.send(frame).await.is_err()
+                {
+                    // Client disconnected — stop forwarding, but let the
+                    // turn itself run to completion (same as `/ws/chat`,
+                    // which doesn't cancel on a dropped sink either).
+                    break;
                 }
-                // Other `TurnEvent` variants (tool calls, thinking, usage,
-                // approval requests, plan): not surfaced to Console today —
-                // kept to a minimal superset of the blocking `/webhook`
-                // contract (`response` + `pending_approval`) rather than
-                // guessing at a richer wire format nothing consumes yet.
+                // Other `TurnEvent` variants (thinking, usage, approval
+                // requests, plan): not surfaced to Console — kept to a
+                // minimal superset of the blocking `/webhook` contract
+                // (`response` + `pending_approval`).
             }
         };
 
@@ -4589,6 +4632,26 @@ async fn handle_webhook_stream(
     axum::response::sse::Sse::new(sse_stream)
         .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response()
+}
+
+/// Wire frame for one `TurnEvent` on `/webhook/stream`, or `None` when the event
+/// is not surfaced. `tool` frames carry only the tool name and a coarse status
+/// (`running` / `done`) so Console can show progress during a long tool loop;
+/// arguments and results never leave the runtime.
+fn webhook_stream_frame(event: &zeroclaw_api::agent::TurnEvent) -> Option<serde_json::Value> {
+    use zeroclaw_api::agent::TurnEvent;
+    match event {
+        TurnEvent::Chunk { delta } => {
+            Some(serde_json::json!({ "type": "chunk", "content": delta }))
+        }
+        TurnEvent::ToolCall { id, name, .. } => {
+            Some(serde_json::json!({ "type": "tool", "id": id, "name": name, "status": "running" }))
+        }
+        TurnEvent::ToolResult { id, name, .. } => {
+            Some(serde_json::json!({ "type": "tool", "id": id, "name": name, "status": "done" }))
+        }
+        _ => None,
+    }
 }
 
 /// True when the request's `Accept` header negotiates Server-Sent Events.
@@ -15259,5 +15322,55 @@ mod gmail_bearer_tests {
     #[test]
     fn missing_bearer_never_matches_a_configured_secret() {
         assert!(!gmail_bearer_matches("", "s3cret-token"));
+    }
+}
+
+#[cfg(test)]
+mod webhook_stream_frame_tests {
+    use super::webhook_stream_frame;
+    use zeroclaw_api::agent::TurnEvent;
+
+    #[test]
+    fn chunk_keeps_its_wire_shape() {
+        let frame = webhook_stream_frame(&TurnEvent::Chunk {
+            delta: "Hal".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            frame,
+            serde_json::json!({ "type": "chunk", "content": "Hal" })
+        );
+    }
+
+    #[test]
+    fn tool_events_carry_name_and_status_only() {
+        let call = webhook_stream_frame(&TurnEvent::ToolCall {
+            id: "t1".into(),
+            name: "crm_update_lead".into(),
+            args: serde_json::json!({ "email": "secret@example.com" }),
+        })
+        .unwrap();
+        assert_eq!(
+            call,
+            serde_json::json!({ "type": "tool", "id": "t1", "name": "crm_update_lead", "status": "running" })
+        );
+        let result = webhook_stream_frame(&TurnEvent::ToolResult {
+            id: "t1".into(),
+            name: "crm_update_lead".into(),
+            output: "token=abc123".into(),
+            artifact: None,
+        })
+        .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({ "type": "tool", "id": "t1", "name": "crm_update_lead", "status": "done" })
+        );
+        assert!(!call.to_string().contains("secret@example.com"));
+        assert!(!result.to_string().contains("abc123"));
+    }
+
+    #[test]
+    fn other_events_are_not_surfaced() {
+        assert!(webhook_stream_frame(&TurnEvent::Thinking { delta: "hm".into() }).is_none());
     }
 }

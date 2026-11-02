@@ -24,6 +24,7 @@ pub mod file_read;
 pub mod model_switch;
 pub mod param_options;
 pub mod read_skill;
+pub mod run_outcome;
 mod runtime_command_error;
 pub mod schedule;
 pub mod scoped;
@@ -1360,6 +1361,8 @@ pub(crate) fn all_tools_with_runtime_context(
     // room-turn and tenant scopes here, on the turn's task.
     let team_tools = crate::agent::tenant::team_actions_available()
         && crate::agent::tenant::current_tenant().is_some();
+    // ADR-021 §4.3: same for the unattended-run cell (cron, fired reminder).
+    let run_outcome_tools = crate::agent::tenant::run_outcome_available();
     let builder = move || {
         #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
         let _late_guard = late_tool_search_observer::enter_builder(late_trace);
@@ -1396,6 +1399,7 @@ pub(crate) fn all_tools_with_runtime_context(
             execution_capability,
             acp_sessions,
             team_tools,
+            run_outcome_tools,
         )
     };
     std::thread::scope(|scope| -> anyhow::Result<AllToolsResult> {
@@ -1567,6 +1571,7 @@ fn all_tools_with_runtime_on_thread(
     execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
     team_tools: bool,
+    run_outcome_tools: bool,
 ) -> anyhow::Result<AllToolsResult> {
     #[cfg(feature = "tools-external")]
     let browser_config = _browser_config;
@@ -1754,6 +1759,13 @@ fn all_tools_with_runtime_on_thread(
     // builder thread, where those task-locals are not set.
     if team_tools {
         for tool in team_comms::TeamCommsTool::all() {
+            tool_arcs.push(Arc::new(tool));
+        }
+    }
+    // ADR-021 §4.3: quiet / failed run tools, only on an unattended run (the
+    // cron scheduler and the gateway scope `RUN_OUTCOME` for those).
+    if run_outcome_tools {
+        for tool in run_outcome::RunOutcomeTool::all() {
             tool_arcs.push(Arc::new(tool));
         }
     }
@@ -3848,6 +3860,15 @@ mod tests {
     }
 
     fn team_tool_names_built_in(room: bool, tenant: bool) -> Vec<String> {
+        tool_names_built_in(room, tenant, false, "team_")
+    }
+
+    fn tool_names_built_in(
+        room: bool,
+        tenant: bool,
+        unattended: bool,
+        prefix: &str,
+    ) -> Vec<String> {
         let tmp = TempDir::new().unwrap();
         let mem_cfg = MemoryConfig {
             backend: "markdown".into(),
@@ -3880,7 +3901,7 @@ mod tests {
             .tools
             .iter()
             .map(|t| t.name().to_string())
-            .filter(|n| n.starts_with("team_"))
+            .filter(|n| n.starts_with(prefix))
             .collect::<Vec<_>>()
         };
         let tenant_ctx = tenant.then(|| {
@@ -3896,9 +3917,22 @@ mod tests {
             })
         });
         let cell = room.then(|| Arc::new(parking_lot::Mutex::new(Vec::new())));
+        let run_cell = unattended.then(|| Arc::new(parking_lot::Mutex::new(None)));
         crate::agent::tenant::TENANT_CONTEXT.sync_scope(tenant_ctx, || {
-            crate::agent::tenant::TEAM_ACTIONS.sync_scope(cell, build)
+            crate::agent::tenant::TEAM_ACTIONS.sync_scope(cell, || {
+                crate::agent::tenant::RUN_OUTCOME.sync_scope(run_cell, build)
+            })
         })
+    }
+
+    /// ADR-021 §4.3: the quiet / failed run tools are built only for an
+    /// unattended run, read on the caller like the team tools.
+    #[test]
+    fn run_outcome_tools_reach_an_unattended_run_only() {
+        let mut names = tool_names_built_in(false, true, true, "run_");
+        names.sort();
+        assert_eq!(names, vec!["run_no_update", "run_report_failure"]);
+        assert!(tool_names_built_in(true, true, false, "run_").is_empty());
     }
 
     /// ADR-021 regression: the registry is built on a dedicated thread, where
@@ -3913,6 +3947,8 @@ mod tests {
             "team_delegate",
             "team_handoff",
             "team_remind",
+            "team_wait",
+            "team_wait_close",
         ] {
             assert!(
                 names.iter().any(|n| n == expected),

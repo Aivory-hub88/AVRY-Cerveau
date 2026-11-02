@@ -16346,7 +16346,13 @@ async fn assemble_channel_agent_tools(
     .instrument(zeroclaw_log::attribution_span!(&agent_attribution))
     .await;
     let deferred_section = assembled.deferred_section().to_string();
-    let pinned_section = assembled.pinned_section().to_string();
+    // The unavailable-servers note rides with the pinned section: it is
+    // appended after the text-tool policy may clear the deferred listing.
+    let mut pinned_section = assembled.pinned_section().to_string();
+    zeroclaw_runtime::tools::scoped::append_mcp_note(
+        &mut pinned_section,
+        assembled.unavailable_mcp_section(),
+    );
     let zeroclaw_runtime::tools::scoped::ScopedAssembled {
         registry,
         // `assemble` threads the target's own `delegate_handle` into eager MCP

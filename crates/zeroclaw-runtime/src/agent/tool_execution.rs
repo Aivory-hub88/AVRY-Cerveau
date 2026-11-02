@@ -552,6 +552,13 @@ pub(crate) async fn execute_one_tool(
         });
     };
 
+    // Cerveau: a tool in use is the last schema `tool_search` unloads.
+    if let Some(at) = dispatch.activated_tools {
+        at.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .note_used(tool.name());
+    }
+
     if is_excluded_tool(tool.name(), dispatch.excluded_tools) {
         return Ok(unavailable_tool_outcome(
             call_name,

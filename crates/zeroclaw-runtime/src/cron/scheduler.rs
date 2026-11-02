@@ -1228,6 +1228,7 @@ async fn run_agent_job(
         },
     ));
 
+    let run_outcome_cell = Arc::new(parking_lot::Mutex::new(None));
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
             // Box the (~100 KB) agent-run future *before* the task-local scopes
@@ -1255,24 +1256,22 @@ async fn run_agent_job(
                 )
                 .instrument(subagent_span),
             );
-            crate::agent::tenant::TENANT_CONTEXT
+            // ADR-021 §4.3: a cron run is unattended, so the agent can end it
+            // quietly (`run_no_update`) or as failed (`run_report_failure`).
+            crate::agent::tenant::RUN_OUTCOME
                 .scope(
-                    tenant_ctx,
-                    crate::agent::tenant::TURN_ORIGIN_CONTEXT.scope(turn_origin, agent_run),
+                    Some(run_outcome_cell.clone()),
+                    crate::agent::tenant::TENANT_CONTEXT.scope(
+                        tenant_ctx,
+                        crate::agent::tenant::TURN_ORIGIN_CONTEXT.scope(turn_origin, agent_run),
+                    ),
                 )
                 .await
         }
     };
 
     match run_result {
-        Ok(response) => (
-            true,
-            if response.trim().is_empty() {
-                "agent job executed".to_string()
-            } else {
-                response
-            },
-        ),
+        Ok(response) => apply_run_outcome(response, run_outcome_cell.lock().take()),
         Err(e) => {
             let mut error_attributes = ::serde_json::json!({
                 "job_id": job.id,
@@ -1314,6 +1313,31 @@ async fn run_agent_job(
             }
             (false, agent_job_error_message(&e))
         }
+    }
+}
+
+/// ADR-021 §4.3: an agent job's `(success, output)` from its reply and the
+/// outcome it reported. Quiet becomes the `NO_REPLY:` sentinel, so a
+/// configured delivery is `skipped` and the run stays `ok`. Failed makes the
+/// execution `error` on `cron_runs`, and the reason is still delivered.
+fn apply_run_outcome(
+    response: String,
+    outcome: Option<crate::agent::tenant::RunOutcome>,
+) -> (bool, String) {
+    let response = if response.trim().is_empty() {
+        "agent job executed".to_string()
+    } else {
+        response
+    };
+    match outcome {
+        None => (true, response),
+        Some(crate::agent::tenant::RunOutcome::Quiet) => {
+            (true, format!("NO_REPLY: {}", response.trim()))
+        }
+        Some(crate::agent::tenant::RunOutcome::Failed { reason }) => (
+            false,
+            format!("run reported failure: {reason}\n\n{}", response.trim()),
+        ),
     }
 }
 
@@ -1783,6 +1807,32 @@ mod tests {
         assert!(!is_no_reply_sentinel("NO_REPLY[WARN]: disk at 90%"));
         // Malformed kinded form with no closing bracket is delivered.
         assert!(!is_no_reply_sentinel("NO_REPLY[INFO without close"));
+    }
+
+    #[test]
+    fn a_quiet_run_is_withheld_and_a_failed_run_is_an_error() {
+        use crate::agent::tenant::RunOutcome;
+        assert_eq!(
+            apply_run_outcome("3 new leads".into(), None),
+            (true, "3 new leads".to_string())
+        );
+        let (ok, quiet) = apply_run_outcome("No new leads today.".into(), Some(RunOutcome::Quiet));
+        assert!(ok);
+        assert!(is_no_reply_sentinel(&quiet), "{quiet}");
+        assert!(!announce_delivery_decision(&quiet).should_deliver());
+        let (ok, failed) = apply_run_outcome(
+            "I could not reach Odoo.".into(),
+            Some(RunOutcome::Failed {
+                reason: "Odoo unreachable".into(),
+            }),
+        );
+        assert!(!ok);
+        assert!(failed.starts_with("run reported failure: Odoo unreachable"));
+        assert!(!is_no_reply_sentinel(&failed));
+        assert_eq!(
+            apply_run_outcome("  ".into(), Some(RunOutcome::Quiet)).1,
+            "NO_REPLY: agent job executed"
+        );
     }
 
     #[test]

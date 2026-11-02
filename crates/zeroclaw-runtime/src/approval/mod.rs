@@ -790,6 +790,7 @@ mod tests {
                 auth_header_value: None,
                 risk_tier: tier.to_string(),
                 disabled_tools: Vec::new(),
+                unavailable_reason: None,
             }],
         })
     }
