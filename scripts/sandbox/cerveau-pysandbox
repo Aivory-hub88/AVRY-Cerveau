@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# cerveau-pysandbox — start one `python_execute` run as a transient systemd
+# service. Installed root-owned at /usr/local/sbin/cerveau-pysandbox and
+# reached by the Cerveau daemon through `sudo -n` (see cerveau-pysandbox.sudoers).
+#
+#   cerveau-pysandbox [--dry-run] <workspace> <script> <timeout_s> <mem_mb> <cpu_pct> <pids> <python>
+#
+# It runs as root, so it trusts nothing it is given: every argument is checked
+# against /etc/cerveau-pysandbox.conf and fixed patterns before anything is
+# executed, and the service properties are not caller-controlled.
+#
+# --dry-run validates and prints the systemd-run command instead of running
+# it. It is the only mode that reads CERVEAU_PYSANDBOX_CONF, for tests.
+set -euo pipefail
+
+die() { echo "cerveau-pysandbox: $*" >&2; exit 64; }
+
+DRY=0
+if [[ "${1:-}" == "--dry-run" ]]; then DRY=1; shift; fi
+[[ $# -eq 7 ]] || die "expected 7 arguments, got $#"
+WS=$1 SCRIPT=$2 TIMEOUT=$3 MEM=$4 CPU=$5 PIDS=$6 PYTHON=$7
+
+CONF=/etc/cerveau-pysandbox.conf
+[[ $DRY -eq 1 && -n "${CERVEAU_PYSANDBOX_CONF:-}" ]] && CONF=$CERVEAU_PYSANDBOX_CONF
+[[ -f $CONF && ! -L $CONF ]] || die "missing config $CONF"
+if [[ $DRY -eq 0 ]]; then
+  [[ "$(stat -c %u "$CONF")" == 0 ]] || die "$CONF must be owned by root"
+  [[ $EUID -eq 0 ]] || die "must run as root"
+fi
+ALLOWED_ROOTS="" SANDBOX_USER="" DAEMON_USER=""
+# shellcheck disable=SC1090
+source "$CONF"
+[[ -n $ALLOWED_ROOTS && -n $SANDBOX_USER && -n $DAEMON_USER ]] || die "incomplete config"
+
+DAEMON_UID=$(id -u -- "$DAEMON_USER") || die "unknown DAEMON_USER"
+if [[ $DRY -eq 0 ]]; then
+  [[ "${SUDO_UID:-}" == "$DAEMON_UID" ]] || die "caller is not $DAEMON_USER"
+fi
+id -u -- "$SANDBOX_USER" >/dev/null 2>&1 || [[ $DRY -eq 1 ]] || die "unknown SANDBOX_USER"
+[[ "$SANDBOX_USER" != "$DAEMON_USER" && "$SANDBOX_USER" != root ]] \
+  || die "SANDBOX_USER must be a dedicated unprivileged user"
+
+num() { # name value min max
+  [[ $2 =~ ^[0-9]{1,6}$ ]] || die "$1 is not a number"
+  (( 10#$2 >= $3 && 10#$2 <= $4 )) || die "$1 out of range [$3,$4]"
+}
+num timeout "$TIMEOUT" 1 600
+num memory_mb "$MEM" 32 2048
+num cpu_pct "$CPU" 1 400
+num pids "$PIDS" 1 512
+
+# Workspace: canonical, a directory, inside an allowed root, owned by the daemon.
+[[ $WS == /* ]] || die "workspace must be absolute"
+REAL=$(realpath -e -- "$WS") || die "workspace does not exist"
+[[ $REAL == "$WS" ]] || die "workspace must be a canonical path"
+[[ -d $REAL ]] || die "workspace is not a directory"
+ok=0
+for root in $ALLOWED_ROOTS; do
+  root=${root%/}
+  [[ $root == /?* ]] || continue
+  if [[ $REAL == "$root" || $REAL == "$root"/* ]]; then ok=1; fi
+done
+[[ $ok -eq 1 ]] || die "workspace is outside ALLOWED_ROOTS"
+[[ "$(stat -c %u "$REAL")" == "$DAEMON_UID" ]] || die "workspace is not owned by $DAEMON_USER"
+
+# Script: the daemon's own tempfile, a plain file directly inside the workspace.
+[[ $SCRIPT =~ ^\.zeroclaw_python_execute_[A-Za-z0-9]+\.py$ ]] || die "bad script name"
+[[ -f $REAL/$SCRIPT && ! -L $REAL/$SCRIPT ]] || die "script is not a regular file"
+[[ "$(stat -c %u "$REAL/$SCRIPT")" == "$DAEMON_UID" ]] || die "script is not owned by $DAEMON_USER"
+
+# Interpreter: fixed shapes only, root-owned, and not writable by anyone else.
+[[ $PYTHON =~ ^/usr/bin/python3(\.[0-9]+)?$ || $PYTHON =~ ^/opt/[A-Za-z0-9_][A-Za-z0-9._-]*/bin/python3?$ ]] \
+  || die "interpreter path not allowed"
+[[ -x $PYTHON ]] || die "interpreter not executable"
+[[ "$(stat -L -c %u "$PYTHON")" == 0 ]] || die "interpreter must be root-owned"
+[[ "$(stat -L -c %a "$PYTHON")" =~ ^[0-7][0-5][0-5]$ ]] || die "interpreter must not be group/world writable"
+VENV_BIND=()
+if [[ $PYTHON == /opt/* ]]; then
+  top=${PYTHON#/opt/}; top=/opt/${top%%/*}
+  [[ "$(stat -c %u "$top")" == 0 ]] || die "$top must be root-owned"
+  VENV_BIND=(-p "BindReadOnlyPaths=$top")
+fi
+
+CMD=(systemd-run --quiet --wait --pipe --collect
+  -p "User=$SANDBOX_USER"
+  -p PrivateNetwork=yes -p PrivateTmp=yes -p PrivateDevices=yes
+  -p ProtectSystem=strict -p ProtectHome=yes -p ProtectProc=invisible -p ProcSubset=pid
+  -p ProtectKernelTunables=yes -p ProtectKernelModules=yes -p ProtectControlGroups=yes
+  -p NoNewPrivileges=yes -p CapabilityBoundingSet= -p RestrictNamespaces=yes
+  -p RestrictSUIDSGID=yes -p LockPersonality=yes
+  -p SystemCallArchitectures=native -p SystemCallFilter=@system-service
+  -p "SystemCallFilter=~@privileged @resources" -p SystemCallErrorNumber=EPERM
+  -p TemporaryFileSystem=/etc:ro -p TemporaryFileSystem=/var:ro -p TemporaryFileSystem=/run:ro
+  -p TemporaryFileSystem=/opt:ro -p TemporaryFileSystem=/srv:ro -p TemporaryFileSystem=/mnt:ro
+  -p BindReadOnlyPaths=/etc/ld.so.cache "${VENV_BIND[@]}"
+  -p "BindPaths=$REAL" -p "ReadWritePaths=$REAL" -p "WorkingDirectory=$REAL"
+  -p "MemoryMax=${MEM}M" -p MemorySwapMax=0 -p "TasksMax=$PIDS" -p "CPUQuota=${CPU}%"
+  -p "RuntimeMaxSec=$TIMEOUT"
+  -E PYTHONDONTWRITEBYTECODE=1 -E HOME=/tmp
+  -- "$PYTHON" "$REAL/$SCRIPT")
+
+if [[ $DRY -eq 1 ]]; then
+  printf '%q ' "${CMD[@]}"; echo
+  exit 0
+fi
+
+# Let the sandbox user write new files in the workspace, and keep the daemon
+# able to read and remove them. Existing files only need to be readable.
+setfacl -m "u:$SANDBOX_USER:rwx,m::rwx" -- "$REAL"
+setfacl -d -m "u:$SANDBOX_USER:rwx,u:$DAEMON_USER:rwx,m::rwx" -- "$REAL"
+timeout 10 setfacl -R -P -m "u:$SANDBOX_USER:rX" -- "$REAL" || true
+
+exec "${CMD[@]}"

@@ -1,0 +1,7 @@
+# /etc/cerveau-pysandbox.conf — root-owned, mode 0644.
+# Workspace roots the helper may bind into a sandbox (space separated).
+ALLOWED_ROOTS="/home/ubuntu/.zeroclaw-cerveau/workspace"
+# Dedicated unprivileged user the sandboxed code runs as.
+SANDBOX_USER=cerveau-sandbox
+# The user the Cerveau daemon runs as (the only caller the helper accepts).
+DAEMON_USER=ubuntu

@@ -7,10 +7,12 @@
 //!   script to completion, tears the container down. No persistent
 //!   kernel/state across calls (that's a deliberate v2 decision, not made
 //!   here).
-//! - **Docker-only.** This tool refuses to run unless the injected
-//!   [`RuntimeAdapter`] identifies itself as `"docker"` (see
-//!   `zeroclaw-config/src/platform/docker.rs`). It never falls back to
-//!   executing Python directly on the host.
+//! - **Sandboxed only.** With the default `docker` backend this tool refuses
+//!   to run unless the injected [`RuntimeAdapter`] identifies itself as
+//!   `"docker"` (see `zeroclaw-config/src/platform/docker.rs`). With the
+//!   `systemd` backend it runs through the root-owned helper in
+//!   `scripts/sandbox/` instead and ignores the runtime kind. Neither falls
+//!   back to executing Python directly on the host.
 //! - **Network is hard-coded to `none`.** Unlike the generic `shell` tool,
 //!   which honours `runtime.docker.network` from `DockerRuntimeConfig`,
 //!   this tool builds its own `docker run` invocation and always passes
@@ -60,7 +62,7 @@ use std::time::Duration;
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
-use zeroclaw_config::schema::PythonExecuteConfig;
+use zeroclaw_config::schema::{PythonExecuteBackend, PythonExecuteConfig};
 
 /// Network mode this tool always runs with. Hard-coded, not read from any
 /// config — see the module doc for why.
@@ -469,12 +471,14 @@ impl Tool for PythonExecuteTool {
             });
         }
 
-        if !self.runtime_is_docker() {
+        let backend = self.config.backend;
+        if backend == PythonExecuteBackend::Docker && !self.runtime_is_docker() {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(
-                    "python_execute requires Docker sandbox; runtime.kind must be \"docker\""
+                    "python_execute requires Docker sandbox; runtime.kind must be \"docker\" \
+                     (or set python_execute.backend = \"systemd\")"
                         .to_string(),
                 ),
             });
@@ -587,30 +591,46 @@ impl Tool for PythonExecuteTool {
 
         let container_name = format!("zeroclaw-python-execute-{}", uuid::Uuid::new_v4());
 
-        let mut cmd = tokio::process::Command::new("docker");
-        cmd.arg("run")
-            .arg("--rm")
-            .arg("--init")
-            .arg("--name")
-            .arg(&container_name)
-            .arg("--network")
-            .arg(HARD_NETWORK_MODE)
-            .arg("--memory")
-            .arg(format!("{}m", self.config.memory_limit_mb))
-            .arg("--cpus")
-            .arg(self.config.cpu_limit.to_string())
-            .arg("--volume")
-            .arg(format!("{}:/workspace:rw", host_workspace.display()))
-            .arg("--workdir")
-            .arg("/workspace")
-            .arg("--security-opt")
-            .arg("no-new-privileges");
-        if let Some(pids_limit) = pids_limit {
-            cmd.arg("--pids-limit").arg(pids_limit.to_string());
-        }
-        cmd.arg(self.config.image.trim())
-            .arg("python3")
-            .arg(format!("/workspace/{tempfile_name}"));
+        let mut cmd = match backend {
+            PythonExecuteBackend::Docker => {
+                let mut cmd = tokio::process::Command::new("docker");
+                cmd.arg("run")
+                    .arg("--rm")
+                    .arg("--init")
+                    .arg("--name")
+                    .arg(&container_name)
+                    .arg("--network")
+                    .arg(HARD_NETWORK_MODE)
+                    .arg("--memory")
+                    .arg(format!("{}m", self.config.memory_limit_mb))
+                    .arg("--cpus")
+                    .arg(self.config.cpu_limit.to_string())
+                    .arg("--volume")
+                    .arg(format!("{}:/workspace:rw", host_workspace.display()))
+                    .arg("--workdir")
+                    .arg("/workspace")
+                    .arg("--security-opt")
+                    .arg("no-new-privileges");
+                if let Some(pids_limit) = pids_limit {
+                    cmd.arg("--pids-limit").arg(pids_limit.to_string());
+                }
+                cmd.arg(self.config.image.trim())
+                    .arg("python3")
+                    .arg(format!("/workspace/{tempfile_name}"));
+                cmd
+            }
+            PythonExecuteBackend::Systemd => {
+                let mut cmd = tokio::process::Command::new("sudo");
+                cmd.args(systemd_helper_args(
+                    &self.config,
+                    &host_workspace,
+                    &tempfile_name,
+                    timeout_secs,
+                    pids_limit.unwrap_or(SYSTEMD_DEFAULT_PIDS_LIMIT),
+                ));
+                cmd
+            }
+        };
 
         #[cfg(unix)]
         cmd.process_group(0);
@@ -625,7 +645,7 @@ impl Tool for PythonExecuteTool {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(format!("Failed to spawn docker: {e}")),
+                    error: Some(format!("Failed to spawn {}: {e}", cmd_program(backend))),
                 });
             }
         };
@@ -635,7 +655,8 @@ impl Tool for PythonExecuteTool {
         // Safety net for true cancellation (this future dropped before
         // either branch below runs). Disarmed on every normal path so it
         // never fires a redundant/late kill.
-        let container_guard = ContainerKillGuard::new(container_name.clone());
+        let container_guard = (backend == PythonExecuteBackend::Docker)
+            .then(|| ContainerKillGuard::new(container_name.clone()));
 
         let stdout_handle = child.stdout.take();
         let stderr_handle = child.stderr.take();
@@ -649,7 +670,9 @@ impl Tool for PythonExecuteTool {
             Ok(Ok(status)) => {
                 #[cfg(unix)]
                 group_guard.disarm();
-                container_guard.disarm();
+                if let Some(guard) = &container_guard {
+                    guard.disarm();
+                }
                 let (stdout_capture, stderr_capture) =
                     tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
 
@@ -674,20 +697,15 @@ impl Tool for PythonExecuteTool {
                 }
             }
             Ok(Err(e)) => {
-                container_guard.disarm();
+                if let Some(guard) = &container_guard {
+                    guard.disarm();
+                }
                 // The local `docker run` CLI process itself failed
                 // (e.g. it was reaped unexpectedly); the container it
                 // launched may or may not still be running. Best-effort
                 // clean it up, but don't claim success either way.
-                let kill_status = tokio::process::Command::new("docker")
-                    .arg("kill")
-                    .arg(&container_name)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .await;
+                let kill_note = kill_sandbox(backend, &container_name).await;
                 tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
-                let kill_note = describe_kill_result(kill_status);
                 ToolResult {
                     success: false,
                     output: ToolOutput::default(),
@@ -703,17 +721,12 @@ impl Tool for PythonExecuteTool {
                 // process. `--rm` means a successful `docker kill` also
                 // removes the container, so there is nothing further to
                 // clean up on that side.
-                let kill_status = tokio::process::Command::new("docker")
-                    .arg("kill")
-                    .arg(&container_name)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .await;
-                container_guard.disarm();
+                let kill_note = kill_sandbox(backend, &container_name).await;
+                if let Some(guard) = &container_guard {
+                    guard.disarm();
+                }
                 let _ = child.start_kill();
                 tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
-                let kill_note = describe_kill_result(kill_status);
                 ToolResult {
                     success: false,
                     output: ToolOutput::default(),
@@ -742,6 +755,66 @@ impl Tool for PythonExecuteTool {
         }
 
         Ok(result)
+    }
+}
+
+/// Pids limit passed to the `systemd` helper when the sandbox gate carries none.
+const SYSTEMD_DEFAULT_PIDS_LIMIT: u64 = 128;
+
+fn cmd_program(backend: PythonExecuteBackend) -> &'static str {
+    match backend {
+        PythonExecuteBackend::Docker => "docker",
+        PythonExecuteBackend::Systemd => "sudo",
+    }
+}
+
+/// Arguments for `sudo` that start the `systemd` helper:
+/// `sudo -n -- <helper> <workspace> <script> <timeout> <mem_mb> <cpu_percent> <pids> <python>`.
+///
+/// `-n` makes a missing sudoers rule fail at once instead of waiting for a
+/// password. Every value is positional and fixed-shape; the helper validates
+/// each one again, since it runs as root.
+fn systemd_helper_args(
+    config: &PythonExecuteConfig,
+    workspace: &Path,
+    script: &str,
+    timeout_secs: u64,
+    pids_limit: u64,
+) -> Vec<String> {
+    let cpu_percent = (config.cpu_limit * 100.0).round().max(1.0) as u64;
+    vec![
+        "-n".to_string(),
+        "--".to_string(),
+        config.systemd_helper.clone(),
+        workspace.display().to_string(),
+        script.to_string(),
+        timeout_secs.to_string(),
+        config.memory_limit_mb.to_string(),
+        cpu_percent.to_string(),
+        pids_limit.to_string(),
+        config.systemd_python.clone(),
+    ]
+}
+
+/// Stop a still-running sandbox after a timeout or a failed wait. Docker is
+/// stopped explicitly. The `systemd` unit carries `RuntimeMaxSec` equal to the
+/// timeout, so it ends on its own: this process cannot signal the root-owned
+/// helper, and it says so instead of claiming a kill.
+async fn kill_sandbox(backend: PythonExecuteBackend, container_name: &str) -> String {
+    match backend {
+        PythonExecuteBackend::Docker => {
+            let kill_status = tokio::process::Command::new("docker")
+                .arg("kill")
+                .arg(container_name)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+            describe_kill_result(kill_status)
+        }
+        PythonExecuteBackend::Systemd => {
+            "the sandbox service stops itself at its runtime limit".to_string()
+        }
     }
 }
 
@@ -1152,5 +1225,104 @@ mod tests {
         // daemon to run end-to-end); this just pins the naming convention.
         assert!(TEMPFILE_PREFIX.starts_with('.'));
         assert_eq!(TEMPFILE_SUFFIX, ".py");
+    }
+
+    // ── systemd backend ──────────────────────────────────────────
+
+    #[test]
+    fn backend_defaults_to_docker() {
+        let cfg = PythonExecuteConfig::default();
+        assert_eq!(cfg.backend, PythonExecuteBackend::Docker);
+        assert_eq!(cfg.systemd_helper, "/usr/local/sbin/cerveau-pysandbox");
+        assert_eq!(cfg.systemd_python, "/usr/bin/python3");
+    }
+
+    #[test]
+    fn backend_parses_from_toml() {
+        let cfg: PythonExecuteConfig = toml::from_str(
+            "enabled = true\nbackend = \"systemd\"\nsystemd_python = \"/opt/py/bin/python\"",
+        )
+        .expect("valid config");
+        assert_eq!(cfg.backend, PythonExecuteBackend::Systemd);
+        assert_eq!(cfg.systemd_python, "/opt/py/bin/python");
+        assert!(toml::from_str::<PythonExecuteConfig>("backend = \"firecracker\"").is_err());
+    }
+
+    #[test]
+    fn systemd_helper_args_are_positional_and_fixed_shape() {
+        let cfg = PythonExecuteConfig {
+            memory_limit_mb: 256,
+            cpu_limit: 0.5,
+            ..PythonExecuteConfig::default()
+        };
+        let args = systemd_helper_args(
+            &cfg,
+            Path::new("/data/ws/t1"),
+            ".zeroclaw_python_execute_abc.py",
+            60,
+            128,
+        );
+        assert_eq!(
+            args,
+            [
+                "-n",
+                "--",
+                "/usr/local/sbin/cerveau-pysandbox",
+                "/data/ws/t1",
+                ".zeroclaw_python_execute_abc.py",
+                "60",
+                "256",
+                "50",
+                "128",
+                "/usr/bin/python3",
+            ]
+        );
+    }
+
+    #[test]
+    fn systemd_cpu_percent_never_rounds_to_zero() {
+        let cfg = PythonExecuteConfig {
+            cpu_limit: 0.0,
+            ..PythonExecuteConfig::default()
+        };
+        let args = systemd_helper_args(&cfg, Path::new("/w"), "s.py", 1, 1);
+        assert_eq!(args[7], "1");
+    }
+
+    #[tokio::test]
+    async fn systemd_backend_does_not_require_a_docker_runtime() {
+        let cfg = PythonExecuteConfig {
+            enabled: true,
+            backend: PythonExecuteBackend::Systemd,
+            // A helper path that cannot exist, so no real sandbox is started.
+            systemd_helper: "/nonexistent/cerveau-pysandbox".to_string(),
+            ..PythonExecuteConfig::default()
+        };
+        let tool = make_tool(native_runtime(), cfg, Vec::new());
+        let result = tool
+            .execute(json!({"code": "print('hi')"}))
+            .await
+            .expect("should return a result, not an error");
+        assert!(!result.success);
+        let err = result.error.unwrap_or_default();
+        assert!(!err.contains("Docker sandbox"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn docker_backend_still_requires_a_docker_runtime() {
+        let cfg = PythonExecuteConfig {
+            enabled: true,
+            ..PythonExecuteConfig::default()
+        };
+        let tool = make_tool(native_runtime(), cfg, Vec::new());
+        let result = tool
+            .execute(json!({"code": "print('hi')"}))
+            .await
+            .expect("should return a result, not an error");
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("Docker sandbox") && err.contains("systemd"),
+            "got: {err}"
+        );
     }
 }

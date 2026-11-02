@@ -9906,12 +9906,30 @@ impl Default for ShellToolConfig {
 
 // ── Python execute tool ─────────────────────────────────────────
 
+/// Where `python_execute` runs the script.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum PythonExecuteBackend {
+    /// A fresh Docker container per call (default). Requires `runtime.kind = "docker"`.
+    #[default]
+    Docker,
+    /// A transient systemd service per call, started through a root-owned
+    /// helper (`systemd_helper`) that Cerveau reaches with `sudo -n`. Needs no
+    /// Docker and no unprivileged user namespaces; works with any runtime kind.
+    Systemd,
+}
+
 /// Python code execution tool configuration (`[python_execute]` section).
 ///
-/// `python_execute` runs a one-shot Python script in a fresh Docker
-/// container per call (no persistent kernel across calls). It is opt-in
-/// (`enabled = false` by default) and only registers when the active
-/// runtime is Docker — this tool never runs Python directly on the host.
+/// `python_execute` runs a one-shot Python script in a fresh sandbox per call
+/// (no persistent kernel across calls). It is opt-in (`enabled = false` by
+/// default). With the default `docker` backend it only registers when the
+/// active runtime is Docker; with the `systemd` backend it registers on any
+/// runtime that has shell access. Either way it never runs Python directly
+/// on the host.
 ///
 /// Network access is hard-coded to `none` in the tool implementation and is
 /// deliberately NOT a field here: unlike `runtime.docker.network` (which the
@@ -9944,6 +9962,19 @@ pub struct PythonExecuteConfig {
     /// `DockerRuntimeConfig::cpu_limit`. Default: `1.0`.
     #[serde(default = "default_python_execute_cpu_limit")]
     pub cpu_limit: f64,
+    /// Sandbox backend. Default: `docker`.
+    #[serde(default)]
+    pub backend: PythonExecuteBackend,
+    /// `systemd` backend only: absolute path of the root-owned helper that
+    /// validates its arguments and starts the transient service. Default:
+    /// `/usr/local/sbin/cerveau-pysandbox`.
+    #[serde(default = "default_python_execute_systemd_helper")]
+    pub systemd_helper: String,
+    /// `systemd` backend only: absolute path of the interpreter run inside
+    /// the sandbox (a venv python makes its packages available). Default:
+    /// `/usr/bin/python3`.
+    #[serde(default = "default_python_execute_systemd_python")]
+    pub systemd_python: String,
 }
 
 fn default_python_execute_image() -> String {
@@ -9966,6 +9997,14 @@ fn default_python_execute_cpu_limit() -> f64 {
     1.0
 }
 
+fn default_python_execute_systemd_helper() -> String {
+    "/usr/local/sbin/cerveau-pysandbox".to_string()
+}
+
+fn default_python_execute_systemd_python() -> String {
+    "/usr/bin/python3".to_string()
+}
+
 impl Default for PythonExecuteConfig {
     fn default() -> Self {
         Self {
@@ -9975,6 +10014,9 @@ impl Default for PythonExecuteConfig {
             memory_limit_mb: default_python_execute_memory_limit_mb(),
             max_output_bytes: default_python_execute_max_output_bytes(),
             cpu_limit: default_python_execute_cpu_limit(),
+            backend: PythonExecuteBackend::default(),
+            systemd_helper: default_python_execute_systemd_helper(),
+            systemd_python: default_python_execute_systemd_python(),
         }
     }
 }

@@ -1,0 +1,3 @@
+# /etc/sudoers.d/cerveau-pysandbox — mode 0440, validate with `visudo -cf`.
+# The daemon may run exactly one root command. The helper checks every argument.
+ubuntu ALL=(root) NOPASSWD: /usr/local/sbin/cerveau-pysandbox *
