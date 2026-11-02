@@ -2508,13 +2508,18 @@ fn all_tools_with_runtime_on_thread(
         );
     }
 
-    // Python code execution tool — opt-in (disabled by default), and only
-    // registered when the runtime is actually Docker (the tool refuses to
-    // run at all otherwise, but there's no point offering it to the model
-    // when it can never succeed) and shell access is available (mirrors the
+    // Python code execution tool — opt-in (disabled by default). The Docker
+    // backend only registers when the runtime is actually Docker (the tool
+    // refuses to run at all otherwise, but there's no point offering it to
+    // the model when it can never succeed); the systemd backend does not use
+    // the runtime. Shell access is required either way (mirrors the
     // google_workspace/browser_delegate gating above).
     if root_config.python_execute.enabled {
-        if has_shell_access && runtime.name() == "docker" {
+        let python_backend_ready = match root_config.python_execute.backend {
+            zeroclaw_config::schema::PythonExecuteBackend::Docker => runtime.name() == "docker",
+            zeroclaw_config::schema::PythonExecuteBackend::Systemd => true,
+        };
+        if has_shell_access && python_backend_ready {
             tool_arcs.push(Arc::new(RateLimitedTool::new(
                 PathGuardedTool::new(
                     PythonExecuteTool::new(
@@ -2532,7 +2537,7 @@ fn all_tools_with_runtime_on_thread(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "python_execute: skipped registration because the current runtime is not Docker"
+                "python_execute: skipped registration because the Docker backend needs runtime.kind = \"docker\" (or set python_execute.backend = \"systemd\")"
             );
         }
     }
