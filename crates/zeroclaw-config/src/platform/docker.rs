@@ -1,3 +1,4 @@
+use super::sandbox_gate;
 use crate::schema::DockerRuntimeConfig;
 use anyhow::{Context, Result};
 use std::ffi::OsStr;
@@ -34,16 +35,16 @@ pub struct DockerRuntime {
 
 impl DockerRuntime {
     pub fn new(config: DockerRuntimeConfig) -> Self {
-        Self {
-            config,
-            resolved_launcher: None,
-        }
+        Self::with_resolved_launcher(config, None)
     }
 
     pub(crate) fn with_resolved_launcher(
         config: DockerRuntimeConfig,
         resolved_launcher: Option<PathBuf>,
     ) -> Self {
+        // First runtime constructed in the process installs the shared
+        // admission gate; see `sandbox_gate`.
+        sandbox_gate::init_global(sandbox_gate::SandboxGateLimits::from(&config));
         Self {
             config,
             resolved_launcher,
@@ -172,6 +173,11 @@ impl DockerRuntime {
         if self.config.read_only_rootfs {
             process.arg("--read-only");
         }
+
+        if let Some(pids_limit) = self.config.pids_limit.filter(|n| *n > 0) {
+            process.arg("--pids-limit").arg(pids_limit.to_string());
+        }
+        process.arg("--security-opt").arg("no-new-privileges");
 
         for key in env_keys {
             let key = docker_env_key(key)?;
@@ -354,6 +360,7 @@ mod tests {
             read_only_rootfs: true,
             mount_workspace: true,
             allowed_workspace_roots: Vec::new(),
+            ..Default::default()
         };
         let runtime = DockerRuntime::new(cfg);
 
@@ -370,6 +377,33 @@ mod tests {
         assert!(debug.contains("1.5"));
         assert!(debug.contains("--workdir"));
         assert!(debug.contains("echo hello"));
+    }
+
+    #[test]
+    fn docker_build_shell_command_limits_pids_and_blocks_privilege_gain() {
+        let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
+        let command = runtime
+            .build_shell_command_for_test("echo hello", &std::env::temp_dir())
+            .unwrap();
+        let debug = format!("{command:?}");
+
+        assert!(debug.contains("--pids-limit"));
+        assert!(debug.contains("128"));
+        assert!(debug.contains("no-new-privileges"));
+    }
+
+    #[test]
+    fn docker_pids_limit_can_be_disabled() {
+        for pids_limit in [None, Some(0)] {
+            let runtime = DockerRuntime::new(DockerRuntimeConfig {
+                pids_limit,
+                ..Default::default()
+            });
+            let command = runtime
+                .build_shell_command_for_test("echo hello", &std::env::temp_dir())
+                .unwrap();
+            assert!(!format!("{command:?}").contains("--pids-limit"));
+        }
     }
 
     #[test]

@@ -225,6 +225,28 @@ impl Tool for SkillShellTool {
             cmd.env(SESSION_ID_ENV_VAR, session_id);
         }
 
+        // Docker runs queue behind the process-wide sandbox gate.
+        let _sandbox_permit = if self.runtime.name() == "docker" {
+            match zeroclaw_config::platform::sandbox_gate::global() {
+                Some(gate) => match gate
+                    .acquire(&self.security.workspace_dir.to_string_lossy())
+                    .await
+                {
+                    Ok(permit) => Some(permit),
+                    Err(e) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(e.to_string()),
+                        });
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+
         let result =
             tokio::time::timeout(Duration::from_secs(self.timeout_secs), cmd.output()).await;
 

@@ -16308,6 +16308,56 @@ pub struct DockerRuntimeConfig {
     /// Optional workspace root allowlist for fail-closed Docker mount validation: when `mount_workspace` is enabled, the workspace must exist and canonicalize even when this list is empty; every configured root must also exist and canonicalize; one invalid entry rejects the command before Docker starts; an empty list permits any canonical workspace.
     #[serde(default)]
     pub allowed_workspace_roots: Vec<String>,
+
+    /// Maximum Docker sandbox runs (`shell` on this runtime and
+    /// `python_execute`) executing at once in this daemon process. Extra runs
+    /// queue in FIFO order. `0` disables the limit. Read once at daemon
+    /// start; changing it needs a restart. With several daemons behind a load
+    /// balancer the effective ceiling is this value times the daemon count.
+    #[serde(default = "default_docker_max_concurrent")]
+    pub max_concurrent: usize,
+
+    /// Maximum Docker sandbox runs executing at once for a single workspace,
+    /// so one tenant cannot occupy every slot. `0` disables the limit.
+    #[serde(default = "default_docker_max_concurrent_per_workspace")]
+    pub max_concurrent_per_workspace: usize,
+
+    /// Maximum runs of one workspace allowed to wait for a slot. A run
+    /// arriving when its workspace's queue is full is refused immediately with
+    /// a "sandbox is busy" error instead of waiting. `0` means no queueing:
+    /// a run that cannot start at once is refused.
+    #[serde(default = "default_docker_max_queued_per_workspace")]
+    pub max_queued_per_workspace: usize,
+
+    /// Seconds a run may wait for a slot before it is refused. Keep this well
+    /// below `channels.message_timeout_secs`, which also bounds the turn.
+    #[serde(default = "default_docker_queue_timeout_secs")]
+    pub queue_timeout_secs: u64,
+
+    /// Maximum processes inside one container (`docker run --pids-limit`), a
+    /// guard against fork bombs. `None` or `0` leaves it unlimited.
+    #[serde(default = "default_docker_pids_limit")]
+    pub pids_limit: Option<u64>,
+}
+
+fn default_docker_max_concurrent() -> usize {
+    4
+}
+
+fn default_docker_max_concurrent_per_workspace() -> usize {
+    2
+}
+
+fn default_docker_max_queued_per_workspace() -> usize {
+    8
+}
+
+fn default_docker_queue_timeout_secs() -> u64 {
+    30
+}
+
+fn default_docker_pids_limit() -> Option<u64> {
+    Some(128)
 }
 
 fn default_docker_image() -> String {
@@ -16336,6 +16386,11 @@ impl Default for DockerRuntimeConfig {
             read_only_rootfs: true,
             mount_workspace: true,
             allowed_workspace_roots: Vec::new(),
+            max_concurrent: default_docker_max_concurrent(),
+            max_concurrent_per_workspace: default_docker_max_concurrent_per_workspace(),
+            max_queued_per_workspace: default_docker_max_queued_per_workspace(),
+            queue_timeout_secs: default_docker_queue_timeout_secs(),
+            pids_limit: default_docker_pids_limit(),
         }
     }
 }

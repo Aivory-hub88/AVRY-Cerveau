@@ -530,6 +530,27 @@ impl Tool for PythonExecuteTool {
         let workspace_guard = workspace_lock(&host_workspace);
         let _workspace_permit = workspace_guard.lock().await;
 
+        // Queue behind the process-wide sandbox gate (taken after the
+        // same-workspace lock so a waiting call holds no gate slot).
+        let gate = zeroclaw_config::platform::sandbox_gate::global();
+        let _sandbox_permit = match &gate {
+            Some(gate) => match gate.acquire(&host_workspace.to_string_lossy()).await {
+                Ok(permit) => Some(permit),
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(e.to_string()),
+                    });
+                }
+            },
+            None => None,
+        };
+        let pids_limit = gate
+            .as_ref()
+            .and_then(|g| g.limits().pids_limit)
+            .filter(|n| *n > 0);
+
         let mut tempfile_handle = match tempfile::Builder::new()
             .prefix(TEMPFILE_PREFIX)
             .suffix(TEMPFILE_SUFFIX)
@@ -582,7 +603,12 @@ impl Tool for PythonExecuteTool {
             .arg(format!("{}:/workspace:rw", host_workspace.display()))
             .arg("--workdir")
             .arg("/workspace")
-            .arg(self.config.image.trim())
+            .arg("--security-opt")
+            .arg("no-new-privileges");
+        if let Some(pids_limit) = pids_limit {
+            cmd.arg("--pids-limit").arg(pids_limit.to_string());
+        }
+        cmd.arg(self.config.image.trim())
             .arg("python3")
             .arg(format!("/workspace/{tempfile_name}"));
 
