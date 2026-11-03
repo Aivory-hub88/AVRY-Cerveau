@@ -273,8 +273,76 @@ fn decode_container_output(bytes: &[u8]) -> String {
 
 /// Python code execution tool. Spawns a fresh, network-isolated Docker
 /// container per call; never executes on the host directly.
+/// Picks the workspace for the current call. `Ok(None)` means "no override,
+/// use `security.workspace_dir`"; `Err` refuses the call.
+pub type WorkspaceResolver = Arc<dyn Fn() -> Result<Option<PathBuf>, String> + Send + Sync>;
+
+/// Directory for one tenant's persistent `python_execute` workspace:
+/// `<root>/<tenant_id>/python`. `tenant_id` comes from the authenticated
+/// gateway context; it is still validated because the gateway token allows
+/// dots, and `.`/`..` would escape the per-tenant directory.
+pub fn tenant_python_workspace(root: &Path, tenant_id: &str) -> Result<PathBuf, String> {
+    check_workspace_root(root)?;
+    if !is_safe_dir_name(tenant_id) || tenant_id == SPACES_DIR {
+        return Err("Refusing python_execute: tenant id is not a safe directory name".to_string());
+    }
+    Ok(root.join(tenant_id).join("python"))
+}
+
+/// Directory under the root that holds team-room workspaces.
+const SPACES_DIR: &str = "spaces";
+
+/// Shared `python_execute` workspace of one team room:
+/// `<root>/spaces/<space_id>/python`. Every member's agent in that room uses
+/// it; other rooms and the single-user Console never do.
+pub fn space_python_workspace(root: &Path, space_id: &str) -> Result<PathBuf, String> {
+    check_workspace_root(root)?;
+    if !is_safe_dir_name(space_id) {
+        return Err("Refusing python_execute: space id is not a safe directory name".to_string());
+    }
+    Ok(root.join(SPACES_DIR).join(space_id).join("python"))
+}
+
+fn check_workspace_root(root: &Path) -> Result<(), String> {
+    if root.is_absolute() {
+        Ok(())
+    } else {
+        Err("python_execute.tenant_workspace_root must be an absolute path".to_string())
+    }
+}
+
+fn is_safe_dir_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Create `dir` (and parents) if missing; the leaf is owner-only.
+fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
 pub struct PythonExecuteTool {
     security: Arc<SecurityPolicy>,
+    workspace_resolver: Option<WorkspaceResolver>,
     runtime: Arc<dyn RuntimeAdapter>,
     config: PythonExecuteConfig,
     /// Mirrors `runtime.docker.allowed_workspace_roots` from the generic
@@ -294,10 +362,18 @@ impl PythonExecuteTool {
     ) -> Self {
         Self {
             security,
+            workspace_resolver: None,
             runtime,
             config,
             allowed_workspace_roots,
         }
+    }
+
+    /// Resolve the workspace per call (used to give each tenant its own).
+    #[must_use]
+    pub fn with_workspace_resolver(mut self, resolver: WorkspaceResolver) -> Self {
+        self.workspace_resolver = Some(resolver);
+        self
     }
 
     /// True when the injected runtime is actually Docker. `python_execute`
@@ -495,7 +571,29 @@ impl Tool for PythonExecuteTool {
             .map(|secs| secs.min(self.config.timeout_secs))
             .unwrap_or(self.config.timeout_secs);
 
-        let workspace_dir = self.security.workspace_dir.clone();
+        let workspace_dir = match self.workspace_resolver.as_ref().map(|r| r()) {
+            Some(Err(msg)) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(msg),
+                });
+            }
+            Some(Ok(Some(dir))) => {
+                if let Err(e) = ensure_private_dir(&dir) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!(
+                            "Failed to prepare tenant workspace {}: {e}",
+                            dir.display()
+                        )),
+                    });
+                }
+                dir
+            }
+            _ => self.security.workspace_dir.clone(),
+        };
         let host_workspace = match workspace_dir.canonicalize() {
             Ok(p) => p,
             Err(e) => {
@@ -1324,5 +1422,100 @@ mod tests {
             err.contains("Docker sandbox") && err.contains("systemd"),
             "got: {err}"
         );
+    }
+
+    // ── per-tenant workspace ─────────────────────────────────────
+
+    #[test]
+    fn tenant_workspace_is_root_tenant_python() {
+        let dir = tenant_python_workspace(Path::new("/srv/tw"), "t_42_analyst_brain").unwrap();
+        assert_eq!(dir, PathBuf::from("/srv/tw/t_42_analyst_brain/python"));
+    }
+
+    #[test]
+    fn two_tenants_never_share_a_workspace() {
+        let root = Path::new("/srv/tw");
+        let a = tenant_python_workspace(root, "t_1_analyst_brain").unwrap();
+        let b = tenant_python_workspace(root, "t_2_analyst_brain").unwrap();
+        assert_ne!(a, b);
+        assert!(!a.starts_with(&b) && !b.starts_with(&a));
+    }
+
+    #[test]
+    fn tenant_workspace_rejects_unsafe_ids() {
+        let root = Path::new("/srv/tw");
+        for bad in [
+            "",
+            ".",
+            "..",
+            ".hidden",
+            "a/b",
+            "a\\b",
+            "a b",
+            "../x",
+            "é",
+            &"x".repeat(129),
+        ] {
+            assert!(
+                tenant_python_workspace(root, bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn space_workspace_is_shared_per_room_and_separate_from_tenants() {
+        let root = Path::new("/srv/tw");
+        let room = space_python_workspace(root, "room-9").unwrap();
+        assert_eq!(room, PathBuf::from("/srv/tw/spaces/room-9/python"));
+        assert_ne!(room, space_python_workspace(root, "room-10").unwrap());
+        let console = tenant_python_workspace(root, "t_1_x").unwrap();
+        assert!(!console.starts_with(root.join("spaces")));
+    }
+
+    #[test]
+    fn spaces_dir_name_is_reserved_and_space_ids_are_validated() {
+        let root = Path::new("/srv/tw");
+        assert!(tenant_python_workspace(root, "spaces").is_err());
+        for bad in ["", ".", "..", "a/b", "../x", " ", &"x".repeat(129)] {
+            assert!(space_python_workspace(root, bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn tenant_workspace_rejects_relative_root() {
+        assert!(tenant_python_workspace(Path::new("tw"), "t_1_x").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_creates_owner_only_leaf() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tenant_python_workspace(tmp.path(), "t_1_x").unwrap();
+        ensure_private_dir(&dir).unwrap();
+        ensure_private_dir(&dir).unwrap(); // idempotent
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[tokio::test]
+    async fn resolver_error_refuses_the_call() {
+        let tool = make_tool(
+            native_runtime(),
+            PythonExecuteConfig {
+                enabled: true,
+                backend: PythonExecuteBackend::Systemd,
+                ..Default::default()
+            },
+            vec![],
+        )
+        .with_workspace_resolver(Arc::new(|| Err("no tenant root".to_string())));
+        let res = tool
+            .execute(serde_json::json!({"code": "print(1)"}))
+            .await
+            .unwrap();
+        assert!(!res.success);
+        assert_eq!(res.error.as_deref(), Some("no tenant root"));
     }
 }

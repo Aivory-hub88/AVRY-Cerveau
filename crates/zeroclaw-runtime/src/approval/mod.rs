@@ -782,6 +782,7 @@ mod tests {
             connected_toolkits: Vec::new(),
             disabled_toolkits: Vec::new(),
             active_agents: None,
+            space_id: None,
             tenant_custom_mcp_servers: vec![crate::agent::tenant::TenantCustomMcpServer {
                 name: "orders".to_string(),
                 url: "https://tenant.example/mcp".to_string(),

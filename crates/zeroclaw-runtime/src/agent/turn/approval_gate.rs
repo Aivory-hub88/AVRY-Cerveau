@@ -1105,6 +1105,7 @@ mod cerveau_tests {
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: Vec::new(),
             active_agents: None,
+            space_id: None,
         });
         let turn_origin = Arc::new(TurnOriginContext {
             session_id: Some("sess-1".to_string()),

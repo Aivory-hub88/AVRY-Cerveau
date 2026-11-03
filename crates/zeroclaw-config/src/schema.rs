@@ -9977,6 +9977,13 @@ pub struct PythonExecuteConfig {
     /// `/usr/bin/python3`.
     #[serde(default = "default_python_execute_systemd_python")]
     pub systemd_python: String,
+    /// `systemd` backend only: root under which each tenant gets its own
+    /// persistent workspace, `<root>/<tenant_id>/python`, so tenants that
+    /// share one agent alias never share a directory. Must sit inside the
+    /// helper's `ALLOWED_ROOTS`. When unset, a tenant turn is refused rather
+    /// than falling back to the shared agent workspace.
+    #[serde(default)]
+    pub tenant_workspace_root: Option<String>,
 }
 
 fn default_python_execute_image() -> String {
@@ -10018,6 +10025,7 @@ impl Default for PythonExecuteConfig {
             cpu_limit: default_python_execute_cpu_limit(),
             backend: PythonExecuteBackend::default(),
             systemd_helper: default_python_execute_systemd_helper(),
+            tenant_workspace_root: None,
             systemd_python: default_python_execute_systemd_python(),
         }
     }

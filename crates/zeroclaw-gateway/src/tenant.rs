@@ -329,6 +329,7 @@ pub fn build_tenant_context(
         disabled_toolkits,
         tenant_custom_mcp_servers,
         None,
+        None,
     )
 }
 
@@ -342,6 +343,7 @@ pub fn build_tenant_context_with_active(
     disabled_toolkits: Vec<String>,
     tenant_custom_mcp_servers: Vec<zeroclaw_runtime::agent::tenant::TenantCustomMcpServer>,
     active_agents: Option<Vec<String>>,
+    space_id: Option<String>,
 ) -> Arc<TenantContext> {
     Arc::new(TenantContext {
         tenant_id: sel.tenant_id(),
@@ -352,7 +354,33 @@ pub fn build_tenant_context_with_active(
         disabled_toolkits,
         tenant_custom_mcp_servers,
         active_agents,
+        space_id,
     })
+}
+
+/// Parse the bridge's `X-Space-Id` header: the team room a workspace turn
+/// belongs to. Absent or empty means a single-user turn (`Ok(None)`). Unlike
+/// `X-Active-Agents` this is strict: the value names a shared directory, so a
+/// malformed one fails the turn instead of silently falling back to another
+/// scope. Allowed: `[A-Za-z0-9._-]{1,128}`, not starting with `.`.
+pub fn parse_space_id(headers: &HeaderMap) -> Result<Option<String>, ()> {
+    let Some(raw) = headers.get("X-Space-Id") else {
+        return Ok(None);
+    };
+    let raw = raw.to_str().map_err(|_| ())?.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let valid = raw.len() <= 128
+        && !raw.starts_with('.')
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if valid {
+        Ok(Some(raw.to_owned()))
+    } else {
+        Err(())
+    }
 }
 
 /// Max entries honoured from `X-Active-Agents` (there are six product types;
@@ -970,6 +998,28 @@ mod tests {
             assert!(
                 TenantSelector::from_headers(&h).is_err(),
                 "should reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn space_id_header_absent_or_empty_means_single_user() {
+        assert_eq!(parse_space_id(&headers(&[])), Ok(None));
+        assert_eq!(parse_space_id(&headers(&[("x-space-id", "  ")])), Ok(None));
+    }
+
+    #[test]
+    fn space_id_header_accepts_safe_ids_and_rejects_the_rest() {
+        assert_eq!(
+            parse_space_id(&headers(&[("x-space-id", "room-9_a.b")])),
+            Ok(Some("room-9_a.b".to_string()))
+        );
+        let long = "x".repeat(129);
+        for bad in ["..", ".x", "a/b", "a b", "a,b", long.as_str()] {
+            assert_eq!(
+                parse_space_id(&headers(&[("x-space-id", bad)])),
+                Err(()),
+                "{bad:?}"
             );
         }
     }
