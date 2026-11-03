@@ -442,6 +442,7 @@ mod tenant_custom_fallback_tests {
             delivered_at: None,
             verifier_finding: None,
             schedule_id: None,
+            space_id: None,
         }
     }
 
@@ -507,6 +508,7 @@ mod approval_json_tests {
             delivered_at: None,
             verifier_finding: None,
             schedule_id: None,
+            space_id: None,
         }
     }
 

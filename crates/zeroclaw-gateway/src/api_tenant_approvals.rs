@@ -41,7 +41,7 @@ use crate::AppState;
 use crate::api_approvals::{ListQuery, pending_approval_json};
 use crate::tenant::{
     AgentToolScopeResolver, TenantCustomMcpResolver, TenantResolver, TenantSelector,
-    ToolkitConnectionResolver, build_tenant_context,
+    ToolkitConnectionResolver, build_tenant_context_with_active,
 };
 
 type JsonErr = (StatusCode, Json<serde_json::Value>);
@@ -447,12 +447,16 @@ async fn run_continuation(
             anyhow::anyhow!("tool-scope resolution unavailable; retry the approval later")
         })?;
     let tenant_custom_mcp_servers = TenantCustomMcpResolver::global().resolve(&sel).await;
-    let tenant_ctx = build_tenant_context(
+    // `space_id` comes from the row the original turn parked, never from the
+    // resolve request, so a resumed room turn keeps its room's workspace.
+    let tenant_ctx = build_tenant_context_with_active(
         &sel,
         persona.as_deref(),
         connected_toolkits,
         disabled_toolkits,
         tenant_custom_mcp_servers,
+        None,
+        row.space_id.clone(),
     );
 
     let turn_origin = Arc::new(zeroclaw_runtime::agent::tenant::TurnOriginContext {
@@ -759,6 +763,7 @@ mod tests {
             delivered_at: None,
             verifier_finding: None,
             schedule_id: None,
+            space_id: None,
         };
         let result = serde_json::json!({"success": true, "output": "ok"});
         let prompt = continuation_prompt(&row, "approve", Some(&result));
@@ -786,6 +791,7 @@ mod tests {
             delivered_at: None,
             verifier_finding: None,
             schedule_id: None,
+            space_id: None,
         }
     }
 
@@ -840,6 +846,7 @@ mod tests {
             delivered_at: None,
             verifier_finding: None,
             schedule_id: None,
+            space_id: None,
         };
         let prompt = continuation_prompt(&row, "deny", None);
         assert!(prompt.contains("declined to approve"));
@@ -869,6 +876,7 @@ mod tests {
             delivered_at: None,
             verifier_finding: None,
             schedule_id: None,
+            space_id: None,
         };
         let err = tenant_selector_for_resume(&row).unwrap_err();
         assert!(err.to_string().contains("no agent_type"));
@@ -893,6 +901,7 @@ mod tests {
             delivered_at: None,
             verifier_finding: None,
             schedule_id: None,
+            space_id: None,
         };
         let err = tenant_selector_for_resume(&row).unwrap_err();
         assert!(err.to_string().contains("no principal"));
@@ -917,6 +926,7 @@ mod tests {
             delivered_at: None,
             verifier_finding: None,
             schedule_id: None,
+            space_id: None,
         };
         let sel = tenant_selector_for_resume(&row).unwrap();
         assert_eq!(sel.user_id, "u1");

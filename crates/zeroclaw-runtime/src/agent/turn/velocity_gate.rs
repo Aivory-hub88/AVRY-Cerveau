@@ -197,7 +197,11 @@ fn park_as_pending(
         turn_origin.as_ref().map(|o| o.origin_message.as_str()),
         turn_origin.as_ref().and_then(|o| o.schedule_id.as_deref()),
     ) {
-        Ok(id) => id,
+        Ok(id) => {
+            // Remember the team room so a resume keeps its scope.
+            let _ = store.set_space_id(&id, tenant.as_ref().and_then(|t| t.space_id.as_deref()));
+            id
+        }
         Err(e) => {
             ::zeroclaw_log::record!(
                 ERROR,
