@@ -103,6 +103,11 @@ pub struct PendingApproval {
     /// tenant sees "your last run raised a question nobody answered" on the
     /// schedule itself rather than watching a notification quietly vanish.
     pub schedule_id: Option<String>,
+    /// The team room the parked turn belonged to (`TenantContext::space_id`),
+    /// so a resumed continuation rebuilds the same scope and `python_execute`
+    /// keeps using the room's workspace instead of the leader's Console one.
+    /// `None` for Console/Telegram turns and for rows parked before this column.
+    pub space_id: Option<String>,
 }
 
 /// SQLite-backed store for pending-approval records.
@@ -183,6 +188,10 @@ impl PendingApprovalsStore {
                 "schedule_id",
                 "ALTER TABLE pending_approvals ADD COLUMN schedule_id TEXT",
             ),
+            (
+                "space_id",
+                "ALTER TABLE pending_approvals ADD COLUMN space_id TEXT",
+            ),
         ] {
             if let Err(e) = conn.execute(ddl, []) {
                 let msg = e.to_string();
@@ -261,6 +270,21 @@ impl PendingApprovalsStore {
         Ok(id)
     }
 
+    /// Record the team room a parked row belongs to. Separate from
+    /// `insert_with_context` so its many callers keep one signature; the
+    /// approval gates call this right after inserting a room-turn row.
+    pub fn set_space_id(&self, id: &str, space_id: Option<&str>) -> Result<()> {
+        let Some(space_id) = space_id else {
+            return Ok(());
+        };
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE pending_approvals SET space_id = ?2 WHERE id = ?1",
+            params![id, space_id],
+        )?;
+        Ok(())
+    }
+
     /// How many times this exact call (same principal, tool and arguments) has
     /// been *approved* within the last `within`. Used by the approval gate to
     /// stop an approve -> still-not-done -> re-park loop: an approval that
@@ -317,7 +341,7 @@ impl PendingApprovalsStore {
             "SELECT id, principal, tool_name, arguments, risk_tier, requested_at,
                     status, resolved_at, resolved_by,
                     tenant_id, agent_type, session_id, origin_message, delivered_at,
-                    verifier_finding, schedule_id
+                    verifier_finding, schedule_id, space_id
                FROM pending_approvals WHERE id = ?1",
             params![id],
             Self::row_to_pending_approval,
@@ -335,7 +359,7 @@ impl PendingApprovalsStore {
                 "SELECT id, principal, tool_name, arguments, risk_tier, requested_at,
                         status, resolved_at, resolved_by,
                         tenant_id, agent_type, session_id, origin_message, delivered_at,
-                    verifier_finding, schedule_id
+                    verifier_finding, schedule_id, space_id
                    FROM pending_approvals WHERE status = ?1 ORDER BY requested_at DESC",
             )?
         } else {
@@ -343,7 +367,7 @@ impl PendingApprovalsStore {
                 "SELECT id, principal, tool_name, arguments, risk_tier, requested_at,
                         status, resolved_at, resolved_by,
                         tenant_id, agent_type, session_id, origin_message, delivered_at,
-                    verifier_finding, schedule_id
+                    verifier_finding, schedule_id, space_id
                    FROM pending_approvals ORDER BY requested_at DESC",
             )?
         };
@@ -423,6 +447,7 @@ impl PendingApprovalsStore {
             delivered_at: r.get(13)?,
             verifier_finding: r.get(14)?,
             schedule_id: r.get(15)?,
+            space_id: r.get(16)?,
         })
     }
 
@@ -437,7 +462,7 @@ impl PendingApprovalsStore {
             "SELECT id, principal, tool_name, arguments, risk_tier, requested_at,
                     status, resolved_at, resolved_by,
                     tenant_id, agent_type, session_id, origin_message, delivered_at,
-                    verifier_finding, schedule_id
+                    verifier_finding, schedule_id, space_id
                FROM pending_approvals
               WHERE status = 'pending' AND verifier_finding IS NULL
               ORDER BY requested_at ASC",
@@ -497,7 +522,7 @@ impl PendingApprovalsStore {
             "SELECT id, principal, tool_name, arguments, risk_tier, requested_at,
                     status, resolved_at, resolved_by,
                     tenant_id, agent_type, session_id, origin_message, delivered_at,
-                    verifier_finding, schedule_id
+                    verifier_finding, schedule_id, space_id
                FROM pending_approvals
               WHERE status IN ('approved', 'denied')
                 AND delivered_at IS NULL
@@ -819,5 +844,50 @@ mod tests {
             .count_recent_approved("u1", "t__x", "{}", chrono::Duration::minutes(15))
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn space_id_roundtrips_and_is_none_for_console_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PendingApprovalsStore::new(dir.path()).unwrap();
+        let room = store
+            .insert_with_context(
+                "u1",
+                "t",
+                "{}",
+                "irreversible",
+                Some("u1.x"),
+                Some("x"),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let console = store
+            .insert_with_context(
+                "u1",
+                "t",
+                "{}",
+                "irreversible",
+                Some("u1.x"),
+                Some("x"),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        store.set_space_id(&room, Some("room-9")).unwrap();
+        store.set_space_id(&console, None).unwrap();
+        assert_eq!(
+            store.get(&room).unwrap().unwrap().space_id.as_deref(),
+            Some("room-9")
+        );
+        assert_eq!(store.get(&console).unwrap().unwrap().space_id, None);
+        let listed = store.list(Some("pending")).unwrap();
+        assert!(
+            listed
+                .iter()
+                .any(|r| r.space_id.as_deref() == Some("room-9"))
+        );
     }
 }
