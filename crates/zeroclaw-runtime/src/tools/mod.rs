@@ -524,6 +524,42 @@ pub fn default_tools_with_runtime(
     ]
 }
 
+/// On the `systemd` backend every tenant turn gets its own persistent
+/// workspace (`<tenant_workspace_root>/<tenant_id>/python`); tenants share an
+/// agent alias, so the alias workspace must never be reused for them. A tenant
+/// turn with no root configured is refused. Turns with no tenant context
+/// (operator paths) keep the policy workspace.
+fn python_execute_with_tenant_workspace(
+    tool: PythonExecuteTool,
+    cfg: &zeroclaw_config::schema::PythonExecuteConfig,
+) -> PythonExecuteTool {
+    if cfg.backend != zeroclaw_config::schema::PythonExecuteBackend::Systemd {
+        return tool;
+    }
+    let root = cfg
+        .tenant_workspace_root
+        .clone()
+        .map(std::path::PathBuf::from);
+    tool.with_workspace_resolver(Arc::new(move || {
+        let Some(tenant) = crate::agent::tenant::current_tenant() else {
+            return Ok(None);
+        };
+        let Some(root) = root.as_deref() else {
+            return Err(
+                "python_execute: python_execute.tenant_workspace_root is not set, refusing to share one workspace between tenants"
+                    .to_string(),
+            );
+        };
+        // A team-room turn shares one workspace per room; every other tenant
+        // turn (AI Console, single user) gets its own.
+        match tenant.space_id.as_deref() {
+            Some(space) => zeroclaw_tools::python_execute::space_python_workspace(root, space),
+            None => zeroclaw_tools::python_execute::tenant_python_workspace(root, &tenant.tenant_id),
+        }
+        .map(Some)
+    }))
+}
+
 #[cfg(test)]
 pub(crate) fn register_skill_tools(
     tools_registry: &mut Vec<Box<dyn Tool>>,
@@ -2540,11 +2576,14 @@ fn all_tools_with_runtime_on_thread(
         if has_shell_access && python_backend_ready {
             tool_arcs.push(Arc::new(RateLimitedTool::new(
                 PathGuardedTool::new(
-                    PythonExecuteTool::new(
-                        security.clone(),
-                        runtime.clone(),
-                        root_config.python_execute.clone(),
-                        root_config.runtime.docker.allowed_workspace_roots.clone(),
+                    python_execute_with_tenant_workspace(
+                        PythonExecuteTool::new(
+                            security.clone(),
+                            runtime.clone(),
+                            root_config.python_execute.clone(),
+                            root_config.runtime.docker.allowed_workspace_roots.clone(),
+                        ),
+                        &root_config.python_execute,
                     ),
                     security.clone(),
                 ),
@@ -3958,6 +3997,7 @@ mod tests {
                 disabled_toolkits: Vec::new(),
                 tenant_custom_mcp_servers: Vec::new(),
                 active_agents: None,
+                space_id: None,
             })
         });
         let cell = room.then(|| Arc::new(parking_lot::Mutex::new(Vec::new())));

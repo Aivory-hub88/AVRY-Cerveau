@@ -2871,6 +2871,7 @@ mod tests {
                 custom("orders", Some("auth_rejected")),
             ],
             active_agents: None,
+            space_id: None,
         });
 
         // The real tenant server is behind the SSRF-guarded transport, which

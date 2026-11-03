@@ -4520,6 +4520,13 @@ async fn webhook_prelude(
                     let tenant_custom_mcp_servers = tenant::TenantCustomMcpResolver::global()
                         .resolve(&sel)
                         .await;
+                    let space_id = match tenant::parse_space_id(headers) {
+                        Ok(v) => v,
+                        Err(()) => {
+                            let err = serde_json::json!({ "error": "Invalid X-Space-Id" });
+                            return Err((StatusCode::BAD_REQUEST, err));
+                        }
+                    };
                     Some(tenant::build_tenant_context_with_active(
                         &sel,
                         persona.as_deref(),
@@ -4527,6 +4534,7 @@ async fn webhook_prelude(
                         disabled_toolkits,
                         tenant_custom_mcp_servers,
                         tenant::parse_active_agents(headers),
+                        space_id,
                     ))
                 }
                 Err(e) => {

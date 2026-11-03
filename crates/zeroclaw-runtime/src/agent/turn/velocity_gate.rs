@@ -408,6 +408,7 @@ mod tests {
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: Vec::new(),
             active_agents: None,
+            space_id: None,
         })
     }
 

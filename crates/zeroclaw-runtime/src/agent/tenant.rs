@@ -130,6 +130,11 @@ pub struct TenantContext {
     /// When `Some`, product-agent delegate targets outside this set are
     /// unreachable for this tenant (see `DelegateTool`).
     pub active_agents: Option<Vec<String>>,
+    /// Team-room id for a workspace room turn, from the bridge's
+    /// `X-Space-Id` (set only after the backend's membership check). `None`
+    /// for AI Console and every other single-user surface. Keys the shared
+    /// `python_execute` workspace of a room; validated by the gateway.
+    pub space_id: Option<String>,
 }
 
 /// One tenant-registered MCP server, already decrypted and verified —
@@ -763,6 +768,7 @@ mod tests {
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: Vec::new(),
             active_agents: None,
+            space_id: None,
         });
         TENANT_CONTEXT
             .scope(Some(ctx.clone()), async {
@@ -795,6 +801,7 @@ mod tests {
                         disabled_toolkits: Vec::new(),
                         tenant_custom_mcp_servers: Vec::new(),
                         active_agents: None,
+                        space_id: None,
                     })),
                     "resolvable-empty-persona" => Some(Arc::new(TenantContext {
                         tenant_id: format!("{tenant_id}:{agent_type}"),
@@ -805,6 +812,7 @@ mod tests {
                         disabled_toolkits: Vec::new(),
                         tenant_custom_mcp_servers: Vec::new(),
                         active_agents: None,
+                        space_id: None,
                     })),
                     _ => None,
                 }
@@ -871,6 +879,7 @@ mod tests {
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: vec![sample_custom_server()],
             active_agents: None,
+            space_id: None,
         };
         let configs = ctx.custom_mcp_server_configs();
         assert_eq!(configs.len(), 1);
@@ -907,6 +916,7 @@ mod tests {
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: vec![server],
             active_agents: None,
+            space_id: None,
         };
         assert_eq!(
             ctx.custom_mcp_server_configs()[0].transport,
@@ -928,6 +938,7 @@ mod tests {
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: vec![server],
             active_agents: None,
+            space_id: None,
         };
         assert!(ctx.custom_mcp_server_configs()[0].headers.is_empty());
     }
@@ -943,6 +954,7 @@ mod tests {
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: vec![sample_custom_server()],
             active_agents: None,
+            space_id: None,
         };
         assert!(ctx.is_tenant_custom_mcp_tool("tenant_orders__get_order"));
         assert!(!ctx.is_tenant_custom_mcp_tool("tenant_other__get_order"));
@@ -981,6 +993,7 @@ mod tests {
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: vec![aivory_mail],
             active_agents: None,
+            space_id: None,
         };
         // The real thing: exempt from the hard floor.
         assert!(!ctx.is_tenant_custom_mcp_tool("tenant_aivory-mail__send_mail"));
@@ -1007,6 +1020,7 @@ mod tests {
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: vec![lookalike],
             active_agents: None,
+            space_id: None,
         };
         assert!(ctx.is_tenant_custom_mcp_tool("tenant_aivory-mail__send_mail"));
     }
@@ -1032,6 +1046,7 @@ mod tests {
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: vec![server],
             active_agents: None,
+            space_id: None,
         };
 
         let ctx = ctx_with(odoo("https://odoo-mcp.aivory.uk/mcp?token=abc"));
@@ -1188,6 +1203,7 @@ mod tests {
             disabled_toolkits: Vec::new(),
             tenant_custom_mcp_servers: servers,
             active_agents: None,
+            space_id: None,
         }
     }
 
