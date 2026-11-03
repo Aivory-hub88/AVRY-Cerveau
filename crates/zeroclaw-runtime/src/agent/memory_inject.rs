@@ -439,12 +439,32 @@ pub async fn render_memory_context(
         cfg.limit
     };
 
+    // Acknowledgement/filler ("oke hold dulu") has nothing to retrieve; skip
+    // the recall (an embedding round trip, ~1-1.6 s measured) but keep the
+    // single MemoryRecall event and leave a trace note for latency analysis.
+    let skip_recall = zeroclaw_memory::is_low_information_query(user_msg);
+    if skip_recall {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "agent_alias": turn.agent_alias,
+                    "turn_id": turn.turn_id,
+                    "query_summary": query_summary,
+                })),
+            "memory_inject skipped (low-information query)"
+        );
+    }
+
     let start = Instant::now();
     let mut entries: Vec<MemoryEntry> = Vec::new();
     let mut seen_keys: HashSet<String> = HashSet::new();
-    let mut any_ok = false;
+    let mut any_ok = skip_recall;
     // A turn with no session scopes still recalls once, unscoped.
-    let scopes: &[Option<&str>] = if sessions.is_empty() {
+    let scopes: &[Option<&str>] = if skip_recall {
+        &[]
+    } else if sessions.is_empty() {
         &[None]
     } else {
         sessions
@@ -1069,6 +1089,43 @@ mod tests {
             1,
             "exactly one recall event per turn — the #8619 contract"
         );
+    }
+
+    #[tokio::test]
+    async fn filler_message_skips_recall_but_real_query_recalls() {
+        let meta = || TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "t",
+            channel_name: "test",
+        };
+        let mem = FixtureMemory::with(vec![]);
+        let observer = RecordingObserver::default();
+        let context = render_memory_context(
+            &mem,
+            &observer,
+            "oke hold dulu",
+            &[],
+            &MemoryInjectConfig::default(),
+            false,
+            meta(),
+        )
+        .await;
+        assert!(context.is_empty());
+        assert_eq!(mem.recalls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(observer.recalls.lock().as_slice(), &[(0, true)]);
+
+        let _ = render_memory_context(
+            &mem,
+            &observer,
+            "status invoice Ahmad?",
+            &[],
+            &MemoryInjectConfig::default(),
+            false,
+            meta(),
+        )
+        .await;
+        assert_eq!(mem.recalls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1798,7 +1855,7 @@ mod tests {
         render_memory_context(
             &mem,
             &RecordingObserver::default(),
-            "q",
+            "query",
             &[],
             &cfg,
             false,
@@ -1823,7 +1880,7 @@ mod tests {
         render_memory_context(
             &mem,
             &RecordingObserver::default(),
-            "q",
+            "query",
             &[],
             &cfg,
             false,

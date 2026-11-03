@@ -377,6 +377,33 @@ pub fn should_skip_autosave_content(content: &str) -> bool {
         || lowered.contains("distilled_index_sig:")
 }
 
+/// Words that carry no retrievable intent on their own: acknowledgements,
+/// hold/continue/cancel fillers and thanks, Indonesian and English.
+const LOW_INFORMATION_TOKENS: &[&str] = &[
+    "ok", "oke", "okay", "okey", "ya", "yes", "yup", "yep", "no", "nggak", "ngga", "gak", "tidak",
+    "hold", "tunggu", "dulu", "thanks", "thx", "thank", "you", "makasih", "terima", "kasih",
+    "siap", "sip", "lanjut", "stop", "batal", "nanti", "lagi", "mantap", "noted", "got", "it",
+];
+
+/// True when `msg` is acknowledgement/filler only, so a memory recall (an
+/// embedding round trip on hybrid/vector backends) cannot surface anything
+/// useful. Conservative on purpose: every token must be in
+/// [`LOW_INFORMATION_TOKENS`] (case-insensitive), or the whole message is 1-2
+/// characters. Short real queries ("status invoice Ahmad?") never match, and
+/// length alone is never the criterion.
+pub fn is_low_information_query(msg: &str) -> bool {
+    let trimmed = msg.trim();
+    if trimmed.chars().count() <= 2 {
+        return true;
+    }
+    let mut tokens = trimmed
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .peekable();
+    tokens.peek().is_some()
+        && tokens.all(|t| LOW_INFORMATION_TOKENS.contains(&t.to_lowercase().as_str()))
+}
+
 fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
     value
         .get(..prefix.len())
@@ -2097,6 +2124,30 @@ mod tests {
         assert!(is_user_autosave_key("USER_MSG_abcd"));
         assert!(!is_user_autosave_key("user_message"));
         assert!(!is_user_autosave_key("assistant_resp_1234"));
+    }
+
+    #[test]
+    fn low_information_query_matches_only_filler() {
+        for msg in [
+            "oke hold dulu",
+            "ya",
+            "thanks",
+            "siap lanjut",
+            "Got it!",
+            "OK, makasih.",
+            "k",
+            "  ",
+        ] {
+            assert!(is_low_information_query(msg), "{msg:?} should be filler");
+        }
+        for msg in [
+            "status invoice Ahmad?",
+            "hold the order for Budi",
+            "ok, tolong cek stok",
+            "lanjut ke invoice 42",
+        ] {
+            assert!(!is_low_information_query(msg), "{msg:?} should recall");
+        }
     }
 
     #[test]
