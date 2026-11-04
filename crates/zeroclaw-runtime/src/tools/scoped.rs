@@ -846,10 +846,23 @@ impl ScopedToolRegistry {
                 // (see `mcp_client::connection_pool`). Tests connect fresh:
                 // their mock servers reuse names and ports with different
                 // tool lists, which a process-wide pool would mix up.
+                let mcp_connect_started = std::time::Instant::now();
                 #[cfg(not(test))]
                 let connected = tools::McpRegistry::connect_all_pooled(&agent_mcp_servers).await;
                 #[cfg(test)]
                 let connected = tools::McpRegistry::connect_all(&agent_mcp_servers).await;
+                if emit_assembly_logs {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                            .with_category(::zeroclaw_log::EventCategory::Tool),
+                        &format!(
+                            "MCP assembly stage: connect_ms={} servers={}",
+                            mcp_connect_started.elapsed().as_millis(),
+                            agent_mcp_servers.len()
+                        )
+                    );
+                }
                 match connected {
                     Ok(registry) => Some(Arc::new(registry)),
                     Err(err) => {

@@ -1105,27 +1105,51 @@ impl McpRegistry {
         let mut server_index = HashMap::new();
         let mut failures = Vec::new();
 
+        let batch_start = Instant::now();
         let connected = futures_util::future::join_all(configs.iter().map(|config| async move {
-            let connected =
+            let started = Instant::now();
+            // `hit` reused a live pooled connection, `miss` connected fresh and
+            // pooled it, `bypass` is never pooled (stdio, or pooling disabled).
+            let (connected, pool) =
                 match pool_ttl.and_then(|ttl| Some((ttl, connection_pool::key(config)?))) {
                     Some((ttl, key)) => match connection_pool::take(&key, ttl) {
-                        Some(server) => Ok(server),
-                        None => McpServer::connect(config.clone()).await.inspect(|server| {
-                            connection_pool::put(key, server.clone());
-                        }),
+                        Some(server) => (Ok(server), "hit"),
+                        None => (
+                            McpServer::connect(config.clone()).await.inspect(|server| {
+                                connection_pool::put(key, server.clone());
+                            }),
+                            "miss",
+                        ),
                     },
-                    None => McpServer::connect(config.clone()).await,
+                    None => (McpServer::connect(config.clone()).await, "bypass"),
                 };
-            (config, connected)
+            let connect_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            (config, connected, pool, connect_ms)
         }))
         .await;
-        for (config, connected) in connected {
+        let batch_ms = u64::try_from(batch_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let (mut hits, mut misses, mut bypasses) = (0u32, 0u32, 0u32);
+        for (config, connected, pool, connect_ms) in connected {
+            match pool {
+                "hit" => hits += 1,
+                "miss" => misses += 1,
+                _ => bypasses += 1,
+            }
             match connected {
                 Ok(server) => {
                     let server_idx = servers.len();
                     server_index.insert(config.name.clone(), server_idx);
                     // Collect tools while holding the lock once, then release
                     let tools = server.tools().await;
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        &format!(
+                            "MCP connect timing: server `{}` pool={pool} connect_ms={connect_ms} tools_count={}",
+                            config.name,
+                            tools.len()
+                        )
+                    );
                     for tool in &tools {
                         // Prefix prevents name collisions across servers
                         let prefixed =
@@ -1148,6 +1172,18 @@ impl McpRegistry {
                     });
                 }
             }
+        }
+
+        if !configs.is_empty() {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!(
+                    "MCP connect batch: servers={} pool_hit={hits} pool_miss={misses} pool_bypass={bypasses} failed={} batch_ms={batch_ms}",
+                    configs.len(),
+                    failures.len()
+                )
+            );
         }
 
         Ok(Self {
