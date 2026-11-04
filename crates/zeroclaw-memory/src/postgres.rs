@@ -24,6 +24,14 @@ const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
 /// it, and adding the knob can wait until one does.
 const POSTGRES_POOL_MAX_SIZE: u32 = 8;
 
+/// Session-level advisory lock key held while a store runs its schema setup.
+/// Several agents constructing their store at once (parallel room turns) each
+/// ran the same `ALTER TABLE` / `CREATE INDEX` batch; those take
+/// `AccessExclusiveLock` in different orders and Postgres aborted one of them
+/// with "deadlock detected", failing that agent's turn. Serialising the setup
+/// removes the cycle; later callers find everything already in place.
+const POSTGRES_SCHEMA_INIT_LOCK_KEY: i64 = 0x5a43_4d45_4d49_4e54; // "ZCMEMINT"
+
 struct DropOnThread<T: Send + 'static>(Option<T>);
 
 impl<T: Send + 'static> DropOnThread<T> {
@@ -229,35 +237,51 @@ impl PostgresMemory {
                         .get()
                         .context("failed to check out PostgreSQL connection for schema init")?;
 
-                    Self::init_schema(&mut client, &schema_ident, &qualified_table)?;
-                    zeroclaw_config::schema::v2::migrate_postgres_memory_to_v3(
-                        &mut client,
-                        &schema_ident,
-                        &qualified_table,
-                        &schema,
-                        &table,
-                    )?;
-                    // The synchronous postgres client uses block_on internally,
-                    // so pgvector setup must also stay on this plain OS thread —
-                    // calling it from a Tokio runtime thread panics.
-                    // (Cerveau: schema/table/dimensions threading is the
-                    // race-hardening from the pgvector-enable fix — the
-                    // information_schema verification inside needs them.)
-                    let pgvector_ok = match pgvector {
-                        Some(dimensions) => Self::try_enable_pgvector(
+                    client
+                        .execute(
+                            "SELECT pg_advisory_lock($1)",
+                            &[&POSTGRES_SCHEMA_INIT_LOCK_KEY],
+                        )
+                        .context("failed to take schema init advisory lock")?;
+                    let setup = (|| -> Result<bool> {
+                        Self::init_schema(&mut client, &schema_ident, &qualified_table)?;
+                        zeroclaw_config::schema::v2::migrate_postgres_memory_to_v3(
                             &mut client,
+                            &schema_ident,
                             &qualified_table,
                             &schema,
                             &table,
-                            dimensions,
-                        )
-                        .is_ok(),
-                        // Not requested => no `embedding` column. `pgvector_ready` means
-                        // the column exists (store/recall pick their SQL from it), so this
-                        // must be false; upstream's `true` broke every store on a
-                        // deployment that never enabled pgvector.
-                        None => false,
-                    };
+                        )?;
+                        // The synchronous postgres client uses block_on internally,
+                        // so pgvector setup must also stay on this plain OS thread —
+                        // calling it from a Tokio runtime thread panics.
+                        // (Cerveau: schema/table/dimensions threading is the
+                        // race-hardening from the pgvector-enable fix — the
+                        // information_schema verification inside needs them.)
+                        let pgvector_ok = match pgvector {
+                            Some(dimensions) => Self::try_enable_pgvector(
+                                &mut client,
+                                &qualified_table,
+                                &schema,
+                                &table,
+                                dimensions,
+                            )
+                            .is_ok(),
+                            // Not requested => no `embedding` column. `pgvector_ready` means
+                            // the column exists (store/recall pick their SQL from it), so this
+                            // must be false; upstream's `true` broke every store on a
+                            // deployment that never enabled pgvector.
+                            None => false,
+                        };
+                        Ok(pgvector_ok)
+                    })();
+                    // Always release, even when setup failed; the lock is
+                    // session-scoped so a dropped connection frees it as well.
+                    let _ = client.execute(
+                        "SELECT pg_advisory_unlock($1)",
+                        &[&POSTGRES_SCHEMA_INIT_LOCK_KEY],
+                    );
+                    let pgvector_ok = setup?;
 
                     // Return the connection to the pool instead of holding
                     // it — the caller gets the pool, not this connection.
