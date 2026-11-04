@@ -385,6 +385,20 @@ const LOW_INFORMATION_TOKENS: &[&str] = &[
     "siap", "sip", "lanjut", "stop", "batal", "nanti", "lagi", "mantap", "noted", "got", "it",
 ];
 
+/// The user's own text inside a Team Space turn payload. Room turns reach the
+/// agent as room brief + thread history + `<instruction>…</instruction>`, so
+/// the whole payload is never filler; the trailing instruction block is what
+/// the person actually said. Any other message is returned unchanged.
+fn instruction_body(msg: &str) -> &str {
+    const OPEN: &str = "<instruction>";
+    const CLOSE: &str = "</instruction>";
+    let trimmed = msg.trim_end();
+    trimmed
+        .strip_suffix(CLOSE)
+        .and_then(|head| head.rfind(OPEN).map(|at| &head[at + OPEN.len()..]))
+        .unwrap_or(msg)
+}
+
 /// True when `msg` is acknowledgement/filler only, so a memory recall (an
 /// embedding round trip on hybrid/vector backends) cannot surface anything
 /// useful. Conservative on purpose: every token must be in
@@ -392,7 +406,7 @@ const LOW_INFORMATION_TOKENS: &[&str] = &[
 /// characters. Short real queries ("status invoice Ahmad?") never match, and
 /// length alone is never the criterion.
 pub fn is_low_information_query(msg: &str) -> bool {
-    let trimmed = msg.trim();
+    let trimmed = instruction_body(msg).trim();
     if trimmed.chars().count() <= 2 {
         return true;
     }
@@ -2148,6 +2162,19 @@ mod tests {
         ] {
             assert!(!is_low_information_query(msg), "{msg:?} should recall");
         }
+    }
+
+    #[test]
+    fn low_information_query_looks_inside_room_payload() {
+        let room = |instruction: &str| {
+            format!(
+                "<thread_history>\nBudi: status invoice Ahmad?\n</thread_history>\n\
+                 <team_rules>\nTeammates in this space: Lex.\n</team_rules>\n\
+                 <instruction>\n{instruction}\n</instruction>"
+            )
+        };
+        assert!(is_low_information_query(&room("oke hold dulu")));
+        assert!(!is_low_information_query(&room("cek stok gudang")));
     }
 
     #[test]
