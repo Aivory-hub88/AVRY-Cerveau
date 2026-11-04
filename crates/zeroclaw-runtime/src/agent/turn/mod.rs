@@ -1781,12 +1781,17 @@ async fn run_tool_call_loop_impl<'a>(
             // recall (bounded by `[cognee].recall_timeout_ms`, fails open), so
             // it adds at most the slower of the two, never their sum. Only for
             // tenant turns, and only when the operator opted in.
+            // Filler ("oke hold dulu") has nothing to retrieve from the graph
+            // either; `render_memory_context` already skips its own recall.
+            let low_information = zeroclaw_memory::is_low_information_query(&turn_memory.query);
             let graph_recall = async {
                 match (
                     config.map(|c| &c.cognee),
                     crate::agent::tenant::current_tenant(),
                 ) {
-                    (Some(cognee), Some(tenant)) if cognee.enabled && cognee.auto_recall => {
+                    (Some(cognee), Some(tenant))
+                        if cognee.enabled && cognee.auto_recall && !low_information =>
+                    {
                         zeroclaw_tools::graph_memory::recall_context(
                             cognee,
                             &tenant.platform_user_id,
