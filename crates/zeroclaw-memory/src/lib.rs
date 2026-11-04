@@ -385,17 +385,23 @@ const LOW_INFORMATION_TOKENS: &[&str] = &[
     "siap", "sip", "lanjut", "stop", "batal", "nanti", "lagi", "mantap", "noted", "got", "it",
 ];
 
-/// The user's own text inside a Team Space turn payload. Room turns reach the
-/// agent as room brief + thread history + `<instruction>…</instruction>`, so
-/// the whole payload is never filler; the trailing instruction block is what
-/// the person actually said. Any other message is returned unchanged.
+/// The user's own text inside a room turn payload. Team Space turns reach the
+/// agent as room brief + thread history + `<instruction>…</instruction>`, and
+/// Console group turns as room context + history + `<user_message>…</user_message>`,
+/// so the whole payload is never filler; the trailing block is what the person
+/// actually said. Any other message is returned unchanged.
 fn instruction_body(msg: &str) -> &str {
-    const OPEN: &str = "<instruction>";
-    const CLOSE: &str = "</instruction>";
+    const WRAPPERS: &[(&str, &str)] = &[
+        ("<instruction>", "</instruction>"),
+        ("<user_message>", "</user_message>"),
+    ];
     let trimmed = msg.trim_end();
-    trimmed
-        .strip_suffix(CLOSE)
-        .and_then(|head| head.rfind(OPEN).map(|at| &head[at + OPEN.len()..]))
+    WRAPPERS
+        .iter()
+        .find_map(|(open, close)| {
+            let head = trimmed.strip_suffix(close)?;
+            head.rfind(open).map(|at| &head[at + open.len()..])
+        })
         .unwrap_or(msg)
 }
 
@@ -2175,6 +2181,16 @@ mod tests {
         };
         assert!(is_low_information_query(&room("oke hold dulu")));
         assert!(!is_low_information_query(&room("cek stok gudang")));
+
+        let console = |text: &str| {
+            format!(
+                "<room_context>\nYou are in the room.\n</room_context>\n\
+                 <room_history>\nBudi: status invoice Ahmad?\n</room_history>\n\
+                 <user_message>\n{text}\n</user_message>"
+            )
+        };
+        assert!(is_low_information_query(&console("oke hold dulu")));
+        assert!(!is_low_information_query(&console("cek stok gudang")));
     }
 
     #[test]
