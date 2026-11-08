@@ -3532,6 +3532,24 @@ impl Agent {
         // Keep the runtime orientation at the end of the complete prompt so
         // truncation cannot retain an earlier copy and append a second one.
         append_timestamp_orientation(&mut prompt);
+        // Measurement only: assembled size vs the cap (a prompt over the cap
+        // is truncated from the tail, which drops skills and MCP sections).
+        let assembled_chars = prompt.chars().count();
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "stage": "system_prompt_final",
+                    "assembled_chars": assembled_chars,
+                    "deferred_mcp_chars": deferred_section.chars().count(),
+                    "pinned_chars": pinned_section.chars().count(),
+                    "mcp_unavailable_chars": self.mcp_unavailable_section.chars().count(),
+                    "max_chars": max_chars,
+                    "truncated": max_chars > 0 && assembled_chars > max_chars,
+                })
+            ),
+            "cerveau: system prompt final size"
+        );
         // Match the channel/CLI prompt path: cap the fully assembled prompt,
         // including dispatcher instructions, receipts, and MCP sections.
         Ok(crate::agent::system_prompt::finalize_system_prompt(
