@@ -32,6 +32,101 @@ use serde_json::json;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::CogneeConfig;
 
+// ── Latency telemetry (ADR-023 phase 0) ─────────────────────────────────
+//
+// One structured log event per sidecar call so p50/p90/max and the fail-open
+// rate can be read from the journal. Logs a short hash of the tenant id (never
+// the id itself, never fact or query text).
+
+/// Short, stable, non-reversible tag for a tenant id.
+fn tenant_tag(tenant_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(tenant_id.as_bytes());
+    digest[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Bucket an error message into a stable outcome label.
+fn classify_error(message: &str) -> &'static str {
+    if message.contains("failing fast") {
+        "breaker_open"
+    } else if message.contains("failed (") {
+        "http_error"
+    } else if message.contains("timed out") || message.contains("timeout") {
+        "timeout"
+    } else {
+        "error"
+    }
+}
+
+fn record_stage(
+    stage: &'static str,
+    tenant_id: &str,
+    agent_type: &str,
+    started: std::time::Instant,
+    outcome: &'static str,
+) {
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let event_outcome = if outcome == "ok" || outcome == "empty" {
+        ::zeroclaw_log::EventOutcome::Success
+    } else {
+        ::zeroclaw_log::EventOutcome::Failure
+    };
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(event_outcome)
+            .with_attrs(::serde_json::json!({
+                "stage": stage,
+                "tenant_tag": tenant_tag(tenant_id),
+                "agent_type": agent_type,
+                "elapsed_ms": elapsed_ms,
+                "outcome": outcome,
+            })),
+        "cerveau: graph sidecar call"
+    );
+}
+
+/// Time a `Result<()>` call and record it.
+async fn timed_unit<F>(
+    stage: &'static str,
+    tenant_id: &str,
+    agent_type: &str,
+    fut: F,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let started = std::time::Instant::now();
+    let result = fut.await;
+    let outcome = match &result {
+        Ok(()) => "ok",
+        Err(e) => classify_error(&e.to_string()),
+    };
+    record_stage(stage, tenant_id, agent_type, started, outcome);
+    result
+}
+
+/// Time a tool call and record it.
+async fn timed_tool<F>(
+    stage: &'static str,
+    tenant_id: &str,
+    agent_type: &str,
+    fut: F,
+) -> anyhow::Result<ToolResult>
+where
+    F: std::future::Future<Output = anyhow::Result<ToolResult>>,
+{
+    let started = std::time::Instant::now();
+    let result = fut.await;
+    let outcome = match &result {
+        Ok(r) if r.success => "ok",
+        Ok(r) => classify_error(r.error.as_deref().unwrap_or("")),
+        Err(e) => classify_error(&e.to_string()),
+    };
+    record_stage(stage, tenant_id, agent_type, started, outcome);
+    result
+}
+
 const DATASET_NAME: &str = "cerveau_graph";
 
 // ── Fail fast when the sidecar is down ──────────────────────────────────
@@ -224,6 +319,21 @@ pub async fn add_fact(
     agent_type: &str,
     text: &str,
 ) -> anyhow::Result<()> {
+    timed_unit(
+        "add",
+        tenant_id,
+        agent_type,
+        add_fact_untimed(cfg, tenant_id, agent_type, text),
+    )
+    .await
+}
+
+async fn add_fact_untimed(
+    cfg: &CogneeConfig,
+    tenant_id: &str,
+    agent_type: &str,
+    text: &str,
+) -> anyhow::Result<()> {
     let client = client();
     let base = cfg.base_url.trim_end_matches('/');
     if let Some(remaining) = breaker_open(base) {
@@ -264,6 +374,20 @@ pub async fn add_fact(
 /// far. An LLM pipeline on the sidecar (measured ~40 s), so callers that
 /// ingest many facts should batch it -- see `agent::graph_sync`.
 pub async fn cognify(cfg: &CogneeConfig, tenant_id: &str, agent_type: &str) -> anyhow::Result<()> {
+    timed_unit(
+        "cognify",
+        tenant_id,
+        agent_type,
+        cognify_untimed(cfg, tenant_id, agent_type),
+    )
+    .await
+}
+
+async fn cognify_untimed(
+    cfg: &CogneeConfig,
+    tenant_id: &str,
+    agent_type: &str,
+) -> anyhow::Result<()> {
     let client = client();
     let base = cfg.base_url.trim_end_matches('/');
     if let Some(remaining) = breaker_open(base) {
@@ -359,12 +483,32 @@ pub async fn recall_context(
     agent_type: &str,
     query: &str,
 ) -> Option<String> {
-    let query = query.trim();
-    if query.is_empty() {
+    if query.trim().is_empty() {
         return None;
     }
+    let started = std::time::Instant::now();
+    let outcome = std::cell::Cell::new("error");
+    let context = recall_context_inner(cfg, tenant_id, agent_type, query.trim(), &outcome).await;
+    record_stage(
+        "recall_context",
+        tenant_id,
+        agent_type,
+        started,
+        outcome.get(),
+    );
+    context
+}
+
+async fn recall_context_inner(
+    cfg: &CogneeConfig,
+    tenant_id: &str,
+    agent_type: &str,
+    query: &str,
+    outcome: &std::cell::Cell<&'static str>,
+) -> Option<String> {
     let base = cfg.base_url.trim_end_matches('/');
     if breaker_open(base).is_some() {
+        outcome.set("breaker_open");
         return None;
     }
     let request = apply_tenant_headers(
@@ -388,21 +532,30 @@ pub async fn recall_context(
         request,
     )
     .await
-    .ok()?
     {
-        Ok(response) => {
+        Err(_) => {
+            outcome.set("timeout");
+            return None;
+        }
+        Ok(Ok(response)) => {
             reset_breaker(base);
             response
         }
-        Err(_) => {
+        Ok(Err(_)) => {
             trip_breaker(base);
+            outcome.set("error");
             return None;
         }
     };
     if !response.status().is_success() {
+        // Includes "dataset not found" for a tenant with no graph yet.
+        outcome.set("http_error");
         return None;
     }
-    let body: serde_json::Value = response.json().await.ok()?;
+    let Ok(body) = response.json::<serde_json::Value>().await else {
+        outcome.set("error");
+        return None;
+    };
 
     let cap = cfg.recall_max_chars;
     let mut context = String::new();
@@ -421,7 +574,13 @@ pub async fn recall_context(
             break;
         }
     }
-    (!context.is_empty()).then_some(context)
+    if context.is_empty() {
+        outcome.set("empty");
+        None
+    } else {
+        outcome.set("ok");
+        Some(context)
+    }
 }
 
 /// Query the tenant's knowledge graph. Use for relationship questions
@@ -475,112 +634,116 @@ impl Tool for GraphRecallTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let (tenant_id, agent_type) = (self.tenant_id.as_str(), self.agent_type.as_str());
 
-        let query = args
-            .get("query")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        if query.is_empty() {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some("'query' must be non-empty".to_string()),
-            });
-        }
-
-        let client = client();
-        let base = self.cfg.base_url.trim_end_matches('/');
-        if let Some(remaining) = breaker_open(base) {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(breaker_error(base, remaining)),
-            });
-        }
-
-        let req = apply_tenant_headers(
-            client.post(format!("{base}/api/v1/search")),
-            &self.cfg,
-            tenant_id,
-            agent_type,
-        )
-        .json(&json!({"query": query, "datasets": [DATASET_NAME]}))
-        .timeout(SEARCH_TIMEOUT);
-
-        let resp = match req.send().await {
-            Ok(r) => {
-                reset_breaker(base);
-                r
-            }
-            Err(e) => {
-                trip_breaker(base);
+        timed_tool("search", tenant_id, agent_type, async {
+            let query = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if query.is_empty() {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(format!("graph memory unavailable: {e}")),
+                    error: Some("'query' must be non-empty".to_string()),
                 });
             }
-        };
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body: serde_json::Value = resp.json().await.unwrap_or_default();
-            // "dataset not found" is the expected shape of "nothing stored yet" --
-            // graph_remember creates the dataset lazily, so a fresh tenant with no
-            // facts stored gets this, not a real error.
-            let detail = body.get("detail").and_then(|v| v.as_str()).unwrap_or("");
-            if status == reqwest::StatusCode::NOT_FOUND || detail.contains("dataset not found") {
+            let client = client();
+            let base = self.cfg.base_url.trim_end_matches('/');
+            if let Some(remaining) = breaker_open(base) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(breaker_error(base, remaining)),
+                });
+            }
+
+            let req = apply_tenant_headers(
+                client.post(format!("{base}/api/v1/search")),
+                &self.cfg,
+                tenant_id,
+                agent_type,
+            )
+            .json(&json!({"query": query, "datasets": [DATASET_NAME]}))
+            .timeout(SEARCH_TIMEOUT);
+
+            let resp = match req.send().await {
+                Ok(r) => {
+                    reset_breaker(base);
+                    r
+                }
+                Err(e) => {
+                    trip_breaker(base);
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("graph memory unavailable: {e}")),
+                    });
+                }
+            };
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                // "dataset not found" is the expected shape of "nothing stored yet" --
+                // graph_remember creates the dataset lazily, so a fresh tenant with no
+                // facts stored gets this, not a real error.
+                let detail = body.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+                if status == reqwest::StatusCode::NOT_FOUND || detail.contains("dataset not found")
+                {
+                    return Ok(ToolResult {
+                        success: true,
+                        output: ToolOutput::text(
+                            "No graph memory stored yet for this tenant -- nothing to recall.",
+                        ),
+                        error: None,
+                    });
+                }
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("graph_recall failed ({status}): {body}")),
+                });
+            }
+
+            let results: Vec<serde_json::Value> = match resp.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("graph_recall: could not parse response: {e}")),
+                    });
+                }
+            };
+
+            if results.is_empty() {
                 return Ok(ToolResult {
                     success: true,
-                    output: ToolOutput::text(
-                        "No graph memory stored yet for this tenant -- nothing to recall.",
-                    ),
+                    output: ToolOutput::text("No relevant graph facts found."),
                     error: None,
                 });
             }
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!("graph_recall failed ({status}): {body}")),
-            });
-        }
 
-        let results: Vec<serde_json::Value> = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!("graph_recall: could not parse response: {e}")),
-                });
+            let mut text = String::new();
+            for (i, r) in results.iter().enumerate() {
+                let result = r
+                    .get("searchResult")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if i > 0 {
+                    text.push_str("\n\n");
+                }
+                text.push_str(result);
             }
-        };
 
-        if results.is_empty() {
-            return Ok(ToolResult {
+            Ok(ToolResult {
                 success: true,
-                output: ToolOutput::text("No relevant graph facts found."),
+                output: ToolOutput::text(text),
                 error: None,
-            });
-        }
-
-        let mut text = String::new();
-        for (i, r) in results.iter().enumerate() {
-            let result = r
-                .get("searchResult")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            if i > 0 {
-                text.push_str("\n\n");
-            }
-            text.push_str(result);
-        }
-
-        Ok(ToolResult {
-            success: true,
-            output: ToolOutput::text(text),
-            error: None,
+            })
         })
+        .await
     }
 }
 
@@ -589,6 +752,47 @@ mod tests {
     use super::*;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn tenant_tag_is_stable_short_and_does_not_leak_the_id() {
+        let tag = tenant_tag("user_d0985ab099ef142a");
+        assert_eq!(tag, tenant_tag("user_d0985ab099ef142a"));
+        assert_ne!(tag, tenant_tag("user_other"));
+        assert_eq!(tag.len(), 8);
+        assert!(!tag.contains("d0985"));
+    }
+
+    #[test]
+    fn classify_error_buckets_the_known_failure_shapes() {
+        assert_eq!(
+            classify_error(
+                "graph memory unavailable: sidecar at x did not respond; failing fast for another 3s"
+            ),
+            "breaker_open"
+        );
+        assert_eq!(
+            classify_error("graph_remember: add failed (500 Internal Server Error): boom"),
+            "http_error"
+        );
+        assert_eq!(classify_error("operation timed out"), "timeout");
+        assert_eq!(classify_error("connection refused"), "error");
+    }
+
+    #[tokio::test]
+    async fn recall_context_reports_http_error_outcome_without_changing_the_result() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/search"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let cfg = cfg_for(&server);
+        // Fail-open contract is unchanged by the telemetry wrapper.
+        assert_eq!(
+            recall_context(&cfg, "user1", "leads_qualifier", "who is X").await,
+            None
+        );
+    }
 
     fn cfg_for(server: &MockServer) -> CogneeConfig {
         CogneeConfig {
