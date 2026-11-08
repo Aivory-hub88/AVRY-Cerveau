@@ -13751,6 +13751,18 @@ pub struct MemoryConfig {
     /// live turn it is prepended to.
     #[serde(default = "default_true")]
     pub recall_date_stamp: bool,
+    /// ADR-024 B: how many entries of the `pinned` category are injected on
+    /// every turn, regardless of the recall query or the session id. `0`
+    /// (default) disables the pinned tier entirely. Not the same as the
+    /// `core` category, which `memory_store` uses by default for ordinary
+    /// agent writes; `pinned` is written only by a reviewed path.
+    #[serde(default)]
+    pub pinned_max_entries: usize,
+    /// Character budget for the pinned block (charged to the same total
+    /// budget as recalled entries). Only consulted when
+    /// `pinned_max_entries > 0`.
+    #[serde(default = "default_pinned_max_chars")]
+    pub pinned_max_chars: usize,
 
     // ── Namespace Isolation ─────────────────────────────────────
     /// Default namespace for memory entries.
@@ -13947,6 +13959,9 @@ fn default_recency_weight() -> f64 {
 }
 fn default_fts_early_return_score() -> f64 {
     0.85
+}
+fn default_pinned_max_chars() -> usize {
+    1_500
 }
 
 fn validate_memory_rerank_config(memory: &MemoryConfig) -> Result<()> {
@@ -14272,6 +14287,8 @@ impl Default for MemoryConfig {
             recency_weight: default_recency_weight(),
             fts_early_return_score: default_fts_early_return_score(),
             recall_date_stamp: true,
+            pinned_max_entries: 0,
+            pinned_max_chars: default_pinned_max_chars(),
             default_namespace: default_namespace(),
             conflict_threshold: default_conflict_threshold(),
             conflict_supersede_enabled: default_conflict_supersede_enabled(),

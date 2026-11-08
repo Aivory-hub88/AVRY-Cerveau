@@ -1248,6 +1248,115 @@ pub async fn handle_api_memory_list(
     }
 }
 
+/// Query of [`handle_api_memory_injection`].
+#[derive(Debug, serde::Deserialize)]
+pub struct MemoryInjectionQuery {
+    /// The user message to simulate. Empty means "no query": only the
+    /// pinned tier can appear.
+    #[serde(default)]
+    pub q: Option<String>,
+    /// Host agent alias, as for `/api/memory`.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Session id to scope the recall to, to reproduce a session-scoped turn.
+    #[serde(default)]
+    pub session: Option<String>,
+}
+
+/// `GET /api/memory-injection`: the memory block a turn with this query
+/// would inject (ADR-024 A). Uses the turn's own renderer
+/// (`render_memory_context_report`), so the answer cannot drift from what
+/// the model receives. Read-only: it stores nothing, and its recall event
+/// goes to a no-op observer.
+pub async fn handle_api_memory_injection(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<MemoryInjectionQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let tenant = match tenant_from_headers_or_400(&headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
+    let mem = match resolve_memory_handle_scoped(&state, params.agent.as_deref(), tenant.as_ref())
+        .await
+    {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+
+    let config = state.config.read().clone();
+    let limit = match params
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(alias) => config.effective_memory_recall_limit(alias),
+        None => zeroclaw_runtime::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+    };
+    let cfg = zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+        &config.memory,
+        limit,
+    );
+    let session = params.session.as_deref().filter(|s| !s.is_empty());
+    let sessions: Vec<Option<&str>> = match session {
+        Some(s) => vec![Some(s)],
+        None => vec![],
+    };
+    let observer = zeroclaw_runtime::observability::NoopObserver;
+    let report = zeroclaw_runtime::agent::memory_inject::render_memory_context_report(
+        mem.as_ref(),
+        &observer,
+        params.q.as_deref().unwrap_or(""),
+        &sessions,
+        &cfg,
+        false,
+        zeroclaw_runtime::agent::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: params.agent.as_deref(),
+            turn_id: "memory-injection-inspector",
+            channel_name: "inspector",
+        },
+    )
+    .await;
+
+    use zeroclaw_runtime::agent::memory_inject::InjectedSource;
+    let items: Vec<serde_json::Value> = report
+        .items
+        .iter()
+        .map(|i| {
+            serde_json::json!({
+                "key": i.key,
+                "source": match i.source {
+                    InjectedSource::Pinned => "pinned",
+                    InjectedSource::Recalled => "recalled",
+                },
+                "score": i.score,
+                "chars": i.chars,
+                "est_tokens": i.est_tokens,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "text": report.text,
+        "items": items,
+        "pool": report.pool,
+        "total_chars": report.items.iter().map(|i| i.chars).sum::<usize>(),
+        "total_est_tokens": report.items.iter().map(|i| i.est_tokens).sum::<usize>(),
+        "config": {
+            "pinned_max_entries": cfg.pinned_max_entries,
+            "pinned_max_chars": cfg.pinned_max_chars,
+            "max_entries": cfg.max_entries,
+            "max_total_chars": cfg.max_total_chars,
+            "min_relevance_score": cfg.min_relevance_score,
+        },
+    }))
+    .into_response()
+}
+
 pub(crate) fn sanitize_memory_entries_for_api(entries: Vec<MemoryEntry>) -> Vec<MemoryEntry> {
     entries
         .into_iter()

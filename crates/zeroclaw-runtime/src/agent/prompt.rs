@@ -235,14 +235,31 @@ impl SystemPromptBuilder {
         always_ask: &[String],
     ) -> Result<String> {
         let mut output = String::new();
+        let mut sizes = serde_json::Map::new();
         for section in &self.sections {
             let part = section.build_with_approval_policy(ctx, always_ask)?;
             if part.trim().is_empty() {
                 continue;
             }
+            sizes.insert(
+                section.name().to_string(),
+                serde_json::Value::from(part.chars().count()),
+            );
             output.push_str(part.trim_end());
             output.push_str("\n\n");
         }
+        // Measurement only: where the system prompt's characters come from.
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "stage": "system_prompt_sections",
+                    "sections": sizes,
+                    "total_chars": output.chars().count(),
+                })
+            ),
+            "cerveau: system prompt section sizes"
+        );
         Ok(output)
     }
 }
