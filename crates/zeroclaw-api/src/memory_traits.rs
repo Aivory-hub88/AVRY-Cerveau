@@ -181,6 +181,20 @@ pub enum MemoryCategory {
     Custom(String),
 }
 
+impl MemoryCategory {
+    /// Name of the always-injected tier (ADR-024 B). Reserved: it is written
+    /// only by a reviewed path (operator/dashboard or an approved curator
+    /// proposal), never by the model's own tools, otherwise anything the
+    /// model read could make itself permanent in every later prompt.
+    pub const PINNED: &'static str = "pinned";
+
+    /// Whether a category name is reserved against agent-tool writes.
+    #[must_use]
+    pub fn is_reserved_name(name: &str) -> bool {
+        name.trim().eq_ignore_ascii_case(Self::PINNED)
+    }
+}
+
 impl serde::Serialize for MemoryCategory {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.to_string())
