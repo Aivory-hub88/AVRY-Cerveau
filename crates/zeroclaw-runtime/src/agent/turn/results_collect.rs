@@ -28,7 +28,7 @@ use zeroclaw_tool_call_parser::ParsedToolCall;
 /// could otherwise be mistaken for a real instruction. `collect_tool_results`
 /// wraps output from these tools in an explicit `<untrusted_tool_result>`
 /// delimiter; everything else is left byte-for-byte unchanged.
-fn is_untrusted_source_tool(tool_name: &str) -> bool {
+pub(crate) fn is_untrusted_source_tool(tool_name: &str) -> bool {
     let name = tool_name.trim();
     // MCP tools are registered as "<server>__<tool>" (see
     // `zeroclaw_tools::mcp_client`/`mcp_tool::McpToolWrapper`) — any tool

@@ -13,6 +13,7 @@ pub(crate) mod judge_shadow;
 pub(crate) mod knobs;
 pub(crate) mod max_iter;
 pub(crate) mod media_degrade;
+pub(crate) mod memory_taint_gate;
 pub(crate) mod outcome;
 pub(crate) mod parse_response;
 pub(crate) mod post_exec;
@@ -1884,6 +1885,8 @@ async fn run_tool_call_loop_impl<'a>(
     // calls.
     let mut last_guard_suppressed_text: Option<String> = None;
     let mut prompt_approval_tool_signatures: HashSet<(String, String)> = HashSet::new();
+    // ADR-024: removes this turn's taint mark on every exit path.
+    let _taint_guard = memory_taint_gate::TurnTaintGuard::new(turn_id);
 
     // Shared-ref context for the turn step functions. Every `&mut` the loop
     // owns stays a loop local passed as an explicit argument (RUN_SHEET
@@ -3567,7 +3570,12 @@ async fn run_tool_call_loop_impl<'a>(
             turn_id,
             mcp_content_safety.as_ref(),
         ) {
-            Ok(collected) => collected,
+            Ok(collected) => {
+                // ADR-024: from here on the model has seen this round's
+                // untrusted content; gate its memory writes accordingly.
+                memory_taint_gate::mark_if_untrusted(turn_id, &tool_calls);
+                collected
+            }
             // The detector stopped the turn: wrap up gracefully with a
             // tools-free summary instead of failing into a 500. Any other
             // collection error still bails.
