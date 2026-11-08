@@ -487,15 +487,8 @@ pub async fn recall_context(
         return None;
     }
     let started = std::time::Instant::now();
-    let outcome = std::cell::Cell::new("error");
-    let context = recall_context_inner(cfg, tenant_id, agent_type, query.trim(), &outcome).await;
-    record_stage(
-        "recall_context",
-        tenant_id,
-        agent_type,
-        started,
-        outcome.get(),
-    );
+    let (context, outcome) = recall_context_inner(cfg, tenant_id, agent_type, query.trim()).await;
+    record_stage("recall_context", tenant_id, agent_type, started, outcome);
     context
 }
 
@@ -504,12 +497,10 @@ async fn recall_context_inner(
     tenant_id: &str,
     agent_type: &str,
     query: &str,
-    outcome: &std::cell::Cell<&'static str>,
-) -> Option<String> {
+) -> (Option<String>, &'static str) {
     let base = cfg.base_url.trim_end_matches('/');
     if breaker_open(base).is_some() {
-        outcome.set("breaker_open");
-        return None;
+        return (None, "breaker_open");
     }
     let request = apply_tenant_headers(
         client().post(format!("{base}/api/v1/search")),
@@ -534,8 +525,7 @@ async fn recall_context_inner(
     .await
     {
         Err(_) => {
-            outcome.set("timeout");
-            return None;
+            return (None, "timeout");
         }
         Ok(Ok(response)) => {
             reset_breaker(base);
@@ -543,18 +533,15 @@ async fn recall_context_inner(
         }
         Ok(Err(_)) => {
             trip_breaker(base);
-            outcome.set("error");
-            return None;
+            return (None, "error");
         }
     };
     if !response.status().is_success() {
         // Includes "dataset not found" for a tenant with no graph yet.
-        outcome.set("http_error");
-        return None;
+        return (None, "http_error");
     }
     let Ok(body) = response.json::<serde_json::Value>().await else {
-        outcome.set("error");
-        return None;
+        return (None, "error");
     };
 
     let cap = cfg.recall_max_chars;
@@ -575,11 +562,9 @@ async fn recall_context_inner(
         }
     }
     if context.is_empty() {
-        outcome.set("empty");
-        None
+        (None, "empty")
     } else {
-        outcome.set("ok");
-        Some(context)
+        (Some(context), "ok")
     }
 }
 
