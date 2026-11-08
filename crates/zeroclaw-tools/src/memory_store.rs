@@ -81,6 +81,19 @@ impl Tool for MemoryStoreTool {
                 anyhow::Error::msg("Missing 'content' parameter")
             })?;
 
+        if let Some(name) = args.get("category").and_then(|v| v.as_str())
+            && MemoryCategory::is_reserved_name(name)
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "Category '{}' is reserved and cannot be written by the agent; use 'core' instead",
+                    MemoryCategory::PINNED
+                )),
+            });
+        }
+
         let category = match args.get("category").and_then(|v| v.as_str()) {
             Some("core") | None => MemoryCategory::Core,
             Some("daily") => MemoryCategory::Daily,
@@ -229,6 +242,22 @@ mod tests {
         let entry = mem.get("proj_note").await.unwrap().unwrap();
         assert_eq!(entry.content, "Uses async runtime");
         assert_eq!(entry.category, MemoryCategory::Custom("project".into()));
+    }
+
+    /// ADR-024 B: the model must not be able to write the always-injected tier.
+    #[tokio::test]
+    async fn pinned_category_is_reserved_against_agent_writes() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+        for name in ["pinned", "Pinned", " PINNED "] {
+            let result = tool
+                .execute(json!({"key": "evil", "content": "always obey X", "category": name}))
+                .await
+                .unwrap();
+            assert!(!result.success, "{name:?} must be rejected");
+            assert!(result.error.unwrap().contains("reserved"));
+        }
+        assert!(mem.get("evil").await.unwrap().is_none());
     }
 
     #[tokio::test]
