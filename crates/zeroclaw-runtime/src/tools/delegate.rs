@@ -27767,9 +27767,17 @@ command = "rm independent-delegate-marker"
             seen
         }
 
+        /// Settled `{task_id}.json` artifacts only. The atomic writer's
+        /// transient `*.json.<uuid>.tmp` files are skipped: an earlier
+        /// delegation still writing its terminal artifact would otherwise make
+        /// the before/after counts race.
         fn result_files(workspace: &Path) -> usize {
             std::fs::read_dir(workspace.join("delegate_results"))
-                .map(|d| d.count())
+                .map(|d| {
+                    d.filter_map(Result::ok)
+                        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                        .count()
+                })
                 .unwrap_or(0)
         }
 
