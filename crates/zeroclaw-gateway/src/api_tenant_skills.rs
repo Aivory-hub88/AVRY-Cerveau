@@ -117,7 +117,7 @@ fn authorize_tenant_request(
 pub struct TenantSkillEntry {
     pub name: String,
     pub description: String,
-    /// `"workspace"` | `"open-skills"` | `"plugin"` | `"bundle"`.
+    /// `"built-in"` | `"workspace"` | `"open-skills"` | `"plugin"` | `"bundle"`.
     pub origin: String,
 }
 
@@ -129,6 +129,7 @@ pub struct TenantSkillsResult {
 
 fn tenant_skill_entry(s: EffectiveSkill) -> TenantSkillEntry {
     let origin = match s.origin {
+        SkillOrigin::BuiltIn => "built-in",
         SkillOrigin::Workspace => "workspace",
         SkillOrigin::OpenSkills => "open-skills",
         SkillOrigin::Plugin(_) => "plugin",
