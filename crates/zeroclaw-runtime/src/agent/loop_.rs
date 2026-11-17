@@ -321,6 +321,22 @@ pub use super::history::{
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
+/// Host rules against repeating context, appended to every agent's system prompt.
+/// Customers saw the same closing pitch ("business operations, diagnostics… our team is
+/// ready to help") on every WhatsApp reply; the model copies its own earlier turns.
+const CONVERSATION_DISCIPLINE: &str = "\
+## Conversation discipline (applies to every reply, on every channel)
+- Say each thing once per conversation. Before you answer, look at your earlier replies in this \
+conversation: do not repeat any sentence, greeting, offer, capability list, sign-off or \"how can \
+we help\" line you already used, and do not re-explain context the other person already has.
+- Answer only the latest message. Short, casual or off-topic messages (thanks, sorry, a joke, \
+a test) get a short, natural reply of one sentence or less, with no pitch and no list of services.
+- Do not end replies with a stock closing line or a standing offer of help. End when the answer ends. \
+Only add a next step when there is a concrete new one.
+- Do not greet or introduce yourself again after the first reply. Do not restate the user's question.
+- If you have nothing new to add, say less rather than rephrase what you already said.
+";
+
 fn interactive_context_recovery_budget(
     context_limits: zeroclaw_config::schema::ResolvedContextLimits,
 ) -> usize {
@@ -4347,6 +4363,12 @@ async fn process_message_inner(
             system_prompt.push('\n');
             system_prompt.push_str(&deferred_section);
         }
+
+        // Cerveau: host-level conversation discipline, every agent and every
+        // channel (this loop serves them all). Placed before the persona so
+        // operator data cannot weaken it.
+        system_prompt.push('\n');
+        system_prompt.push_str(CONVERSATION_DISCIPLINE);
 
         // Cerveau: append the tenant's persona as pre-framed inert operator
         // data. The block is rendered and fenced by the gateway (untrusted
