@@ -87,8 +87,14 @@ async fn check(schema: &str, pgvector: bool) {
 
     let tenant = mem.ensure_agent_uuid("t_tenant").await.expect("uuid");
     let other = mem.ensure_agent_uuid("t_other").await.expect("uuid");
-    let rows: [(&str, MemoryCategory, Option<&str>, &str); 6] = [
+    let rows: [(&str, MemoryCategory, Option<&str>, &str); 7] = [
         ("k_core_global", MemoryCategory::Core, None, &tenant),
+        (
+            "k_document_global",
+            MemoryCategory::Custom("document".to_string()),
+            None,
+            &tenant,
+        ),
         ("k_daily_global", MemoryCategory::Daily, None, &tenant),
         (
             "k_same_session",
@@ -129,7 +135,12 @@ async fn check(schema: &str, pgvector: bool) {
         k.sort();
         k
     };
-    let want = vec!["k_core_global", "k_daily_global", "k_same_session"];
+    let want = vec![
+        "k_core_global",
+        "k_daily_global",
+        "k_document_global",
+        "k_same_session",
+    ];
 
     let scoped = mem
         .recall_for_agents(&[&tenant], "invoice", 50, Some("chat-1"), None, None)
