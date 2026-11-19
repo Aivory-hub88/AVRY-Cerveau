@@ -75,7 +75,11 @@ jobs:
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install cargo-nextest
         shell: bash
-        run: curl -LsSf "https://get.nexte.st/latest/${{ matrix.nextest-platform }}" | tar zxf - -C "$HOME/.cargo/bin"
+        # The macos-15 runner has no ~/.cargo/bin, so `tar -C` failed and the
+        # whole job went red before any test ran. Create it first.
+        run: |
+          mkdir -p "$HOME/.cargo/bin"
+          curl -LsSf "https://get.nexte.st/latest/${{ matrix.nextest-platform }}" | tar zxf - -C "$HOME/.cargo/bin"
       - name: Run tests
         shell: bash
         run: cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fail-fast
