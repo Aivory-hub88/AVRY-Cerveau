@@ -644,8 +644,15 @@ fn recall_time_filter(since: bool, until: bool, first_placeholder: usize) -> Str
 /// row with no session binding. Same rule as SQLite's
 /// `DURABLE_GLOBAL_CATEGORIES`; without it, a recall scoped to a chat session
 /// never returns long-term memories, which are stored session-less.
+///
+/// `document` is included for the same reason: operator-uploaded knowledge
+/// (`cerveau_memory.ingest_document` in avry-backend) is written session-less,
+/// so without it a document uploaded in the dashboard is invisible to any turn
+/// carrying a session id, i.e. every Telegram/console turn. `conversation`
+/// stays out on purpose: those are per-chat transcripts and must not cross
+/// channels.
 const DURABLE_GLOBAL_SESSION_ROWS: &str =
-    "(m.session_id IS NULL AND m.category IN ('core', 'daily'))";
+    "(m.session_id IS NULL AND m.category IN ('core', 'daily', 'document'))";
 
 #[async_trait]
 impl Memory for PostgresMemory {
