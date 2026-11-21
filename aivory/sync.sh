@@ -27,7 +27,7 @@ REMOTE_DIR="/home/ubuntu/.zeroclaw-cerveau"
 LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Scoped to product agents only — internal *_brain workspaces are managed
 # by Cerveau's own sync-aivory-identity.sh on the VPS, not here.
-PRODUCT_AGENTS="autonomous customer_service leads_qualifier finance_invoice_ops office_assistant chief_of_staff"
+PRODUCT_AGENTS="autonomous customer_service leads_qualifier finance_invoice_ops office_assistant chief_of_staff data_analyst operations_inventory marketing_content default"
 # Remote files are ubuntu-owned. Operators with direct write access leave
 # CERVEAU_SUDO unset (legacy behavior). Operators with passwordless sudo
 # instead (e.g. irfan via aivory-prod) export CERVEAU_SUDO="sudo -n".
