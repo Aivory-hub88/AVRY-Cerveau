@@ -1,0 +1,100 @@
+--- a/config.toml	2026-11-21 13:46:40
++++ b/config.toml	2026-11-21 13:47:17
+@@ -1822,14 +1822,29 @@
+ tools = ["tenant_odoo__odoo_read_group", "tenant_odoo__odoo_search", "tenant_odoo__odoo_search_read", "tenant_odoo__odoo_read", "tenant_odoo__odoo_count", "tenant_odoo__odoo_list_models", "tenant_odoo__odoo_get_model_metadata", "tenant_odoo__odoo_check_access", "tenant_odoo__odoo_generate_report", "tenant_odoo__odoo_list_instances"]
+ keywords = []
+ 
++[[runtime_profiles.agent_autonomous.tool_filter_groups]]
++mode = "preload"
++tools = ["composio-googlecalendar-scheduling__GOOGLECALENDAR_EVENTS_LIST", "aivory-native-finance-invoice-ops__list_invoices", "aivory-native-leads-qualifier__list_leads", "aivory-native-customer-service__list_tickets"]
++keywords = []
++
+ [[runtime_profiles.agent_leads_qualifier.tool_filter_groups]]
+ mode = "preload"
+ tools = ["tenant_odoo__odoo_read_group", "tenant_odoo__odoo_search", "tenant_odoo__odoo_search_read", "tenant_odoo__odoo_read", "tenant_odoo__odoo_count", "tenant_odoo__odoo_list_models", "tenant_odoo__odoo_get_model_metadata", "tenant_odoo__odoo_check_access", "tenant_odoo__odoo_generate_report", "tenant_odoo__odoo_list_instances"]
+ keywords = []
+ 
++[[runtime_profiles.agent_leads_qualifier.tool_filter_groups]]
++mode = "preload"
++tools = ["aivory-native-leads-qualifier__pipeline_summary", "aivory-native-leads-qualifier__list_leads", "aivory-native-leads-qualifier__get_lead"]
++keywords = []
++
+ [[runtime_profiles.agent_customer_service.tool_filter_groups]]
+ mode = "preload"
+ tools = ["tenant_odoo__odoo_read_group", "tenant_odoo__odoo_search", "tenant_odoo__odoo_search_read", "tenant_odoo__odoo_read", "tenant_odoo__odoo_count", "tenant_odoo__odoo_list_models", "tenant_odoo__odoo_get_model_metadata", "tenant_odoo__odoo_check_access", "tenant_odoo__odoo_generate_report", "tenant_odoo__odoo_list_instances"]
++keywords = []
++
++[[runtime_profiles.agent_customer_service.tool_filter_groups]]
++mode = "preload"
++tools = ["aivory-native-customer-service__list_tickets", "aivory-native-customer-service__get_ticket"]
+ keywords = []
+ 
+ [[runtime_profiles.agent_finance_invoice_ops.tool_filter_groups]]
+@@ -1837,16 +1852,31 @@
+ tools = ["tenant_odoo__odoo_read_group", "tenant_odoo__odoo_search", "tenant_odoo__odoo_search_read", "tenant_odoo__odoo_read", "tenant_odoo__odoo_count", "tenant_odoo__odoo_list_models", "tenant_odoo__odoo_get_model_metadata", "tenant_odoo__odoo_check_access", "tenant_odoo__odoo_generate_report", "tenant_odoo__odoo_list_instances"]
+ keywords = []
+ 
++[[runtime_profiles.agent_finance_invoice_ops.tool_filter_groups]]
++mode = "preload"
++tools = ["aivory-native-finance-invoice-ops__list_invoices", "aivory-native-finance-invoice-ops__get_invoice"]
++keywords = []
++
+ [[runtime_profiles.agent_office_assistant.tool_filter_groups]]
+ mode = "preload"
+ tools = ["tenant_odoo__odoo_read_group", "tenant_odoo__odoo_search", "tenant_odoo__odoo_search_read", "tenant_odoo__odoo_read", "tenant_odoo__odoo_count", "tenant_odoo__odoo_list_models", "tenant_odoo__odoo_get_model_metadata", "tenant_odoo__odoo_check_access", "tenant_odoo__odoo_generate_report", "tenant_odoo__odoo_list_instances"]
+ keywords = []
+ 
++[[runtime_profiles.agent_office_assistant.tool_filter_groups]]
++mode = "preload"
++tools = ["composio-googlecalendar-scheduling__GOOGLECALENDAR_GET_CURRENT_DATE_TIME", "composio-googlecalendar-scheduling__GOOGLECALENDAR_EVENTS_LIST", "composio-googlecalendar-scheduling__GOOGLECALENDAR_FIND_FREE_SLOTS"]
++keywords = []
++
+ [[runtime_profiles.agent_chief_of_staff.tool_filter_groups]]
+ mode = "preload"
+ tools = ["tenant_odoo__odoo_read_group", "tenant_odoo__odoo_search", "tenant_odoo__odoo_search_read", "tenant_odoo__odoo_read", "tenant_odoo__odoo_count", "tenant_odoo__odoo_list_models", "tenant_odoo__odoo_get_model_metadata", "tenant_odoo__odoo_check_access", "tenant_odoo__odoo_generate_report", "tenant_odoo__odoo_list_instances"]
+ keywords = []
+ 
++[[runtime_profiles.agent_chief_of_staff.tool_filter_groups]]
++mode = "preload"
++tools = ["composio-googlecalendar-scheduling__GOOGLECALENDAR_GET_CURRENT_DATE_TIME", "composio-googlecalendar-scheduling__GOOGLECALENDAR_EVENTS_LIST", "composio-googlecalendar-scheduling__GOOGLECALENDAR_FIND_FREE_SLOTS", "aivory-native-data-analyst__kpi_snapshot", "aivory-native-data-analyst__sales_funnel_forecast"]
++keywords = []
++
+ [python_execute]
+ tenant_workspace_root = "/home/ubuntu/.zeroclaw-cerveau/tenant-workspaces"
+ enabled = true
+@@ -1924,6 +1954,11 @@
+ tools = ["tenant_odoo__odoo_read_group", "tenant_odoo__odoo_search", "tenant_odoo__odoo_search_read", "tenant_odoo__odoo_read", "tenant_odoo__odoo_count", "tenant_odoo__odoo_list_models", "tenant_odoo__odoo_get_model_metadata", "tenant_odoo__odoo_check_access", "tenant_odoo__odoo_generate_report", "tenant_odoo__odoo_list_instances"]
+ keywords = []
+ 
++[[runtime_profiles.agent_data_analyst.tool_filter_groups]]
++mode = "preload"
++tools = ["aivory-native-data-analyst__kpi_snapshot", "aivory-native-data-analyst__sales_funnel_forecast", "composio-googlesheets-data__GOOGLESHEETS_BATCH_GET"]
++keywords = []
++
+ [[agents.chief_of_staff.delegates]]
+ agent = "data_analyst"
+ mode = "independent"
+@@ -1986,6 +2021,11 @@
+ tools = ["tenant_odoo__odoo_read_group", "tenant_odoo__odoo_search", "tenant_odoo__odoo_search_read", "tenant_odoo__odoo_read", "tenant_odoo__odoo_count", "tenant_odoo__odoo_list_models", "tenant_odoo__odoo_get_model_metadata", "tenant_odoo__odoo_check_access", "tenant_odoo__odoo_generate_report", "tenant_odoo__odoo_list_instances"]
+ keywords = []
+ 
++[[runtime_profiles.agent_operations_inventory.tool_filter_groups]]
++mode = "preload"
++tools = ["aivory-native-operations-inventory__reorder_suggestion"]
++keywords = []
++
+ [[agents.chief_of_staff.delegates]]
+ agent = "operations_inventory"
+ mode = "independent"
+@@ -2047,6 +2087,11 @@
+ tools = ["tenant_odoo__odoo_read_group", "tenant_odoo__odoo_search", "tenant_odoo__odoo_search_read", "tenant_odoo__odoo_read", "tenant_odoo__odoo_count", "tenant_odoo__odoo_list_models", "tenant_odoo__odoo_get_model_metadata", "tenant_odoo__odoo_check_access", "tenant_odoo__odoo_generate_report", "tenant_odoo__odoo_list_instances"]
+ keywords = []
+ 
++[[runtime_profiles.agent_marketing_content.tool_filter_groups]]
++mode = "preload"
++tools = ["aivory-native-marketing-content__campaign_links", "composio-googledocs-docs__GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN", "composio-googlesheets-data__GOOGLESHEETS_CREATE_GOOGLE_SHEET1", "composio-gmail-mail__GMAIL_CREATE_EMAIL_DRAFT"]
++keywords = []
++
+ [[agents.chief_of_staff.delegates]]
+ agent = "marketing_content"
+ mode = "independent"
