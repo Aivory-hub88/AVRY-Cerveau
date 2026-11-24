@@ -4793,6 +4793,7 @@ mod tests {
                 tenant_custom_mcp_servers: Vec::new(),
                 active_agents: None,
                 space_id: None,
+                provider_key: None,
             })
         });
         let cell = room.then(|| Arc::new(parking_lot::Mutex::new(Vec::new())));
@@ -4867,6 +4868,7 @@ mod tests {
             tenant_custom_mcp_servers: Vec::new(),
             active_agents: None,
             space_id: None,
+            provider_key: None,
         }));
         let room = Some(Arc::new(parking_lot::Mutex::new(Vec::new())));
         let built = crate::agent::tenant::TENANT_CONTEXT.sync_scope(tenant_ctx, || {

@@ -4737,6 +4737,7 @@ async fn webhook_prelude(
                         tenant_custom_mcp_servers,
                         tenant::parse_active_agents(headers),
                         space_id,
+                        tenant::parse_provider_key(headers),
                     ))
                 }
                 Err(e) => {

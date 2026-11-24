@@ -413,6 +413,7 @@ mod tests {
             tenant_custom_mcp_servers: Vec::new(),
             active_agents: None,
             space_id: None,
+            provider_key: None,
         })
     }
 
