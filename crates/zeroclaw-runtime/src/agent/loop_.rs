@@ -3857,6 +3857,11 @@ async fn process_message_inner(
         );
         config = admission.config();
     }
+    // Cerveau: tenant BYOK. Applied after the admission snapshot replaces
+    // `config` (applying it earlier would be overwritten), on a per-turn copy.
+    if let Some(key) = crate::agent::tenant::current_tenant().and_then(|t| t.provider_key.clone()) {
+        config = Arc::new(config.with_openrouter_api_key(key.expose()));
+    }
     let capabilities = capabilities.unwrap_or_else(|| RuntimeCapabilities::config_backed(&config));
     let execution_capability = execution_admission
         .as_ref()
@@ -8510,6 +8515,7 @@ mod tests {
                 tenant_custom_mcp_servers: Vec::new(),
                 active_agents: None,
                 space_id: None,
+                provider_key: None,
             }))
         };
         let cognee = |auto_recall: bool, base_url: String| zeroclaw_config::schema::CogneeConfig {

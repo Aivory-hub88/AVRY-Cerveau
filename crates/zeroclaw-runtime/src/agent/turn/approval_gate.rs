@@ -1111,6 +1111,7 @@ mod cerveau_tests {
             tenant_custom_mcp_servers: Vec::new(),
             active_agents: None,
             space_id: None,
+            provider_key: None,
         });
         let turn_origin = Arc::new(TurnOriginContext {
             session_id: Some("sess-1".to_string()),

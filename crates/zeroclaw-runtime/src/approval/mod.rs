@@ -793,6 +793,7 @@ mod tests {
                 disabled_tools: Vec::new(),
                 unavailable_reason: None,
             }],
+            provider_key: None,
         })
     }
 

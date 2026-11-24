@@ -385,6 +385,7 @@ pub(super) fn delegate_tenant_overlay(
             tenant_custom_mcp_servers: parent.tenant_custom_mcp_servers.clone(),
             active_agents: parent.active_agents.clone(),
             space_id: parent.space_id.clone(),
+            provider_key: parent.provider_key.clone(),
         })
     } else {
         parent
@@ -27075,6 +27076,7 @@ command = "rm independent-delegate-marker"
             tenant_custom_mcp_servers: Vec::new(),
             active_agents: None,
             space_id: None,
+            provider_key: None,
         }))
     }
 
@@ -27565,6 +27567,7 @@ command = "rm independent-delegate-marker"
             tenant_custom_mcp_servers: Vec::new(),
             active_agents: active,
             space_id: None,
+            provider_key: None,
         }))
     }
 

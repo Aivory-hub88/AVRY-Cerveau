@@ -330,6 +330,7 @@ pub fn build_tenant_context(
         tenant_custom_mcp_servers,
         None,
         None,
+        None,
     )
 }
 
@@ -344,6 +345,7 @@ pub fn build_tenant_context_with_active(
     tenant_custom_mcp_servers: Vec<zeroclaw_runtime::agent::tenant::TenantCustomMcpServer>,
     active_agents: Option<Vec<String>>,
     space_id: Option<String>,
+    provider_key: Option<zeroclaw_runtime::agent::tenant::TenantProviderKey>,
 ) -> Arc<TenantContext> {
     Arc::new(TenantContext {
         tenant_id: sel.tenant_id(),
@@ -355,6 +357,7 @@ pub fn build_tenant_context_with_active(
         tenant_custom_mcp_servers,
         active_agents,
         space_id,
+        provider_key,
     })
 }
 
@@ -380,6 +383,27 @@ pub fn parse_space_id(headers: &HeaderMap) -> Result<Option<String>, ()> {
         Ok(Some(raw.to_owned()))
     } else {
         Err(())
+    }
+}
+
+/// Parse the bridge's `X-Provider-Key`: the tenant's own OpenRouter key (BYOK).
+///
+/// Lenient like `X-Active-Agents`: a missing, empty or malformed value yields
+/// `None` (the turn runs on Aivory's key, exactly as before) rather than
+/// rejecting it. Only a plausible OpenRouter key is accepted — `sk-or-` prefix,
+/// printable ASCII with no whitespace, 20..=512 bytes — so a stray header can
+/// never swap in an arbitrary credential string.
+pub fn parse_provider_key(
+    headers: &HeaderMap,
+) -> Option<zeroclaw_runtime::agent::tenant::TenantProviderKey> {
+    let raw = headers.get("X-Provider-Key")?.to_str().ok()?.trim();
+    let plausible = (20..=512).contains(&raw.len())
+        && raw.starts_with("sk-or-")
+        && raw.bytes().all(|b| b.is_ascii_graphic());
+    if plausible {
+        zeroclaw_runtime::agent::tenant::TenantProviderKey::new(raw)
+    } else {
+        None
     }
 }
 
@@ -1000,6 +1024,57 @@ mod tests {
                 "should reject {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn provider_key_header_accepts_only_a_plausible_openrouter_key() {
+        let key = "sk-or-v1-0123456789abcdef0123456789abcdef";
+        let got = parse_provider_key(&headers(&[("x-provider-key", key)])).expect("valid");
+        assert_eq!(got.expose(), key);
+        // Surrounding whitespace is trimmed, not rejected.
+        assert!(
+            parse_provider_key(&headers(&[(
+                "x-provider-key",
+                " sk-or-v1-0123456789abcdef0123 "
+            )]))
+            .is_some()
+        );
+
+        for bad in [
+            "sk-or-short",
+            "sk-ant-api03-0123456789abcdef0123456789",
+            "sk-or-v1-0123456789 abcdef0123456789",
+            "OPENROUTER-0123456789abcdef0123456789",
+        ] {
+            assert!(
+                parse_provider_key(&headers(&[("x-provider-key", bad)])).is_none(),
+                "{bad:?} must be ignored"
+            );
+        }
+        assert!(parse_provider_key(&headers(&[("x-provider-key", " ")])).is_none());
+        assert!(parse_provider_key(&headers(&[])).is_none());
+    }
+
+    #[test]
+    fn provider_key_never_appears_in_debug_output() {
+        let key = "sk-or-v1-supersecretsupersecret0123";
+        let parsed = parse_provider_key(&headers(&[("x-provider-key", key)]));
+        let sel = TenantSelector {
+            user_id: "u1".into(),
+            agent_type: "autonomous".into(),
+        };
+        let ctx = build_tenant_context_with_active(
+            &sel,
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            parsed,
+        );
+        assert!(ctx.provider_key.is_some());
+        assert!(!format!("{ctx:?}").contains("supersecret"));
     }
 
     #[test]

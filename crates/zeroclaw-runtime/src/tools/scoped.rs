@@ -3895,6 +3895,7 @@ mod tests {
             ],
             active_agents: None,
             space_id: None,
+            provider_key: None,
         });
 
         // The real tenant server is behind the SSRF-guarded transport, which

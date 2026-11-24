@@ -457,6 +457,9 @@ async fn run_continuation(
         tenant_custom_mcp_servers,
         None,
         row.space_id.clone(),
+        // A resumed approval is out-of-band: no request headers, so no BYOK key.
+        // The bridge keeps charging these turns.
+        None,
     );
 
     let turn_origin = Arc::new(zeroclaw_runtime::agent::tenant::TurnOriginContext {

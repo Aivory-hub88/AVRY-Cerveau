@@ -28,6 +28,30 @@
 
 use std::sync::Arc;
 
+/// A tenant's own OpenRouter API key (BYOK), supplied per request by the
+/// bridge. Never logged: `Debug` is redacted so a `TenantContext` that ends up
+/// in a `{:?}` can't leak it. Read it only through [`Self::expose`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct TenantProviderKey(Arc<str>);
+
+impl TenantProviderKey {
+    /// `None` for an empty value, so "no key" has exactly one representation.
+    pub fn new(key: impl AsRef<str>) -> Option<Self> {
+        let key = key.as_ref().trim();
+        (!key.is_empty()).then(|| Self(Arc::from(key)))
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for TenantProviderKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TenantProviderKey(<redacted>)")
+    }
+}
+
 /// Immutable per-turn tenant overlay. Built by the gateway after
 /// authenticating the request and resolving the tenant's persona from the
 /// platform database.
@@ -135,6 +159,12 @@ pub struct TenantContext {
     /// for AI Console and every other single-user surface. Keys the shared
     /// `python_execute` workspace of a room; validated by the gateway.
     pub space_id: Option<String>,
+    /// The tenant's own OpenRouter key (BYOK), from the bridge's
+    /// `X-Provider-Key`. When present, every `openrouter` model provider used
+    /// by this turn authenticates with it instead of the key in `config.toml`,
+    /// so the tenant's provider account is billed, not Aivory's. `None` is
+    /// today's behaviour, bit-for-bit.
+    pub provider_key: Option<TenantProviderKey>,
 }
 
 /// One tenant-registered MCP server, already decrypted and verified —
@@ -769,6 +799,7 @@ mod tests {
             tenant_custom_mcp_servers: Vec::new(),
             active_agents: None,
             space_id: None,
+            provider_key: None,
         });
         TENANT_CONTEXT
             .scope(Some(ctx.clone()), async {
@@ -802,6 +833,7 @@ mod tests {
                         tenant_custom_mcp_servers: Vec::new(),
                         active_agents: None,
                         space_id: None,
+                        provider_key: None,
                     })),
                     "resolvable-empty-persona" => Some(Arc::new(TenantContext {
                         tenant_id: format!("{tenant_id}:{agent_type}"),
@@ -813,6 +845,7 @@ mod tests {
                         tenant_custom_mcp_servers: Vec::new(),
                         active_agents: None,
                         space_id: None,
+                        provider_key: None,
                     })),
                     _ => None,
                 }
@@ -880,6 +913,7 @@ mod tests {
             tenant_custom_mcp_servers: vec![sample_custom_server()],
             active_agents: None,
             space_id: None,
+            provider_key: None,
         };
         let configs = ctx.custom_mcp_server_configs();
         assert_eq!(configs.len(), 1);
@@ -917,6 +951,7 @@ mod tests {
             tenant_custom_mcp_servers: vec![server],
             active_agents: None,
             space_id: None,
+            provider_key: None,
         };
         assert_eq!(
             ctx.custom_mcp_server_configs()[0].transport,
@@ -939,6 +974,7 @@ mod tests {
             tenant_custom_mcp_servers: vec![server],
             active_agents: None,
             space_id: None,
+            provider_key: None,
         };
         assert!(ctx.custom_mcp_server_configs()[0].headers.is_empty());
     }
@@ -955,6 +991,7 @@ mod tests {
             tenant_custom_mcp_servers: vec![sample_custom_server()],
             active_agents: None,
             space_id: None,
+            provider_key: None,
         };
         assert!(ctx.is_tenant_custom_mcp_tool("tenant_orders__get_order"));
         assert!(!ctx.is_tenant_custom_mcp_tool("tenant_other__get_order"));
@@ -994,6 +1031,7 @@ mod tests {
             tenant_custom_mcp_servers: vec![aivory_mail],
             active_agents: None,
             space_id: None,
+            provider_key: None,
         };
         // The real thing: exempt from the hard floor.
         assert!(!ctx.is_tenant_custom_mcp_tool("tenant_aivory-mail__send_mail"));
@@ -1021,6 +1059,7 @@ mod tests {
             tenant_custom_mcp_servers: vec![lookalike],
             active_agents: None,
             space_id: None,
+            provider_key: None,
         };
         assert!(ctx.is_tenant_custom_mcp_tool("tenant_aivory-mail__send_mail"));
     }
@@ -1047,6 +1086,7 @@ mod tests {
             tenant_custom_mcp_servers: vec![server],
             active_agents: None,
             space_id: None,
+            provider_key: None,
         };
 
         let ctx = ctx_with(odoo("https://odoo-mcp.aivory.uk/mcp?token=abc"));
@@ -1204,6 +1244,7 @@ mod tests {
             tenant_custom_mcp_servers: servers,
             active_agents: None,
             space_id: None,
+            provider_key: None,
         }
     }
 

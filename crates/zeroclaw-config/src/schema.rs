@@ -5131,6 +5131,22 @@ impl Config {
     /// `crates/zeroclaw-runtime/src/tools/delegate.rs::resolve_brain` for
     /// the delegation path; this helper exposes the same contract for the
     /// channel-server startup path.
+    /// A copy of this config in which every `openrouter` model provider
+    /// authenticates with `api_key` — the fallbacks included, since a fallback
+    /// never inherits its parent alias's key. Per-turn BYOK: the tenant's own
+    /// OpenRouter key replaces Aivory's for exactly one turn; the shared live
+    /// config is never mutated.
+    #[must_use]
+    pub fn with_openrouter_api_key(&self, api_key: &str) -> Self {
+        let mut config = self.clone();
+        for (provider_type, _alias, entry) in config.providers.models.iter_entries_mut() {
+            if provider_type == "openrouter" {
+                entry.api_key = Some(api_key.to_owned());
+            }
+        }
+        config
+    }
+
     #[must_use]
     pub fn model_provider_for_agent(&self, agent_alias: &str) -> Option<&ModelProviderConfig> {
         let agent = self.agents.get(agent_alias)?;
@@ -57683,5 +57699,54 @@ mod fast_path_tests {
     fn small_talk_fast_path_parses_from_a_config_section() {
         let cfg: FastPathConfig = toml::from_str("smalltalk = true\n").unwrap();
         assert!(cfg.smalltalk);
+    }
+}
+
+#[cfg(test)]
+mod tenant_byok_tests {
+    use super::*;
+
+    fn entry(key: &str) -> ModelProviderConfig {
+        ModelProviderConfig {
+            api_key: Some(key.to_string()),
+            model: Some("m".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn with_openrouter_api_key_rewrites_every_openrouter_entry_and_nothing_else() {
+        let mut config = Config::default();
+        for alias in ["default", "fb_flash_2", "agent_workflow_brain"] {
+            config.providers.models.openrouter.insert(
+                alias.to_string(),
+                OpenRouterModelProviderConfig {
+                    base: entry("sk-or-aivory"),
+                    ..Default::default()
+                },
+            );
+        }
+        config.providers.models.anthropic.insert(
+            "main".to_string(),
+            AnthropicModelProviderConfig {
+                base: entry("sk-ant-aivory"),
+                ..Default::default()
+            },
+        );
+
+        let tenant = config.with_openrouter_api_key("sk-or-tenant");
+
+        for (family, alias, e) in tenant.providers.models.iter_entries() {
+            let expected = if family == "openrouter" {
+                "sk-or-tenant"
+            } else {
+                "sk-ant-aivory"
+            };
+            assert_eq!(e.api_key.as_deref(), Some(expected), "{family}.{alias}");
+        }
+        // The shared config is untouched: the override is per-turn.
+        for (_, _, e) in config.providers.models.iter_entries() {
+            assert!(!e.api_key.as_deref().unwrap_or("").contains("tenant"));
+        }
     }
 }
