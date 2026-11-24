@@ -392,6 +392,25 @@ tokio::task_local! {
     pub static TENANT_CONTEXT: Option<Arc<TenantContext>>;
 }
 
+tokio::task_local! {
+    /// The caller's own OpenRouter key (BYOK) on a turn that has NO tenant
+    /// overlay: the bridge's operator-style callers (assistant, blueprint,
+    /// workflow generate/edit) send `X-Provider-Key` without `X-Tenant-Id`, so
+    /// the key cannot ride inside [`TenantContext`]. Scoped by the gateway
+    /// beside [`TENANT_CONTEXT`]; read through [`current_provider_key`].
+    pub static PROVIDER_KEY_OVERRIDE: Option<TenantProviderKey>;
+}
+
+/// The BYOK key this turn should run on: the standalone override if the
+/// gateway scoped one, else the tenant overlay's. `None` = the configured key.
+pub fn current_provider_key() -> Option<TenantProviderKey> {
+    PROVIDER_KEY_OVERRIDE
+        .try_with(std::clone::Clone::clone)
+        .ok()
+        .flatten()
+        .or_else(|| current_tenant().and_then(|t| t.provider_key.clone()))
+}
+
 /// The tenant overlay for the current task, if any.
 ///
 /// Returns `None` both when running outside a scoped turn (vanilla
@@ -781,6 +800,77 @@ pub fn report_custom_mcp_auth_failure(tenant: &TenantContext, server: &str, stat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tenant_with_key(key: Option<&str>) -> Arc<TenantContext> {
+        Arc::new(TenantContext {
+            tenant_id: "u1.autonomous".to_string(),
+            platform_user_id: "u1".to_string(),
+            agent_type: "autonomous".to_string(),
+            persona: None,
+            connected_toolkits: Vec::new(),
+            disabled_toolkits: Vec::new(),
+            tenant_custom_mcp_servers: Vec::new(),
+            active_agents: None,
+            space_id: None,
+            provider_key: key.and_then(TenantProviderKey::new),
+        })
+    }
+
+    #[tokio::test]
+    async fn standalone_provider_key_is_visible_only_inside_its_scope() {
+        assert!(current_provider_key().is_none());
+        let key = TenantProviderKey::new("sk-or-v1-standalone0123456789");
+        PROVIDER_KEY_OVERRIDE
+            .scope(key, async {
+                // No tenant overlay at all: the operator-style caller's case.
+                assert!(current_tenant().is_none());
+                assert_eq!(
+                    current_provider_key().expect("scoped").expose(),
+                    "sk-or-v1-standalone0123456789"
+                );
+            })
+            .await;
+        assert!(current_provider_key().is_none());
+    }
+
+    #[tokio::test]
+    async fn tenant_key_is_the_fallback_and_the_standalone_override_wins() {
+        let tenant = tenant_with_key(Some("sk-or-v1-tenantkey0123456789"));
+        TENANT_CONTEXT
+            .scope(Some(tenant), async {
+                assert_eq!(
+                    current_provider_key().expect("tenant fallback").expose(),
+                    "sk-or-v1-tenantkey0123456789"
+                );
+                PROVIDER_KEY_OVERRIDE
+                    .scope(
+                        TenantProviderKey::new("sk-or-v1-override0123456789"),
+                        async {
+                            assert_eq!(
+                                current_provider_key().expect("override").expose(),
+                                "sk-or-v1-override0123456789"
+                            );
+                        },
+                    )
+                    .await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn no_key_anywhere_means_the_configured_key() {
+        let tenant = tenant_with_key(None);
+        TENANT_CONTEXT
+            .scope(Some(tenant), async {
+                assert!(current_provider_key().is_none());
+            })
+            .await;
+        PROVIDER_KEY_OVERRIDE
+            .scope(None, async {
+                assert!(current_provider_key().is_none());
+            })
+            .await;
+    }
 
     #[tokio::test]
     async fn absent_context_reads_none() {

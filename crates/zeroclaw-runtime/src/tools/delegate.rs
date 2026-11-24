@@ -400,6 +400,8 @@ struct DelegateAmbient {
     tenant: Option<Arc<crate::agent::tenant::TenantContext>>,
     origin: Option<Arc<crate::agent::tenant::TurnOriginContext>>,
     approval: Option<Arc<crate::approval::ApprovalManager>>,
+    /// The parent's BYOK key, so a delegated sub-agent bills the same account.
+    provider_key: Option<crate::agent::tenant::TenantProviderKey>,
 }
 
 impl DelegateAmbient {
@@ -409,6 +411,7 @@ impl DelegateAmbient {
                 .map(|parent| delegate_tenant_overlay(parent, target)),
             origin: crate::agent::tenant::current_turn_origin(),
             approval: crate::approval::current_delegation_approval(),
+            provider_key: crate::agent::tenant::current_provider_key(),
         }
     }
 
@@ -418,9 +421,12 @@ impl DelegateAmbient {
         let fut = Box::pin(fut);
         crate::approval::scope_delegation_approval(
             self.approval,
-            crate::agent::tenant::TENANT_CONTEXT.scope(
-                self.tenant,
-                crate::agent::tenant::TURN_ORIGIN_CONTEXT.scope(self.origin, fut),
+            crate::agent::tenant::PROVIDER_KEY_OVERRIDE.scope(
+                self.provider_key,
+                crate::agent::tenant::TENANT_CONTEXT.scope(
+                    self.tenant,
+                    crate::agent::tenant::TURN_ORIGIN_CONTEXT.scope(self.origin, fut),
+                ),
             ),
         )
         .await

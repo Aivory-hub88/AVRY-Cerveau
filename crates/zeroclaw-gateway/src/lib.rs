@@ -4404,6 +4404,9 @@ struct WebhookPrelude {
     session_id: Option<String>,
     agent_override: Option<String>,
     tenant_ctx: Option<std::sync::Arc<zeroclaw_runtime::agent::tenant::TenantContext>>,
+    /// `X-Provider-Key`, parsed whether or not the request is tenant-scoped, so
+    /// operator-style callers (no `X-Tenant-Id`) can run on their own key too.
+    provider_key: Option<zeroclaw_runtime::agent::tenant::TenantProviderKey>,
     model_label: String,
     /// ADR-021: the turn came from a Team Space room (`X-Room-Channel:
     /// discussion`), so team tools are offered and their actions returned.
@@ -4852,6 +4855,7 @@ async fn webhook_prelude(
         session_id,
         agent_override: agent_override.map(str::to_string),
         tenant_ctx,
+        provider_key: tenant::parse_provider_key(headers),
         model_label,
         room_turn: headers
             .get("x-room-channel")
@@ -4906,6 +4910,7 @@ async fn handle_webhook(
         session_id,
         agent_override,
         tenant_ctx,
+        provider_key,
         model_label,
         room_turn,
         unattended,
@@ -4937,13 +4942,18 @@ async fn handle_webhook(
     // ADR-021 §4.3: an unattended tenant turn can end quietly or as failed.
     let run_cell = (unattended && tenant_ctx.is_some())
         .then(|| std::sync::Arc::new(parking_lot::Mutex::new(None)));
-    let chat = Box::pin(run_gateway_chat_with_tools(
-        &state,
-        &message,
-        session_id.as_deref(),
-        agent_override.as_deref(),
-        tenant_ctx,
-    ));
+    let chat = Box::pin(
+        zeroclaw_runtime::agent::tenant::PROVIDER_KEY_OVERRIDE.scope(
+            provider_key,
+            run_gateway_chat_with_tools(
+                &state,
+                &message,
+                session_id.as_deref(),
+                agent_override.as_deref(),
+                tenant_ctx,
+            ),
+        ),
+    );
     let outcome = zeroclaw_runtime::agent::tenant::TEAM_ACTIONS
         .scope(
             team_cell.clone(),
@@ -5061,6 +5071,7 @@ async fn handle_webhook_stream(
         session_id,
         agent_override,
         tenant_ctx,
+        provider_key,
         model_label,
         room_turn: _,
         unattended: _,
@@ -5083,13 +5094,16 @@ async fn handle_webhook_stream(
         // see `WebhookPrelude::_admission_permit`'s doc.
         let _permit = _admission_permit;
 
-        let turn_fut = run_gateway_chat_with_tools_streamed(
-            &state_bg,
-            &message,
-            session_id.as_deref(),
-            agent_override.as_deref(),
-            tenant_ctx,
-            event_tx,
+        let turn_fut = zeroclaw_runtime::agent::tenant::PROVIDER_KEY_OVERRIDE.scope(
+            provider_key,
+            run_gateway_chat_with_tools_streamed(
+                &state_bg,
+                &message,
+                session_id.as_deref(),
+                agent_override.as_deref(),
+                tenant_ctx,
+                event_tx,
+            ),
         );
 
         // Drains `event_rx` concurrently with the turn future, mirroring
