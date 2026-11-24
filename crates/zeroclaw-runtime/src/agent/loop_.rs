@@ -3859,7 +3859,7 @@ async fn process_message_inner(
     }
     // Cerveau: tenant BYOK. Applied after the admission snapshot replaces
     // `config` (applying it earlier would be overwritten), on a per-turn copy.
-    if let Some(key) = crate::agent::tenant::current_tenant().and_then(|t| t.provider_key.clone()) {
+    if let Some(key) = crate::agent::tenant::current_provider_key() {
         config = Arc::new(config.with_openrouter_api_key(key.expose()));
     }
     let capabilities = capabilities.unwrap_or_else(|| RuntimeCapabilities::config_backed(&config));
